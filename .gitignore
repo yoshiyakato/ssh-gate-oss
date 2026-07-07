@@ -1,0 +1,15 @@
+# Wails
+build/bin/
+frontend/dist/
+frontend/wailsjs/
+
+# Node
+frontend/node_modules/
+
+# Build artifacts (do not track compiled binaries)
+/ssh-gete
+/ssh-gete.exe
+*.test
+
+# Local
+.DS_Store

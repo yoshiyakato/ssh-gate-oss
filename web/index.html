@@ -1,0 +1,767 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title id="page-title">SSH GATE — Human-in-the-loop SSH MCP Server（ssh-gete）</title>
+<meta id="page-desc" name="description" content="SSH GATE（ssh-gete）は、AI エージェントの SSH コマンドを人間の承認で通す human-in-the-loop な MCP サーバー。要求は承認キューに並び、承認されてはじめて実行。Low リスクでも自動では走らせない、ローカル完結のデスクトップアプリ。SSH／シリアルの対話ターミナルも内蔵。" />
+<meta property="og:title" content="SSH GATE — Human-in-the-loop SSH MCP Server" />
+<meta property="og:description" content="AI が求め、人間が通す。エージェントのコマンドは承認キューに並び、人間の承認ではじめて実機に届く。ローカル完結の SSH ゲートウェイ。" />
+<meta property="og:image" content="assets/ssh-gate-logo.png" />
+<meta property="og:type" content="website" />
+<link rel="icon" type="image/png" href="assets/ssh-gate-logo.png" />
+<link rel="apple-touch-icon" href="assets/ssh-gate-logo.png" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700;900&family=JetBrains+Mono:wght@400;500;700&family=Sora:wght@600;700;800&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --navy-950: #070e22;
+    --navy-900: #0b1530;
+    --navy-800: #112143;
+    --navy-700: #1a2c55;
+    --gold-1: #c9a227;
+    --gold-2: #e7c869;
+    --gold-3: #f5e4ad;
+    --gold-ink: #9c7d1f;
+    --ink: #14161c;
+    --ink-soft: #424755;
+    --muted: #707892;
+    --line: #e7e8ee;
+    --line-soft: #f1f2f6;
+    --paper: #ffffff;
+    --paper-2: #f7f8fc;
+    --good: #15915f;
+    --bad: #d6485e;
+    --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    --display: 'Sora', 'Noto Sans JP', sans-serif;
+    --maxw: 820px;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, 'Noto Sans JP', 'Hiragino Kaku Gothic ProN', sans-serif;
+    color: var(--ink);
+    background: var(--paper);
+    line-height: 1.85;
+    font-size: 16px;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--gold-ink); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { width: min(var(--maxw), 90vw); margin: 0 auto; }
+  .gold-text {
+    background: linear-gradient(95deg, var(--gold-1), var(--gold-2) 55%, var(--gold-3));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+
+  /* ===== header ===== */
+  header.nav {
+    position: sticky; top: 0; z-index: 40;
+    background: rgba(7, 14, 34, 0.82); backdrop-filter: blur(12px);
+    border-bottom: 1px solid rgba(201, 162, 39, 0.28);
+  }
+  .nav-inner { display: flex; align-items: center; justify-content: space-between; height: 62px; }
+  .brand { display: flex; align-items: center; gap: 11px; font-family: var(--display); font-weight: 800; font-size: 18px; letter-spacing: 0.04em; color: #fff; }
+  .brand img { width: 32px; height: 32px; border-radius: 8px; }
+  .nav-links { display: flex; align-items: center; gap: 22px; font-size: 14px; }
+  .nav-links a { color: #c6cfe4; }
+  .nav-links a:hover { color: #fff; text-decoration: none; }
+  .nav-links .dl {
+    color: var(--navy-950); font-weight: 700; padding: 8px 16px; border-radius: 999px;
+    background: linear-gradient(135deg, var(--gold-2), var(--gold-1));
+    box-shadow: 0 6px 18px -6px rgba(201,162,39,0.6);
+  }
+  .nav-links .dl:hover { text-decoration: none; filter: brightness(1.05); }
+  @media (max-width: 720px) { .nav-links a:not(.dl) { display: none; } }
+  .lang-switch { display: inline-flex; align-items: center; gap: 2px; font-family: var(--mono); font-size: 13px; font-weight: 700; user-select: none; }
+  .lang-switch button { background: none; border: 0; padding: 2px 5px; cursor: pointer; color: #8b97b6; font: inherit; border-radius: 5px; transition: .14s; }
+  .lang-switch button:hover { color: #fff; }
+  .lang-switch button.active { color: var(--gold-2); }
+  .lang-switch .sep { color: rgba(201,162,39,0.4); }
+
+  /* ===== hero ===== */
+  .hero {
+    position: relative; overflow: hidden; text-align: center;
+    padding: 76px 0 84px;
+    background:
+      radial-gradient(900px 420px at 50% -8%, rgba(201,162,39,0.20), transparent 60%),
+      radial-gradient(700px 500px at 88% 12%, rgba(26,44,85,0.55), transparent 55%),
+      linear-gradient(180deg, var(--navy-950), var(--navy-900) 60%, var(--navy-800));
+    color: #eef1f9;
+  }
+  .hero::after {
+    content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2px;
+    background: linear-gradient(90deg, transparent, var(--gold-1), var(--gold-3), var(--gold-1), transparent);
+    opacity: .8;
+  }
+  .hero .logo {
+    width: 132px; height: 132px; border-radius: 26px; margin: 0 auto 26px; display: block;
+    box-shadow: 0 26px 60px -18px rgba(0,0,0,0.7), 0 0 0 1px rgba(201,162,39,0.25);
+  }
+  .kicker {
+    display: inline-flex; align-items: center; gap: 8px; margin-bottom: 18px;
+    font-size: 12.5px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--gold-3); padding: 5px 14px; border-radius: 999px;
+    background: rgba(201,162,39,0.10); border: 1px solid rgba(201,162,39,0.35);
+  }
+  .hero h1 {
+    font-family: var(--display);
+    font-size: clamp(30px, 6vw, 52px); line-height: 1.22; letter-spacing: 0.01em;
+    font-weight: 800; margin: 0 0 20px;
+  }
+  .hero .lead { font-size: clamp(15.5px, 2.2vw, 18.5px); color: #c3cce0; max-width: 660px; margin: 0 auto 32px; }
+  .hero .lead code { font-family: var(--mono); font-size: 0.86em; background: rgba(255,255,255,0.08); border: 1px solid rgba(201,162,39,0.3); border-radius: 5px; padding: 1px 6px; color: var(--gold-3); }
+  .cta-row { display: flex; gap: 13px; justify-content: center; flex-wrap: wrap; }
+  .btn { display: inline-flex; align-items: center; gap: 9px; padding: 12px 22px; border-radius: 12px; font-weight: 700; font-size: 15px; border: 1px solid transparent; cursor: pointer; transition: .16s; }
+  .btn svg { width: 18px; height: 18px; }
+  .btn-gold { background: linear-gradient(135deg, var(--gold-2), var(--gold-1)); color: var(--navy-950); box-shadow: 0 14px 30px -12px rgba(201,162,39,0.7); }
+  .btn-gold:hover { transform: translateY(-2px); text-decoration: none; }
+  .btn-ghost { background: rgba(255,255,255,0.04); border-color: rgba(255,255,255,0.22); color: #eef1f9; }
+  .btn-ghost:hover { border-color: var(--gold-2); color: #fff; text-decoration: none; }
+  .hero .note { margin-top: 16px; font-size: 12.5px; color: #97a2bd; }
+
+  /* console mock */
+  .console { margin: 44px auto 0; max-width: 720px; border-radius: 14px; overflow: hidden; border: 1px solid rgba(201,162,39,0.28); background: #060b1b; box-shadow: 0 30px 70px -28px rgba(0,0,0,0.8); text-align: left; }
+  .console .bar { display: flex; align-items: center; gap: 7px; padding: 11px 15px; background: #0b1430; border-bottom: 1px solid rgba(255,255,255,0.06); }
+  .console .bar .d { width: 11px; height: 11px; border-radius: 50%; }
+  .console .bar .d.r{background:#ff5f57}.console .bar .d.y{background:#febc2e}.console .bar .d.g{background:#28c840}
+  .console .bar .t { margin-left: 9px; font-family: var(--mono); font-size: 12px; color: #8893b5; }
+  .console pre { margin: 0; padding: 18px; font-family: var(--mono); font-size: 13px; line-height: 1.9; overflow-x: auto; color: #dde4f5; }
+  .console .g{color:#46d399}.console .b{color:#ff8095}.console .m{color:#7b86a8}.console .y{color:var(--gold-2)}
+
+  /* ===== sections ===== */
+  section { padding: 58px 0; }
+  .band { background: var(--paper-2); }
+  .divider { height: 1px; background: linear-gradient(90deg, transparent, var(--line), transparent); }
+  .sec-label { font-size: 12.5px; font-weight: 800; letter-spacing: 0.1em; color: var(--gold-ink); margin: 0 0 6px; text-transform: uppercase; }
+  h2.sec-title { font-family: var(--display); font-size: clamp(22px, 3.8vw, 32px); line-height: 1.34; letter-spacing: 0.005em; margin: 0 0 22px; font-weight: 800; color: var(--ink); }
+  .body p { color: var(--ink-soft); margin: 0 0 16px; }
+  .body strong { color: var(--ink); }
+  .body code { font-family: var(--mono); font-size: 0.88em; background: var(--line-soft); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; }
+
+  /* comparison */
+  .cmp { width: 100%; border-collapse: collapse; margin: 8px 0 6px; font-size: 15px; background: #fff; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  .cmp th, .cmp td { text-align: left; padding: 13px 15px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  .cmp thead th { font-size: 13px; color: var(--muted); font-weight: 800; background: var(--paper-2); }
+  .cmp thead th:last-child { color: var(--gold-ink); }
+  .cmp tr:last-child td { border-bottom: 0; }
+  .cmp td.l { color: var(--ink-soft); width: 36%; font-weight: 700; }
+  .cmp .x { color: var(--bad); font-weight: 700; }
+  .cmp .o { color: var(--good); font-weight: 700; }
+
+  /* features */
+  .feat-list { list-style: none; margin: 0; padding: 0; }
+  .feat-list li { display: flex; gap: 16px; padding: 19px 0; border-bottom: 1px solid var(--line); }
+  .feat-list li:last-child { border-bottom: 0; }
+  .feat-list .num { flex: 0 0 auto; width: 34px; height: 34px; border-radius: 9px; display: grid; place-items: center; font-family: var(--mono); font-weight: 700; font-size: 14px; color: var(--navy-950); background: linear-gradient(135deg, var(--gold-2), var(--gold-1)); box-shadow: 0 6px 14px -6px rgba(201,162,39,0.6); }
+  .feat-list .ft h3 { margin: 4px 0 5px; font-size: 17px; }
+  .feat-list .ft p { margin: 0; color: var(--ink-soft); font-size: 14.5px; }
+
+  /* steps */
+  .steps { margin: 6px 0 0; padding: 0; list-style: none; counter-reset: s; }
+  .steps li { position: relative; padding: 11px 0 11px 44px; counter-increment: s; color: var(--ink-soft); border-bottom: 1px solid var(--line); }
+  .steps li:last-child { border-bottom: 0; }
+  .steps li::before { content: counter(s); position: absolute; left: 0; top: 11px; width: 28px; height: 28px; border-radius: 50%; background: var(--navy-900); color: var(--gold-2); font-family: var(--mono); font-size: 13px; font-weight: 700; display: grid; place-items: center; border: 1px solid rgba(201,162,39,0.4); }
+  .steps li b { color: var(--ink); }
+
+  /* faq */
+  .faq details { border-bottom: 1px solid var(--line); }
+  .faq summary { cursor: pointer; padding: 14px 2px; font-weight: 700; font-size: 16px; list-style: none; display: flex; justify-content: space-between; gap: 14px; color: var(--ink); }
+  .faq summary::-webkit-details-marker { display: none; }
+  .faq summary::after { content: "+"; color: var(--gold-ink); font-weight: 400; font-size: 22px; line-height: 1; }
+  .faq details[open] summary::after { content: "–"; }
+  .faq .ans { padding: 0 2px 16px; color: var(--ink-soft); font-size: 14.5px; }
+  .faq .ans code { font-family: var(--mono); font-size: 0.88em; background: var(--line-soft); border-radius: 5px; padding: 1px 6px; }
+
+  /* developer */
+  .dev { display: flex; gap: 16px; align-items: center; }
+  .dev img { width: 56px; height: 56px; border-radius: 13px; box-shadow: 0 8px 20px -8px rgba(0,0,0,0.4); }
+  .dev p { margin: 0 0 6px; color: var(--ink-soft); }
+
+  /* download */
+  .dl-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 8px; }
+  @media (max-width: 640px) { .dl-grid { grid-template-columns: 1fr; } }
+  .dl-card { border: 1px solid var(--line); border-radius: 14px; padding: 24px; background: #fff; transition: .18s; position: relative; }
+  .dl-card::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 3px; border-radius: 14px 14px 0 0; background: linear-gradient(90deg, var(--gold-1), var(--gold-3)); opacity: 0; transition: .18s; }
+  .dl-card:hover { transform: translateY(-3px); box-shadow: 0 22px 44px -24px rgba(11,21,48,0.4); }
+  .dl-card:hover::before { opacity: 1; }
+  .dl-card .os { display: flex; align-items: center; gap: 11px; font-weight: 800; font-size: 18px; margin-bottom: 4px; font-family: var(--display); }
+  .dl-card .os svg { width: 23px; height: 23px; }
+  .dl-card .meta { color: var(--muted); font-size: 13px; font-family: var(--mono); margin-bottom: 18px; }
+  .dl-card .dlbtn { display: inline-flex; align-items: center; gap: 8px; padding: 11px 18px; border-radius: 10px; font-weight: 700; font-size: 14.5px; background: linear-gradient(135deg, var(--gold-2), var(--gold-1)); color: var(--navy-950); }
+  .dl-card .dlbtn:hover { text-decoration: none; filter: brightness(1.04); }
+  .dl-card .dlbtn.soon { background: #fff; border: 1px solid var(--line); color: var(--ink-soft); }
+  .dl-card .dlbtn svg { width: 16px; height: 16px; }
+  .dl-note { margin-top: 22px; font-size: 13px; color: var(--muted); line-height: 1.9; }
+  .dl-note code { font-family: var(--mono); background: var(--line-soft); border-radius: 5px; padding: 1px 6px; color: var(--ink); }
+
+  /* footer */
+  footer { background: var(--navy-950); color: #9aa6c4; padding: 40px 0 52px; border-top: 2px solid rgba(201,162,39,0.4); }
+  .foot-inner { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px; }
+  .foot-brand { display: flex; align-items: center; gap: 10px; color: #fff; font-family: var(--display); font-weight: 700; letter-spacing: 0.04em; }
+  .foot-brand img { width: 28px; height: 28px; border-radius: 7px; }
+  .foot-links { display: flex; gap: 20px; font-size: 14px; }
+  .foot-links a { color: #c6cfe4; }
+  .foot-links a:hover { color: var(--gold-2); }
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="#top"><img src="assets/ssh-gate-logo.png" alt="SSH GATE" />SSH GATE</a>
+    <nav class="nav-links">
+      <a href="#why" data-i18n="nav.why">なぜ必要か</a>
+      <a href="#features" data-i18n="nav.features">機能</a>
+      <a href="#oss" data-i18n="nav.oss">オープンソース</a>
+      <a href="#faq" data-i18n="nav.faq">FAQ</a>
+      <span class="lang-switch" aria-label="Language">
+        <button type="button" data-lang="ja">JA</button><span class="sep">|</span><button type="button" data-lang="en">EN</button>
+      </span>
+      <a class="dl" href="#download" data-i18n="nav.download">ダウンロード</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+  <!-- HERO -->
+  <section class="hero">
+    <div class="wrap">
+      <img class="logo" src="assets/ssh-gate-logo.png" alt="SSH GATE ロゴ" />
+      <div class="kicker" data-i18n="hero.kicker">Human-in-the-loop SSH MCP Server</div>
+      <h1 data-i18n="hero.h1">AI が求め、<br /><span class="gold-text">人間が通す。</span></h1>
+      <p class="lead" data-i18n="hero.lead">
+        エージェントが <code>execute_command</code> を呼んでも、走るのはあなたが通してから。
+        要求は<strong style="color:#fff">承認キュー</strong>に並び、人間が目を通してはじめて実機に届きます。
+        <strong style="color:#fff">SSH GATE</strong>（<code>ssh-gete</code>）は、ローカルで完結する human-in-the-loop な SSH ゲートウェイです。
+      </p>
+      <div class="cta-row">
+        <a class="btn btn-gold" href="#download">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M5 21h14"/></svg>
+          <span data-i18n="hero.cta.dl">ダウンロード</span>
+        </a>
+        <a class="btn btn-ghost" href="#why" data-i18n="hero.cta.how">仕組みを見る</a>
+      </div>
+      <div class="note" data-i18n="hero.note">macOS（Apple Silicon）/ Windows · オープンソース · 通信はローカルだけ</div>
+
+      <div class="console">
+        <div class="bar"><span class="d r"></span><span class="d y"></span><span class="d g"></span><span class="t" data-i18n="hero.console.title">SSH GATE — 承認キュー</span></div>
+<pre data-i18n="hero.console.body"><span class="m">agent</span> <span class="y">claude</span> → execute_command
+  host: web01   command: sudo systemctl restart nginx
+  <span class="b">⚠ risk: High</span>   status: 承認待ち（まだ実行していません）
+
+<span class="m"># 人間が GUI で内容を確認 →「承認して実行」</span>
+  <span class="g">✓ 実行済み</span>   0.8s · 監査ログに記録
+</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- WHY -->
+  <section id="why">
+    <div class="wrap body">
+      <p class="sec-label" data-i18n="why.label">なぜ必要か</p>
+      <h2 class="sec-title" data-i18n="why.title">便利と事故は、紙一重。</h2>
+      <p data-i18n="why.p1">
+        一般的な MCP の SSH サーバーは、エージェントの指示を<strong>そのまま実行</strong>します。
+        判断ミスやプロンプトインジェクションが一発で、<code>rm -rf</code> や <code>systemctl stop</code> を本番で走らせ得る構造です。
+        SSH GATE は、その間に「人間が見て承認する画面」を1枚はさみます。
+      </p>
+      <table class="cmp">
+        <thead><tr><th></th><th data-i18n="why.cmp.head.plain">素の SSH ツール</th><th data-i18n="why.cmp.head.gate">SSH GATE</th></tr></thead>
+        <tbody>
+          <tr><td class="l" data-i18n="why.cmp.r1.l">エージェントの指示</td><td data-i18n="why.cmp.r1.a"><span class="x">即実行</span></td><td data-i18n="why.cmp.r1.b"><span class="o">承認キューに保留</span></td></tr>
+          <tr><td class="l" data-i18n="why.cmp.r2.l">Low リスクのコマンド</td><td data-i18n="why.cmp.r2.a"><span class="x">自動で実行</span></td><td data-i18n="why.cmp.r2.b"><span class="o">それでも承認必須</span></td></tr>
+          <tr><td class="l" data-i18n="why.cmp.r3.l">誰が・何を・なぜ</td><td data-i18n="why.cmp.r3.a"><span class="x">残りにくい</span></td><td data-i18n="why.cmp.r3.b"><span class="o">全件 SQLite に記録</span></td></tr>
+          <tr><td class="l" data-i18n="why.cmp.r4.l">信頼できるエージェント</td><td data-i18n="why.cmp.r4.a">—</td><td data-i18n="why.cmp.r4.b"><span class="o">承認省略を段階的に付与</span></td></tr>
+          <tr><td class="l" data-i18n="why.cmp.r5.l">通信範囲</td><td data-i18n="why.cmp.r5.a">—</td><td data-i18n="why.cmp.r5.b"><span class="o">既定 127.0.0.1 のみ</span></td></tr>
+        </tbody>
+      </table>
+      <p data-i18n="why.p2">判断と実行の引き金は、人間（または人間が事前に信頼を与えたエージェント）の手に残す。それだけのことを、確実に。</p>
+    </div>
+  </section>
+
+  <div class="divider"></div>
+
+  <!-- FEATURES -->
+  <section id="features" class="band">
+    <div class="wrap body">
+      <p class="sec-label" data-i18n="feat.label">機能</p>
+      <h2 class="sec-title" data-i18n="feat.title">承認コンソールに必要なもの、ぜんぶ。</h2>
+      <ul class="feat-list">
+        <li><span class="num">1</span><div class="ft"><h3 data-i18n="feat.f1.h">人間承認ゲートウェイ</h3><p data-i18n="feat.f1.p">エージェントの要求は承認キューへ。GUI で内容を確認し、必要ならコマンドを微修正してから実行できます。</p></div></li>
+        <li><span class="num">2</span><div class="ft"><h3 data-i18n="feat.f2.h">MCP サーバー内蔵</h3><p data-i18n="feat.f2.p">JSON-RPC 2.0 over HTTP で <code>list_hosts</code> / <code>execute_command</code> などを提供。Claude などの MCP クライアントから接続できます。</p></div></li>
+        <li><span class="num">3</span><div class="ft"><h3 data-i18n="feat.f3.h">リスク分類</h3><p data-i18n="feat.f3.p">コマンドを High / Medium / Low に推定して表示。人間の判断を助けます（あくまで目安。実行可否は承認とポリシーが決めます）。</p></div></li>
+        <li><span class="num">4</span><div class="ft"><h3 data-i18n="feat.f4.h">監査ログ</h3><p data-i18n="feat.f4.p">すべての要求・実行結果・所要時間を SQLite に記録。接続先を消しても履歴は残します。</p></div></li>
+        <li><span class="num">5</span><div class="ft"><h3 data-i18n="feat.f5.h">ライブターミナル（SSH / シリアル）</h3><p data-i18n="feat.f5.p">承認フローとは別に、人間が直接操作する対話端末を内蔵。SSH の対話シェルとシリアルポートを、同じ画面で扱えます。</p></div></li>
+        <li><span class="num">6</span><div class="ft"><h3 data-i18n="feat.f6.h">ローカル完結 & 最小保持</h3><p data-i18n="feat.f6.p">既定の待受は <code>127.0.0.1:8787</code>。SSH 鍵パスフレーズは保存せずメモリのみ。任意で Bearer 認証も。</p></div></li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- HOW -->
+  <section id="how">
+    <div class="wrap body">
+      <p class="sec-label" data-i18n="how.label">仕組み</p>
+      <h2 class="sec-title" data-i18n="how.title">エージェントと実機の間に、門番を置く。</h2>
+      <p data-i18n="how.p">人間が操作する GUI、状態を所有する Go バックエンド、機械が話す MCP。承認関門はその真ん中にあります。要求から実行までは、こう流れます。</p>
+      <ol class="steps">
+        <li data-i18n="how.s1"><b>エージェントが要求する</b> — <code>execute_command</code> でホスト・コマンド・理由を申請。</li>
+        <li data-i18n="how.s2"><b>承認キューにためる</b> — 実行せず保留し、リスクを付けて GUI に表示。</li>
+        <li data-i18n="how.s3"><b>人間が承認する</b> — 内容を確認し、必要なら微修正して「承認して実行」。</li>
+        <li data-i18n="how.s4"><b>実行して記録する</b> — SSH 実行。結果と所要時間を監査ログに残す。</li>
+      </ol>
+    </div>
+  </section>
+
+  <div class="divider"></div>
+
+  <!-- TERMINAL -->
+  <section id="terminal" class="band">
+    <div class="wrap body">
+      <p class="sec-label" data-i18n="term.label">ターミナル</p>
+      <h2 class="sec-title" data-i18n="term.title">SSH も シリアルも、ひとつの画面で。</h2>
+      <p data-i18n="term.p">
+        承認フローに乗らない「人間の直接操作」も用意しています。接続先に種別（SSH / シリアル）を持たせ、ターミナルはそれに従属。
+        ネットワーク機器のコンソールや USB シリアルも、SSH の対話シェルと同じ操作で開けます。
+        <strong>シリアル接続先は MCP からは実行できません</strong>（対話 GUI 専用）。
+      </p>
+      <div class="console">
+        <div class="bar"><span class="d r"></span><span class="d y"></span><span class="d g"></span><span class="t">serial console — /dev/cu.usbserial-8330 @ 115200</span></div>
+<pre><span class="g">Router&gt;</span> enable
+<span class="g">Router#</span> show version
+  <span class="m">Cisco IOS Software, Version 15.x ...</span>
+  <span class="m">uptime is 42 days, 3 hours</span>
+</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- SECURITY -->
+  <section id="security">
+    <div class="wrap body">
+      <p class="sec-label" data-i18n="sec.label">安全設計</p>
+      <h2 class="sec-title" data-i18n="sec.title">安全は、1個ではなく層で積む。</h2>
+      <ul class="feat-list">
+        <li><span class="num">✓</span><div class="ft"><h3 data-i18n="sec.s1.h">デフォルト承認必須</h3><p data-i18n="sec.s1.p">Low リスクでも自動実行しない。<code>AutoExecuteLowRisk</code> はバックエンドとフロントの二重で false に固定。</p></div></li>
+        <li><span class="num">✓</span><div class="ft"><h3 data-i18n="sec.s2.h">エージェント名の必須化</h3><p data-i18n="sec.s2.p">誰の要求かを必ず記録。未申告のエージェントには承認省略を付与できません。</p></div></li>
+        <li><span class="num">✓</span><div class="ft"><h3 data-i18n="sec.s3.h">出力上限とタイムアウト</h3><p data-i18n="sec.s3.p">stdout/stderr を上限で打ち切り、接続・コマンドにタイムアウト。超過時は確実に kill。</p></div></li>
+        <li><span class="num">✓</span><div class="ft"><h3 data-i18n="sec.s4.h">資格情報の最小保持</h3><p data-i18n="sec.s4.p">SSH 鍵パスフレーズはメモリのみ（DB 非保存）。トークンはマスク表示で平文を返しません。</p></div></li>
+      </ul>
+    </div>
+  </section>
+
+  <div class="divider"></div>
+
+  <!-- OPEN SOURCE -->
+  <section id="oss" class="band">
+    <div class="wrap body">
+      <p class="sec-label" data-i18n="oss.label">オープンソース</p>
+      <h2 class="sec-title" data-i18n="oss.title">大事な SSH／シリアルだからこそ、中身が見える。</h2>
+      <p data-i18n="oss.p">
+        承認をすり抜けて実行する裏口がないか。資格情報をこっそり外へ送っていないか。
+        —— サーバーの鍵やコンソールを預ける道具が<strong>ブラックボックスでは、意味がありません</strong>。
+        SSH GATE は<strong>ソースを丸ごと公開</strong>しています（<strong>MIT ライセンス</strong>。商用利用・改変・再配布OK）。
+        動作は<strong>ローカルだけ</strong>で完結し、外部に何も送りません。気になる挙動は、コードでそのまま確かめられます。
+      </p>
+      <div class="cta-row" style="justify-content:flex-start">
+        <a class="btn btn-gold" href="https://github.com/yoshiyakato/ssh-mcp-server" target="_blank" rel="noopener">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2a10 10 0 0 0-3.16 19.49c.5.09.68-.22.68-.48l-.01-1.7c-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.61.07-.61 1 .07 1.53 1.03 1.53 1.03.9 1.53 2.36 1.09 2.94.83.09-.65.35-1.09.63-1.34-2.22-.25-4.56-1.11-4.56-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.02a9.5 9.5 0 0 1 5 0c1.91-1.29 2.75-1.02 2.75-1.02.55 1.38.2 2.4.1 2.65.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.69-4.57 4.93.36.31.68.92.68 1.85l-.01 2.74c0 .27.18.58.69.48A10 10 0 0 0 12 2z"/></svg>
+          <span data-i18n="oss.cta">GitHub でソースを見る</span>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- FAQ -->
+  <section id="faq">
+    <div class="wrap body faq">
+      <p class="sec-label" data-i18n="faq.label">FAQ</p>
+      <h2 class="sec-title" data-i18n="faq.title">よくある質問</h2>
+      <details open>
+        <summary data-i18n="faq.q1.s">もっと詳しい紹介・背景は？</summary>
+        <div class="ans" data-i18n="faq.q1.a">開発の背景や使いどころを Qiita の紹介記事にまとめています →
+          <a href="https://qiita.com/yoshiyakato/private/7987aa7a671f089f06ea" target="_blank" rel="noopener">SSH GATE 紹介記事（Qiita）</a>。
+          <br /><small>※ 限定共有リンクです。</small>
+        </div>
+      </details>
+      <details>
+        <summary data-i18n="faq.q2.s">本当にエージェントから勝手に実行されませんか？</summary>
+        <div class="ans" data-i18n="faq.q2.a">はい。MCP 経由のコマンドはリスクに関係なく承認キューに入ります。実行されるのは、人間が GUI で承認したときか、特定エージェントに明示的に「承認省略」を与えたときだけです。後者は人間が意図的に付与した場合のみ有効です。</div>
+      </details>
+      <details>
+        <summary data-i18n="faq.q3.s">リスク分類（High/Medium/Low）はどこまで信用できますか？</summary>
+        <div class="ans" data-i18n="faq.q3.a">コマンド文字列のヒューリスティックなので、クオートやエイリアスで回避され得ます。あくまで人間の判断を助ける<strong>目安</strong>で、これ自体が実行可否を決めるわけではありません。実行可否は承認とポリシーが決めます。</div>
+      </details>
+      <details>
+        <summary data-i18n="faq.q4.s">外部に公開されますか？</summary>
+        <div class="ans" data-i18n="faq.q4.a">既定の待受は <code>127.0.0.1:8787</code>。ローカルのエージェントとだけ通信する前提です。必要に応じて Bearer 認証・ボディサイズ上限・CORS 制限を設定できます。</div>
+      </details>
+      <details>
+        <summary data-i18n="faq.q5.s">シリアルポートにも使えますか？</summary>
+        <div class="ans" data-i18n="faq.q5.a">使えます。接続先の種別を「シリアル」にすると、ターミナル画面でシリアルコンソールが開きます。SSH と同じ操作感です。なお、シリアルは対話 GUI 専用で、MCP（エージェント）からは実行できません。</div>
+      </details>
+      <details>
+        <summary data-i18n="faq.q6.s">資格情報はどこに保存されますか？</summary>
+        <div class="ans" data-i18n="faq.q6.a">接続先の鍵パス／パスワードと Bearer トークンは SQLite に保存されます。一方、<strong>SSH 鍵のパスフレーズは保存せず</strong>、アプリ起動中のメモリにのみ保持します。DB ファイルは <code>0700</code> のディレクトリに置かれます。</div>
+      </details>
+      <details>
+        <summary data-i18n="faq.q7.s">保証はありますか？</summary>
+        <div class="ans" data-i18n="faq.q7.a"><strong>ありません。</strong>本ソフトウェアは MIT ライセンスに基づき「<strong>現状有姿（AS IS）</strong>」で提供され、明示・黙示を問わず一切の保証（商品性・特定目的適合性・非侵害など）はありません。利用によって生じたいかなる損害についても、作者・配布者は責任を負いません。本番環境で使う場合は、必ずご自身の責任で検証してください。</div>
+      </details>
+    </div>
+  </section>
+
+  <div class="divider"></div>
+
+  <!-- DEVELOPER -->
+  <section id="dev">
+    <div class="wrap body">
+      <p class="sec-label" data-i18n="dev.label">開発元</p>
+      <h2 class="sec-title" data-i18n="dev.title">開発元について</h2>
+      <div class="dev">
+        <img src="assets/ssh-gate-logo.png" alt="SSH GATE" />
+        <div>
+          <p data-i18n="dev.p1"><strong>QuickIterate Co., Ltd.</strong> が開発しています。日々の小さな摩擦を、確実に取り除く道具づくりを続けています。</p>
+          <p data-i18n="dev.p2">ソースコード・課題・要望は <a href="https://github.com/yoshiyakato/ssh-mcp-server" target="_blank" rel="noopener">GitHub リポジトリ</a> へ。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- DOWNLOAD -->
+  <section id="download" class="band">
+    <div class="wrap body">
+      <p class="sec-label" data-i18n="dl.label">ダウンロード</p>
+      <h2 class="sec-title" data-i18n="dl.title">単一ファイルで、すぐ使える。</h2>
+      <p data-i18n="dl.p">インストール後、サイドバーの「コマンド履歴・承認」や「ターミナル」からそのまま使えます。</p>
+      <div class="dl-grid">
+        <div class="dl-card">
+          <div class="os">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M16.4 12.6c0-2.3 1.9-3.4 2-3.5-1.1-1.6-2.8-1.8-3.4-1.8-1.4-.1-2.8.8-3.5.8-.7 0-1.8-.8-3-.8-1.5 0-3 .9-3.8 2.3-1.6 2.8-.4 7 1.2 9.3.8 1.1 1.7 2.4 2.9 2.3 1.2 0 1.6-.7 3-.7s1.8.7 3 .7c1.2 0 2-1.1 2.8-2.2.9-1.3 1.2-2.5 1.3-2.6-.1 0-2.5-1-2.5-3.8zM14.2 5.9c.6-.8 1-1.9.9-3-.9 0-2 .6-2.7 1.4-.6.7-1.1 1.8-.9 2.9 1 .1 2-.5 2.7-1.3z"/></svg>
+            macOS
+          </div>
+          <div class="meta" data-i18n="dl.mac.meta">Apple Silicon (arm64) · .app (zip)</div>
+          <a class="dlbtn" href="https://github.com/yoshiyakato/ssh-gate-oss/releases" target="_blank" rel="noopener">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M5 21h14"/></svg>
+            <span data-i18n="dl.mac.btn">ダウンロード（5.1MB）</span>
+          </a>
+        </div>
+        <div class="dl-card">
+          <div class="os">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 5.5l7.5-1v7.3H3V5.5zm0 13l7.5 1v-7.2H3v6.2zM11.3 4.4L21 3v8.8h-9.7V4.4zm0 15.2L21 21v-8.7h-9.7v7.3z"/></svg>
+            Windows
+          </div>
+          <div class="meta" data-i18n="dl.win.meta">x64 · .exe (zip)</div>
+          <a class="dlbtn" id="win-btn" href="https://github.com/yoshiyakato/ssh-gate-oss/releases" target="_blank" rel="noopener">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M5 21h14"/></svg>
+            <span data-i18n="dl.win.btn">ダウンロード（8.5MB）</span>
+          </a>
+        </div>
+      </div>
+      <div class="dl-note" data-i18n="dl.note">
+        初回起動の注意（macOS）：未署名アプリのため、初回は <code>.app</code> を右クリック →「開く」で許可してください。<br />
+        初回起動の注意（Windows）：未署名のため SmartScreen が出る場合は「詳細情報」→「実行」で起動できます。<br />
+        ソースからビルド：<code>wails build</code>（Go 1.25 / Node が必要）。詳細は GitHub の README を参照。<br />
+        ライセンスは <strong>MIT</strong>（商用利用・改変・再配布OK）。<br />
+        <strong>無保証（AS IS）</strong>：本ソフトウェアは現状有姿で提供され、明示・黙示を問わず一切の保証はありません。生じた損害について作者・配布者は責任を負いません。<strong>利用は自己責任</strong>でお願いします。
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap foot-inner">
+    <div class="foot-brand"><img src="assets/ssh-gate-logo.png" alt="SSH GATE" />SSH GATE</div>
+    <div class="foot-links">
+      <a href="https://github.com/yoshiyakato/ssh-mcp-server" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/yoshiyakato/ssh-mcp-server/blob/main/LICENSE" target="_blank" rel="noopener" data-i18n="foot.license">MIT License</a>
+      <a href="https://qiita.com/yoshiyakato/private/7987aa7a671f089f06ea" target="_blank" rel="noopener" data-i18n="foot.article">紹介記事</a>
+      <a href="#download" data-i18n="foot.download">ダウンロード</a>
+    </div>
+  </div>
+  <div class="wrap" style="margin-top:18px; font-size:13px; color:#6f7a9a;">© <span id="year">2026</span> QuickIterate Co., Ltd. — SSH GATE（<span style="font-family:var(--mono)">ssh-gete</span>）</div>
+</footer>
+
+<script>
+  document.getElementById('year').textContent = new Date().getFullYear();
+
+  /* ===== i18n ===== */
+  const I18N = {
+    ja: {
+      "meta.title": "SSH GATE — Human-in-the-loop SSH MCP Server（ssh-gete）",
+      "meta.desc": "SSH GATE（ssh-gete）は、AI エージェントの SSH コマンドを人間の承認で通す human-in-the-loop な MCP サーバー。要求は承認キューに並び、承認されてはじめて実行。Low リスクでも自動では走らせない、ローカル完結のデスクトップアプリ。SSH／シリアルの対話ターミナルも内蔵。",
+
+      "nav.why": "なぜ必要か",
+      "nav.features": "機能",
+      "nav.oss": "オープンソース",
+      "nav.faq": "FAQ",
+      "nav.download": "ダウンロード",
+
+      "hero.kicker": "Human-in-the-loop SSH MCP Server",
+      "hero.h1": 'AI が求め、<br /><span class="gold-text">人間が通す。</span>',
+      "hero.lead": 'エージェントが <code>execute_command</code> を呼んでも、走るのはあなたが通してから。\n        要求は<strong style="color:#fff">承認キュー</strong>に並び、人間が目を通してはじめて実機に届きます。\n        <strong style="color:#fff">SSH GATE</strong>（<code>ssh-gete</code>）は、ローカルで完結する human-in-the-loop な SSH ゲートウェイです。',
+      "hero.cta.dl": "ダウンロード",
+      "hero.cta.how": "仕組みを見る",
+      "hero.note": "macOS（Apple Silicon）/ Windows · オープンソース · 通信はローカルだけ",
+      "hero.console.title": "SSH GATE — 承認キュー",
+      "hero.console.body": '<span class="m">agent</span> <span class="y">claude</span> → execute_command\n  host: web01   command: sudo systemctl restart nginx\n  <span class="b">⚠ risk: High</span>   status: 承認待ち（まだ実行していません）\n\n<span class="m"># 人間が GUI で内容を確認 →「承認して実行」</span>\n  <span class="g">✓ 実行済み</span>   0.8s · 監査ログに記録\n',
+
+      "why.label": "なぜ必要か",
+      "why.title": "便利と事故は、紙一重。",
+      "why.p1": '一般的な MCP の SSH サーバーは、エージェントの指示を<strong>そのまま実行</strong>します。\n        判断ミスやプロンプトインジェクションが一発で、<code>rm -rf</code> や <code>systemctl stop</code> を本番で走らせ得る構造です。\n        SSH GATE は、その間に「人間が見て承認する画面」を1枚はさみます。',
+      "why.cmp.head.plain": "素の SSH ツール",
+      "why.cmp.head.gate": "SSH GATE",
+      "why.cmp.r1.l": "エージェントの指示",
+      "why.cmp.r1.a": '<span class="x">即実行</span>',
+      "why.cmp.r1.b": '<span class="o">承認キューに保留</span>',
+      "why.cmp.r2.l": "Low リスクのコマンド",
+      "why.cmp.r2.a": '<span class="x">自動で実行</span>',
+      "why.cmp.r2.b": '<span class="o">それでも承認必須</span>',
+      "why.cmp.r3.l": "誰が・何を・なぜ",
+      "why.cmp.r3.a": '<span class="x">残りにくい</span>',
+      "why.cmp.r3.b": '<span class="o">全件 SQLite に記録</span>',
+      "why.cmp.r4.l": "信頼できるエージェント",
+      "why.cmp.r4.a": "—",
+      "why.cmp.r4.b": '<span class="o">承認省略を段階的に付与</span>',
+      "why.cmp.r5.l": "通信範囲",
+      "why.cmp.r5.a": "—",
+      "why.cmp.r5.b": '<span class="o">既定 127.0.0.1 のみ</span>',
+      "why.p2": "判断と実行の引き金は、人間（または人間が事前に信頼を与えたエージェント）の手に残す。それだけのことを、確実に。",
+
+      "feat.label": "機能",
+      "feat.title": "承認コンソールに必要なもの、ぜんぶ。",
+      "feat.f1.h": "人間承認ゲートウェイ",
+      "feat.f1.p": "エージェントの要求は承認キューへ。GUI で内容を確認し、必要ならコマンドを微修正してから実行できます。",
+      "feat.f2.h": "MCP サーバー内蔵",
+      "feat.f2.p": "JSON-RPC 2.0 over HTTP で <code>list_hosts</code> / <code>execute_command</code> などを提供。Claude などの MCP クライアントから接続できます。",
+      "feat.f3.h": "リスク分類",
+      "feat.f3.p": "コマンドを High / Medium / Low に推定して表示。人間の判断を助けます（あくまで目安。実行可否は承認とポリシーが決めます）。",
+      "feat.f4.h": "監査ログ",
+      "feat.f4.p": "すべての要求・実行結果・所要時間を SQLite に記録。接続先を消しても履歴は残します。",
+      "feat.f5.h": "ライブターミナル（SSH / シリアル）",
+      "feat.f5.p": "承認フローとは別に、人間が直接操作する対話端末を内蔵。SSH の対話シェルとシリアルポートを、同じ画面で扱えます。",
+      "feat.f6.h": "ローカル完結 & 最小保持",
+      "feat.f6.p": "既定の待受は <code>127.0.0.1:8787</code>。SSH 鍵パスフレーズは保存せずメモリのみ。任意で Bearer 認証も。",
+
+      "how.label": "仕組み",
+      "how.title": "エージェントと実機の間に、門番を置く。",
+      "how.p": "人間が操作する GUI、状態を所有する Go バックエンド、機械が話す MCP。承認関門はその真ん中にあります。要求から実行までは、こう流れます。",
+      "how.s1": "<b>エージェントが要求する</b> — <code>execute_command</code> でホスト・コマンド・理由を申請。",
+      "how.s2": "<b>承認キューにためる</b> — 実行せず保留し、リスクを付けて GUI に表示。",
+      "how.s3": "<b>人間が承認する</b> — 内容を確認し、必要なら微修正して「承認して実行」。",
+      "how.s4": "<b>実行して記録する</b> — SSH 実行。結果と所要時間を監査ログに残す。",
+
+      "term.label": "ターミナル",
+      "term.title": "SSH も シリアルも、ひとつの画面で。",
+      "term.p": '承認フローに乗らない「人間の直接操作」も用意しています。接続先に種別（SSH / シリアル）を持たせ、ターミナルはそれに従属。\n        ネットワーク機器のコンソールや USB シリアルも、SSH の対話シェルと同じ操作で開けます。\n        <strong>シリアル接続先は MCP からは実行できません</strong>（対話 GUI 専用）。',
+
+      "sec.label": "安全設計",
+      "sec.title": "安全は、1個ではなく層で積む。",
+      "sec.s1.h": "デフォルト承認必須",
+      "sec.s1.p": "Low リスクでも自動実行しない。<code>AutoExecuteLowRisk</code> はバックエンドとフロントの二重で false に固定。",
+      "sec.s2.h": "エージェント名の必須化",
+      "sec.s2.p": "誰の要求かを必ず記録。未申告のエージェントには承認省略を付与できません。",
+      "sec.s3.h": "出力上限とタイムアウト",
+      "sec.s3.p": "stdout/stderr を上限で打ち切り、接続・コマンドにタイムアウト。超過時は確実に kill。",
+      "sec.s4.h": "資格情報の最小保持",
+      "sec.s4.p": "SSH 鍵パスフレーズはメモリのみ（DB 非保存）。トークンはマスク表示で平文を返しません。",
+
+      "oss.label": "オープンソース",
+      "oss.title": "大事な SSH／シリアルだからこそ、中身が見える。",
+      "oss.p": "承認をすり抜けて実行する裏口がないか。資格情報をこっそり外へ送っていないか。\n        —— サーバーの鍵やコンソールを預ける道具が<strong>ブラックボックスでは、意味がありません</strong>。\n        SSH GATE は<strong>ソースを丸ごと公開</strong>しています（<strong>MIT ライセンス</strong>。商用利用・改変・再配布OK）。\n        動作は<strong>ローカルだけ</strong>で完結し、外部に何も送りません。気になる挙動は、コードでそのまま確かめられます。",
+      "oss.cta": "GitHub でソースを見る",
+
+      "faq.label": "FAQ",
+      "faq.title": "よくある質問",
+      "faq.q1.s": "もっと詳しい紹介・背景は？",
+      "faq.q1.a": '開発の背景や使いどころを Qiita の紹介記事にまとめています →\n          <a href="https://qiita.com/yoshiyakato/private/7987aa7a671f089f06ea" target="_blank" rel="noopener">SSH GATE 紹介記事（Qiita）</a>。\n          <br /><small>※ 限定共有リンクです。</small>',
+      "faq.q2.s": "本当にエージェントから勝手に実行されませんか？",
+      "faq.q2.a": "はい。MCP 経由のコマンドはリスクに関係なく承認キューに入ります。実行されるのは、人間が GUI で承認したときか、特定エージェントに明示的に「承認省略」を与えたときだけです。後者は人間が意図的に付与した場合のみ有効です。",
+      "faq.q3.s": "リスク分類（High/Medium/Low）はどこまで信用できますか？",
+      "faq.q3.a": "コマンド文字列のヒューリスティックなので、クオートやエイリアスで回避され得ます。あくまで人間の判断を助ける<strong>目安</strong>で、これ自体が実行可否を決めるわけではありません。実行可否は承認とポリシーが決めます。",
+      "faq.q4.s": "外部に公開されますか？",
+      "faq.q4.a": "既定の待受は <code>127.0.0.1:8787</code>。ローカルのエージェントとだけ通信する前提です。必要に応じて Bearer 認証・ボディサイズ上限・CORS 制限を設定できます。",
+      "faq.q5.s": "シリアルポートにも使えますか？",
+      "faq.q5.a": "使えます。接続先の種別を「シリアル」にすると、ターミナル画面でシリアルコンソールが開きます。SSH と同じ操作感です。なお、シリアルは対話 GUI 専用で、MCP（エージェント）からは実行できません。",
+      "faq.q6.s": "資格情報はどこに保存されますか？",
+      "faq.q6.a": "接続先の鍵パス／パスワードと Bearer トークンは SQLite に保存されます。一方、<strong>SSH 鍵のパスフレーズは保存せず</strong>、アプリ起動中のメモリにのみ保持します。DB ファイルは <code>0700</code> のディレクトリに置かれます。",
+      "faq.q7.s": "保証はありますか？",
+      "faq.q7.a": "<strong>ありません。</strong>本ソフトウェアは MIT ライセンスに基づき「<strong>現状有姿（AS IS）</strong>」で提供され、明示・黙示を問わず一切の保証（商品性・特定目的適合性・非侵害など）はありません。利用によって生じたいかなる損害についても、作者・配布者は責任を負いません。本番環境で使う場合は、必ずご自身の責任で検証してください。",
+
+      "dev.label": "開発元",
+      "dev.title": "開発元について",
+      "dev.p1": "<strong>QuickIterate Co., Ltd.</strong> が開発しています。日々の小さな摩擦を、確実に取り除く道具づくりを続けています。",
+      "dev.p2": 'ソースコード・課題・要望は <a href="https://github.com/yoshiyakato/ssh-mcp-server" target="_blank" rel="noopener">GitHub リポジトリ</a> へ。',
+
+      "dl.label": "ダウンロード",
+      "dl.title": "単一ファイルで、すぐ使える。",
+      "dl.p": "インストール後、サイドバーの「コマンド履歴・承認」や「ターミナル」からそのまま使えます。",
+      "dl.mac.meta": "Apple Silicon (arm64) · .app (zip)",
+      "dl.mac.btn": "ダウンロード（5.1MB）",
+      "dl.win.meta": "x64 · .exe (zip)",
+      "dl.win.btn": "ダウンロード（8.5MB）",
+      "dl.note": "初回起動の注意（macOS）：未署名アプリのため、初回は <code>.app</code> を右クリック →「開く」で許可してください。<br />\n        初回起動の注意（Windows）：未署名のため SmartScreen が出る場合は「詳細情報」→「実行」で起動できます。<br />\n        ソースからビルド：<code>wails build</code>（Go 1.25 / Node が必要）。詳細は GitHub の README を参照。<br />\n        ライセンスは <strong>MIT</strong>（商用利用・改変・再配布OK）。<br />\n        <strong>無保証（AS IS）</strong>：本ソフトウェアは現状有姿で提供され、明示・黙示を問わず一切の保証はありません。生じた損害について作者・配布者は責任を負いません。<strong>利用は自己責任</strong>でお願いします。",
+
+      "foot.license": "MIT License",
+      "foot.article": "紹介記事",
+      "foot.download": "ダウンロード"
+    },
+    en: {
+      "meta.title": "SSH GATE — Human-in-the-loop SSH MCP Server (ssh-gete)",
+      "meta.desc": "SSH GATE (ssh-gete) is a human-in-the-loop MCP server for AI agents' SSH: every command waits in an approval queue and runs only after a human approves — even Low-risk ones. Fully local, with built-in interactive SSH/serial terminals.",
+
+      "nav.why": "Why",
+      "nav.features": "Features",
+      "nav.oss": "Open Source",
+      "nav.faq": "FAQ",
+      "nav.download": "Download",
+
+      "hero.kicker": "Human-in-the-loop SSH MCP Server",
+      "hero.h1": 'The AI requests.<br /><span class="gold-text">A human lets it through.</span>',
+      "hero.lead": 'When an agent calls <code>execute_command</code>, nothing runs yet.\n        The request waits in an <strong style="color:#fff">approval queue</strong> and reaches the machine only after a human approves it.\n        <strong style="color:#fff">SSH GATE</strong> (<code>ssh-gete</code>) is a fully local, human-in-the-loop SSH gateway.',
+      "hero.cta.dl": "Download",
+      "hero.cta.how": "See how it works",
+      "hero.note": "macOS (Apple Silicon) / Windows · Open source · All traffic stays local",
+      "hero.console.title": "SSH GATE — Approval Queue",
+      "hero.console.body": '<span class="m">agent</span> <span class="y">claude</span> → execute_command\n  host: web01   command: sudo systemctl restart nginx\n  <span class="b">⚠ risk: High</span>   status: awaiting approval (not yet executed)\n\n<span class="m"># A human reviews it in the GUI → "Approve & run"</span>\n  <span class="g">✓ executed</span>   0.8s · recorded in the audit log\n',
+
+      "why.label": "Why you need it",
+      "why.title": "Convenience and disaster are one keystroke apart.",
+      "why.p1": 'A typical MCP SSH server <strong>runs the agent\'s instructions as-is</strong>.\n        A single misjudgment or prompt injection is enough to fire <code>rm -rf</code> or <code>systemctl stop</code> in production.\n        SSH GATE inserts one screen in between — "a human looks at it and approves."',
+      "why.cmp.head.plain": "Plain SSH tool",
+      "why.cmp.head.gate": "SSH GATE",
+      "why.cmp.r1.l": "Agent's instruction",
+      "why.cmp.r1.a": '<span class="x">Runs immediately</span>',
+      "why.cmp.r1.b": '<span class="o">Held in approval queue</span>',
+      "why.cmp.r2.l": "Low-risk command",
+      "why.cmp.r2.a": '<span class="x">Runs automatically</span>',
+      "why.cmp.r2.b": '<span class="o">Still requires approval</span>',
+      "why.cmp.r3.l": "Who / what / why",
+      "why.cmp.r3.a": '<span class="x">Rarely kept</span>',
+      "why.cmp.r3.b": '<span class="o">Every entry logged to SQLite</span>',
+      "why.cmp.r4.l": "Trusted agents",
+      "why.cmp.r4.a": "—",
+      "why.cmp.r4.b": '<span class="o">Grant approval-skip step by step</span>',
+      "why.cmp.r5.l": "Network scope",
+      "why.cmp.r5.a": "—",
+      "why.cmp.r5.b": '<span class="o">127.0.0.1 only by default</span>',
+      "why.p2": "Keep the trigger for judgment and execution in human hands (or with an agent the human trusted in advance). Just that — reliably.",
+
+      "feat.label": "Features",
+      "feat.title": "Everything an approval console needs.",
+      "feat.f1.h": "Human approval gateway",
+      "feat.f1.p": "Agent requests go into the approval queue. Review them in the GUI and, if needed, tweak the command before running it.",
+      "feat.f2.h": "Built-in MCP server",
+      "feat.f2.p": "Exposes <code>list_hosts</code> / <code>execute_command</code> and more over JSON-RPC 2.0 on HTTP. MCP clients such as Claude can connect.",
+      "feat.f3.h": "Risk classification",
+      "feat.f3.p": "Estimates and labels each command as High / Medium / Low to aid human judgment (a guide only — approval and policy decide whether it runs).",
+      "feat.f4.h": "Audit log",
+      "feat.f4.p": "Every request, execution result, and duration is recorded in SQLite. The history remains even if you delete the host.",
+      "feat.f5.h": "Live terminal (SSH / serial)",
+      "feat.f5.p": "Separate from the approval flow, an interactive terminal for direct human operation is built in. Handle interactive SSH shells and serial ports on the same screen.",
+      "feat.f6.h": "Fully local & minimal retention",
+      "feat.f6.p": "Listens on <code>127.0.0.1:8787</code> by default. SSH key passphrases are never stored — kept in memory only. Optional Bearer authentication too.",
+
+      "how.label": "How it works",
+      "how.title": "Place a gatekeeper between the agent and the real machine.",
+      "how.p": "A GUI the human operates, a Go backend that owns the state, and the MCP that machines speak — the approval gate sits right in the middle. From request to execution, the flow goes like this.",
+      "how.s1": "<b>The agent makes a request</b> — submits host, command, and reason via <code>execute_command</code>.",
+      "how.s2": "<b>Held in the approval queue</b> — not executed; held with a risk label and shown in the GUI.",
+      "how.s3": "<b>A human approves</b> — reviews the content, tweaks if needed, and clicks \"Approve & run.\"",
+      "how.s4": "<b>Execute and record</b> — runs over SSH and records the result and duration in the audit log.",
+
+      "term.label": "Terminal",
+      "term.title": "SSH and serial, on a single screen.",
+      "term.p": '"Direct human operation" that does not go through the approval flow is provided too. Each host carries a type (SSH / serial), and the terminal follows it.\n        Network-device consoles and USB serial open with the same feel as an interactive SSH shell.\n        <strong>Serial hosts cannot be executed from MCP</strong> (interactive GUI only).',
+
+      "sec.label": "Security by design",
+      "sec.title": "Safety is built in layers, not a single switch.",
+      "sec.s1.h": "Approval required by default",
+      "sec.s1.p": "Low-risk commands are not auto-executed either. <code>AutoExecuteLowRisk</code> is pinned to false on both the backend and the frontend.",
+      "sec.s2.h": "Agent name required",
+      "sec.s2.p": "Always records whose request it is. You cannot grant approval-skip to an undeclared agent.",
+      "sec.s3.h": "Output limits and timeouts",
+      "sec.s3.p": "stdout/stderr are truncated at a cap, and connections and commands have timeouts. On overrun, the process is reliably killed.",
+      "sec.s4.h": "Minimal credential retention",
+      "sec.s4.p": "SSH key passphrases live in memory only (never stored in the DB). Tokens are shown masked and never returned in plaintext.",
+
+      "oss.label": "Open source",
+      "oss.title": "Because SSH and serial matter, you can see what's inside.",
+      "oss.p": "Is there a back door that runs around the approval? Is it quietly sending your credentials somewhere?\n        —— A tool you entrust with your servers' keys and consoles is <strong>meaningless as a black box</strong>.\n        SSH GATE <strong>publishes its entire source</strong> (<strong>MIT License</strong> — commercial use, modification, and redistribution OK).\n        It runs <strong>fully locally</strong> and sends nothing externally. Any behavior you wonder about, you can verify right in the code.",
+      "oss.cta": "View the source on GitHub",
+
+      "faq.label": "FAQ",
+      "faq.title": "Frequently asked questions",
+      "faq.q1.s": "Where can I read a fuller introduction and background?",
+      "faq.q1.a": 'We have summarized the development background and use cases in an article on Qiita →\n          <a href="https://qiita.com/yoshiyakato/private/7987aa7a671f089f06ea" target="_blank" rel="noopener">SSH GATE introduction (Qiita)</a>.\n          <br /><small>* This is a limited-share link.</small>',
+      "faq.q2.s": "Will it really never run on its own from an agent?",
+      "faq.q2.a": "Correct. Commands via MCP go into the approval queue regardless of risk. They run only when a human approves them in the GUI, or when a specific agent has been explicitly granted \"approval-skip.\" The latter takes effect only when a human intentionally granted it.",
+      "faq.q3.s": "How far can I trust the risk classification (High/Medium/Low)?",
+      "faq.q3.a": "It's a heuristic on the command string, so it can be evaded with quoting or aliases. It's a <strong>guide</strong> to aid human judgment only and does not itself decide whether a command runs. Approval and policy decide that.",
+      "faq.q4.s": "Will it be exposed externally?",
+      "faq.q4.a": "It listens on <code>127.0.0.1:8787</code> by default, on the assumption that it talks only to local agents. You can configure Bearer authentication, a body-size cap, and CORS restrictions as needed.",
+      "faq.q5.s": "Can I use it for serial ports?",
+      "faq.q5.a": "Yes. Set the host's type to \"serial\" and a serial console opens in the terminal screen, with the same feel as SSH. Note that serial is interactive-GUI only and cannot be executed from MCP (agents).",
+      "faq.q6.s": "Where are credentials stored?",
+      "faq.q6.a": "A host's key path / password and the Bearer token are stored in SQLite. On the other hand, <strong>SSH key passphrases are not stored</strong> — they are kept only in memory while the app is running. The DB file is placed in a <code>0700</code> directory.",
+      "faq.q7.s": "Is there a warranty?",
+      "faq.q7.a": "<strong>No.</strong> This software is provided under the MIT License <strong>\"AS IS\"</strong>, without warranty of any kind, express or implied, including but not limited to merchantability, fitness for a particular purpose, and non-infringement. In no event shall the authors or distributors be liable for any damage arising from its use. If you use it in production, be sure to validate it at your own risk.",
+
+      "dev.label": "Developer",
+      "dev.title": "About the developer",
+      "dev.p1": "<strong>QuickIterate Co., Ltd.</strong> develops it. We keep building tools that reliably remove the small frictions of everyday work.",
+      "dev.p2": 'For source code, issues, and requests, head to the <a href="https://github.com/yoshiyakato/ssh-mcp-server" target="_blank" rel="noopener">GitHub repository</a>.',
+
+      "dl.label": "Download",
+      "dl.title": "A single file, ready to use right away.",
+      "dl.p": "After installing, use it directly from \"Command history & approvals\" or \"Terminal\" in the sidebar.",
+      "dl.mac.meta": "Apple Silicon (arm64) · .app (zip)",
+      "dl.mac.btn": "Download (5.1MB)",
+      "dl.win.meta": "x64 · .exe (zip)",
+      "dl.win.btn": "Download (8.5MB)",
+      "dl.note": "First-launch note (macOS): Since the app is unsigned, on first launch right-click the <code>.app</code> → \"Open\" to allow it.<br />\n        First-launch note (Windows): Since it is unsigned, if SmartScreen appears, click \"More info\" → \"Run anyway\" to start it.<br />\n        Build from source: <code>wails build</code> (requires Go 1.25 / Node). See the README on GitHub for details.<br />\n        Licensed under <strong>MIT</strong> (commercial use, modification, and redistribution OK).<br />\n        <strong>No warranty (AS IS)</strong>: This software is provided as-is, without warranty of any kind, express or implied. The authors and distributors are not liable for any damage that may arise. <strong>Use is at your own risk.</strong>",
+
+      "foot.license": "MIT License",
+      "foot.article": "Article",
+      "foot.download": "Download"
+    }
+  };
+
+  (function () {
+    const titleEl = document.getElementById('page-title');
+    const descEl = document.getElementById('page-desc');
+    const btns = document.querySelectorAll('.lang-switch button[data-lang]');
+
+    function applyLang(lang) {
+      const dict = I18N[lang] || I18N.ja;
+      document.documentElement.lang = lang;
+      document.querySelectorAll('[data-i18n]').forEach(function (el) {
+        const key = el.getAttribute('data-i18n');
+        if (Object.prototype.hasOwnProperty.call(dict, key)) {
+          el.innerHTML = dict[key];
+        }
+      });
+      if (dict['meta.title']) { document.title = dict['meta.title']; if (titleEl) titleEl.textContent = dict['meta.title']; }
+      if (descEl && dict['meta.desc']) descEl.setAttribute('content', dict['meta.desc']);
+      btns.forEach(function (b) { b.classList.toggle('active', b.getAttribute('data-lang') === lang); });
+      try { localStorage.setItem('sshgate-lang', lang); } catch (e) {}
+    }
+
+    let initial;
+    try { initial = localStorage.getItem('sshgate-lang'); } catch (e) {}
+    if (initial !== 'ja' && initial !== 'en') {
+      initial = (navigator.language || '').toLowerCase().indexOf('en') === 0 ? 'en' : 'ja';
+    }
+
+    btns.forEach(function (b) {
+      b.addEventListener('click', function () { applyLang(b.getAttribute('data-lang')); });
+    });
+
+    applyLang(initial);
+  })();
+</script>
+</body>
+</html>
