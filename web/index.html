@@ -131,6 +131,10 @@
   .console pre { margin: 0; padding: 18px; font-family: var(--mono); font-size: 13px; line-height: 1.9; overflow-x: auto; color: #dde4f5; }
   .console .g{color:#46d399}.console .b{color:#ff8095}.console .m{color:#7b86a8}.console .y{color:var(--gold-2)}
   .shot { display: block; margin: 44px auto 0; width: 100%; max-width: 940px; border-radius: 14px; border: 1px solid rgba(201,162,39,0.28); box-shadow: 0 30px 70px -28px rgba(0,0,0,0.8); }
+  .term-flex { display: flex; align-items: center; gap: 32px; }
+  .term-flex p { flex: 1; margin: 0; }
+  .cable { width: 220px; flex-shrink: 0; border-radius: 14px; background: #fff; border: 1px solid rgba(201,162,39,0.28); box-shadow: 0 20px 50px -24px rgba(0,0,0,0.7); }
+  @media (max-width: 720px) { .term-flex { flex-direction: column; } .cable { width: 190px; } }
 
   /* ===== sections ===== */
   section { padding: 58px 0; }
@@ -315,11 +319,14 @@
     <div class="wrap body">
       <p class="sec-label" data-i18n="term.label">ターミナル</p>
       <h2 class="sec-title" data-i18n="term.title">SSH も シリアルも、ひとつの画面で。</h2>
-      <p data-i18n="term.p">
-        承認フローに乗らない「人間の直接操作」も用意しています。接続先に種別（SSH / シリアル）を持たせ、ターミナルはそれに従属。
-        ネットワーク機器のコンソールや USB シリアルも、SSH の対話シェルと同じ操作で開けます。
-        <strong>シリアル接続先は MCP からは実行できません</strong>（対話 GUI 専用）。
-      </p>
+      <div class="term-flex">
+        <p data-i18n="term.p">
+          承認フローに乗らない「人間の直接操作」も用意しています。接続先に種別（SSH / シリアル）を持たせ、ターミナルはそれに従属。
+          ネットワーク機器のコンソールや USB シリアルも、SSH の対話シェルと同じ操作で開けます。
+          <strong>シリアル接続先は MCP からは実行できません</strong>（対話 GUI 専用）。
+        </p>
+        <img class="cable" src="assets/serial-cable.png" alt="USB–シリアル変換ケーブル（USB-A / D-sub 9pin）" loading="lazy" />
+      </div>
       <img class="shot" src="assets/screenshot-terminal.png" alt="SSH GATE のターミナル画面 — 接続先の詳細と xterm のインタラクティブシェル" loading="lazy" />
     </div>
   </section>
