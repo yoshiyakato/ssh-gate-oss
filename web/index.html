@@ -130,6 +130,7 @@
   .console .bar .t { margin-left: 9px; font-family: var(--mono); font-size: 12px; color: #8893b5; }
   .console pre { margin: 0; padding: 18px; font-family: var(--mono); font-size: 13px; line-height: 1.9; overflow-x: auto; color: #dde4f5; }
   .console .g{color:#46d399}.console .b{color:#ff8095}.console .m{color:#7b86a8}.console .y{color:var(--gold-2)}
+  .shot { display: block; margin: 44px auto 0; width: 100%; max-width: 940px; border-radius: 14px; border: 1px solid rgba(201,162,39,0.28); box-shadow: 0 30px 70px -28px rgba(0,0,0,0.8); }
 
   /* ===== sections ===== */
   section { padding: 58px 0; }
@@ -328,14 +329,7 @@
         ネットワーク機器のコンソールや USB シリアルも、SSH の対話シェルと同じ操作で開けます。
         <strong>シリアル接続先は MCP からは実行できません</strong>（対話 GUI 専用）。
       </p>
-      <div class="console">
-        <div class="bar"><span class="d r"></span><span class="d y"></span><span class="d g"></span><span class="t">serial console — /dev/cu.usbserial-8330 @ 115200</span></div>
-<pre><span class="g">Router&gt;</span> enable
-<span class="g">Router#</span> show version
-  <span class="m">Cisco IOS Software, Version 15.x ...</span>
-  <span class="m">uptime is 42 days, 3 hours</span>
-</pre>
-      </div>
+      <img class="shot" src="assets/screenshot-terminal.png" alt="SSH GATE のターミナル画面 — 接続先の詳細と xterm のインタラクティブシェル" loading="lazy" />
     </div>
   </section>
 
