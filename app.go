@@ -55,8 +55,27 @@ type App struct {
 	lifecycleMu sync.Mutex
 	mcpServer   *http.Server
 
-	termMu sync.Mutex
-	term   *terminalSession
+	// appCtx is cancelled (cause errShuttingDown) when the app shuts down;
+	// every command execution derives from it or is tied to it by trackExec.
+	appCtx    context.Context
+	appCancel context.CancelFunc
+	// execMu is a leaf lock guarding execs/execSeq: never call out while
+	// holding it.
+	execMu       sync.Mutex
+	execs        map[uint64]runningExec
+	execSeq      uint64
+	execWG       sync.WaitGroup
+	runningTotal atomic.Int64 // §6.1: running commands, shown without a pool
+	sessionsSeq  atomic.Uint64
+	// sessionsMu serializes building a sessions snapshot with stamping its
+	// sessionsSeq, so a higher seq never carries older data. It is the
+	// outermost lock: taken only by notifySessionsChanged / GetInitialData,
+	// never while holding a.mu, termMu or execMu.
+	sessionsMu sync.Mutex
+
+	terminalState
+	emit              func(name string, payload any) // test hook; nil means Wails runtime
+	onSessionsChanged func()                         // set by NewApp
 }
 
 type Connection struct {
@@ -186,7 +205,60 @@ type DashboardData struct {
 	AgentPolicies []AgentPolicy    `json:"agentPolicies"`
 	MCP           MCPSettings      `json:"mcp"`
 	StorageError  string           `json:"storageError"`
+	Sessions      []SessionSummary `json:"sessions"` // every saved connection, in a.conns order
+	Terminals     []TerminalInfo   `json:"terminals"`
+	RunningTotal  int              `json:"runningTotal"`
+	SessionsSeq   uint64           `json:"sessionsSeq"`
 }
+
+// SessionSummary is the live runtime state of one saved connection (§5.4
+// connState). It is derived on every call and never persisted.
+type SessionSummary struct {
+	ConnID         string `json:"connId"`
+	ConnName       string `json:"connName"`
+	Kind           string `json:"kind"`                     // "ssh" | "serial"
+	ConnState      string `json:"connState"`                // connected | connecting | error | disconnected | in_use (serial)
+	Shells         int    `json:"shells"`                   // open tabs
+	Connecting     int    `json:"connecting"`               // tabs still dialing
+	Running        int    `json:"running"`                  // commands being executed
+	Pending        int    `json:"pending"`                  // requests awaiting approval
+	ConnectedSince string `json:"connectedSince,omitempty"` // RFC3339, earliest open tab
+	LastError      string `json:"lastError,omitempty"`
+	Label          string `json:"label,omitempty"` // serial only: "/dev/cu.usbserial-10 @115200"
+}
+
+// sessionsPayload is the sessions:changed event body; the field names match
+// DashboardData so the frontend can merge either one the same way.
+type sessionsPayload struct {
+	Sessions     []SessionSummary `json:"sessions"`
+	Terminals    []TerminalInfo   `json:"terminals"`
+	RunningTotal int              `json:"runningTotal"`
+	SessionsSeq  uint64           `json:"sessionsSeq"`
+}
+
+// Connection runtime states (§5.4). idle / available / missing belong to
+// later stages and are not produced here.
+const (
+	connStateConnected    = "connected"
+	connStateConnecting   = "connecting"
+	connStateError        = "error"
+	connStateDisconnected = "disconnected"
+	connStateInUse        = "in_use"
+)
+
+// runningExec is one command execution in flight, cancellable by connection.
+type runningExec struct {
+	connID string
+	cancel context.CancelCauseFunc
+}
+
+var (
+	errDisconnected = errors.New("接続を切断したため中止しました")
+	errShuttingDown = errors.New("アプリの終了により中断しました")
+	// shutdownExecGrace bounds how long shutdown waits for cancelled commands
+	// to record their outcome. Tests shorten it.
+	shutdownExecGrace = 5 * time.Second
+)
 
 type ActionResult struct {
 	OK      bool   `json:"ok"`
@@ -198,6 +270,8 @@ type ActionResult struct {
 	ID string `json:"id,omitempty"`
 	// Token is only set by GenerateMCPToken, shown once to the user.
 	Token string `json:"token,omitempty"`
+	// SessionID is the terminal tab a terminal API call acted on.
+	SessionID string `json:"sessionId,omitempty"`
 }
 
 type commandResult struct {
@@ -225,7 +299,12 @@ func NewApp() *App {
 		agentPolicies:     map[string]AgentPolicy{},
 		sshPassphrases:    map[string]string{},
 		requestsChanged:   make(chan struct{}),
+		execs:             map[uint64]runningExec{},
 	}
+	appCtx, cancelApp := context.WithCancelCause(context.Background())
+	app.appCtx = appCtx
+	app.appCancel = func() { cancelApp(errShuttingDown) }
+	app.onSessionsChanged = app.notifySessionsChanged
 
 	store, err := openStore(dbPath)
 	if err != nil {
@@ -303,12 +382,61 @@ func (a *App) startup(ctx context.Context) {
 	}
 }
 
+// shutdown follows §5.0: stop accepting MCP calls, cancel running commands
+// and give them a bounded grace to record "interrupted", close every
+// terminal, then close the store.
+//
+// appCancel comes first: once appCtx is done trackExec refuses new
+// executions (so intake is already stopped), and running ones are cancelled
+// with errShuttingDown before the HTTP server is shut down. Stopping the
+// server first would make Shutdown wait out its deadline on in-flight
+// execute_command calls and then Close would cancel r.Context(), recording
+// them as canceled failures instead of interrupted.
 func (a *App) shutdown(ctx context.Context) {
-	a.CloseTerminal()
+	a.appCancel()
+	a.cancelExecs(func(runningExec) bool { return true }, errShuttingDown)
 	a.stopMCPServer(ctx)
+	a.waitExecs(shutdownExecGrace)
+	a.CloseAllTerminals()
 	if err := a.store.Close(); err != nil {
 		log.Printf("close sqlite store: %v", err)
 	}
+}
+
+// waitExecs waits up to grace for tracked executions to end and for their
+// requests to leave running / auto_running (finishRequest runs after the
+// tracker is released, so the WaitGroup alone is not enough).
+func (a *App) waitExecs(grace time.Duration) {
+	deadline := time.Now().Add(grace)
+	// Barrier: trackExec adds to execWG under execMu only while appCtx is
+	// alive, so after this no Add can race with Wait.
+	a.execMu.Lock()
+	a.execMu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		a.execWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Until(deadline)):
+		log.Printf("shutdown: commands still running after %s", grace)
+		return
+	}
+	for a.hasRunningRequests() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (a *App) hasRunningRequests() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	for _, req := range a.requests {
+		if req.Status == stateRunning || req.Status == stateAutoRunning {
+			return true
+		}
+	}
+	return false
 }
 
 // effectiveTokenLocked is the token MCP clients must present. Callers hold a.mu.
@@ -319,16 +447,218 @@ func (a *App) effectiveTokenLocked() string {
 	return a.mcpToken
 }
 
+// GetInitialData copies the persisted state under a.mu, then (after
+// releasing it) adds the live sessions snapshot, so a.mu and termMu are never
+// held together.
 func (a *App) GetInitialData() DashboardData {
 	a.mu.RLock()
-	defer a.mu.RUnlock()
-	return DashboardData{
+	data := DashboardData{
 		Connections:   publicConnections(a.conns),
 		Requests:      cloneRequests(a.requests),
 		AgentPolicies: cloneAgentPolicies(a.agentPolicies),
 		MCP:           a.mcpSnapshotLocked(),
 		StorageError:  a.storageError,
 	}
+	a.mu.RUnlock()
+	snapshot := a.sessionsSnapshot()
+	data.Sessions = snapshot.Sessions
+	data.Terminals = snapshot.Terminals
+	data.RunningTotal = snapshot.RunningTotal
+	data.SessionsSeq = snapshot.SessionsSeq
+	return data
+}
+
+// sessionsSnapshot builds the live sessions view and stamps it with the next
+// sessionsSeq. sessionsMu makes the stamp order match the snapshot order.
+func (a *App) sessionsSnapshot() sessionsPayload {
+	a.sessionsMu.Lock()
+	defer a.sessionsMu.Unlock()
+	return a.sessionsSnapshotLocked()
+}
+
+func (a *App) sessionsSnapshotLocked() sessionsPayload {
+	terminals := a.listTerminalInfos()
+	if terminals == nil {
+		terminals = []TerminalInfo{}
+	}
+	return sessionsPayload{
+		Sessions:     a.sessionSummaries(),
+		Terminals:    terminals,
+		RunningTotal: int(a.runningTotal.Load()),
+		SessionsSeq:  a.sessionsSeq.Add(1),
+	}
+}
+
+// notifySessionsChanged publishes sessions:changed. It is installed as
+// a.onSessionsChanged, so every a.sessionsChanged() lands here. Callers must
+// not hold a.mu, termMu or execMu.
+func (a *App) notifySessionsChanged() {
+	a.sessionsMu.Lock()
+	defer a.sessionsMu.Unlock()
+	// Emitting under sessionsMu keeps events in sessionsSeq order.
+	a.emitEvent(sessionsChangedEvent, a.sessionsSnapshotLocked())
+}
+
+// sessionSummaries derives one SessionSummary per saved connection: a.mu is
+// held only to copy conns and pending counts, then the terminal and exec
+// counters are read with their own locks.
+func (a *App) sessionSummaries() []SessionSummary {
+	a.mu.RLock()
+	conns := make([]Connection, len(a.conns))
+	copy(conns, a.conns)
+	pending := map[string]int{}
+	for _, req := range a.requests {
+		if req.Status == statePending && req.ConnectionID != "" {
+			pending[req.ConnectionID]++
+		}
+	}
+	a.mu.RUnlock()
+
+	terminals := a.terminalRuntime()
+	running := a.runningCounts()
+	out := make([]SessionSummary, 0, len(conns))
+	for _, conn := range conns {
+		rt := terminals[conn.ID]
+		s := SessionSummary{
+			ConnID:     conn.ID,
+			ConnName:   conn.Name,
+			Kind:       "ssh",
+			Shells:     rt.Open,
+			Connecting: rt.Connecting,
+			Running:    running[conn.ID],
+			Pending:    pending[conn.ID],
+			LastError:  rt.LastError,
+		}
+		serial := conn.connectionType() == "Serial"
+		if serial {
+			s.Kind = "serial"
+			baud := conn.BaudRate
+			if baud <= 0 {
+				baud = 115200
+			}
+			s.Label = fmt.Sprintf("%s @%d", conn.SerialPort, baud)
+		}
+		if !rt.Since.IsZero() {
+			s.ConnectedSince = rt.Since.Format(time.RFC3339)
+		}
+		// "Connected" means "has a live tab" (§5.1); running commands do not
+		// change connState.
+		switch {
+		case s.Shells > 0 && serial:
+			s.ConnState = connStateInUse
+		case s.Shells > 0:
+			s.ConnState = connStateConnected
+		case s.Connecting > 0:
+			s.ConnState = connStateConnecting
+		case s.LastError != "":
+			s.ConnState = connStateError
+		default:
+			s.ConnState = connStateDisconnected
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// trackExec registers one command execution for the running counters and
+// for cancellation by DisconnectConnection / shutdown. The returned context
+// is cancelled with errDisconnected or errShuttingDown as its cause; done
+// must be called exactly once when the execution ends (extra calls are
+// ignored), and cancels the context.
+func (a *App) trackExec(parent context.Context, connID string) (context.Context, func()) {
+	ctx, cancel := context.WithCancelCause(parent)
+	// Parents not derived from appCtx (an MCP request's r.Context()) still
+	// stop on shutdown.
+	stop := context.AfterFunc(a.appCtx, func() { cancel(errShuttingDown) })
+
+	a.execMu.Lock()
+	if a.appCtx.Err() != nil {
+		a.execMu.Unlock()
+		stop()
+		cancel(errShuttingDown)
+		return ctx, func() {}
+	}
+	a.execSeq++
+	key := a.execSeq
+	a.execs[key] = runningExec{connID: connID, cancel: cancel}
+	a.execWG.Add(1)
+	a.execMu.Unlock()
+	a.runningTotal.Add(1)
+	a.sessionsChanged()
+
+	var once sync.Once
+	return ctx, func() {
+		once.Do(func() {
+			stop()
+			a.execMu.Lock()
+			delete(a.execs, key)
+			a.execMu.Unlock()
+			cancel(context.Canceled)
+			a.runningTotal.Add(-1)
+			a.execWG.Done()
+			a.sessionsChanged()
+		})
+	}
+}
+
+// runningCounts returns the number of executions in flight per connection ID.
+func (a *App) runningCounts() map[string]int {
+	a.execMu.Lock()
+	defer a.execMu.Unlock()
+	counts := map[string]int{}
+	for _, exec := range a.execs {
+		counts[exec.connID]++
+	}
+	return counts
+}
+
+// cancelExecsForConnection cancels every execution on connID with cause and
+// returns how many were cancelled.
+func (a *App) cancelExecsForConnection(connID string, cause error) int {
+	return a.cancelExecs(func(exec runningExec) bool { return exec.connID == connID }, cause)
+}
+
+func (a *App) cancelExecs(match func(runningExec) bool, cause error) int {
+	a.execMu.Lock()
+	var cancels []context.CancelCauseFunc
+	for _, exec := range a.execs {
+		if match(exec) {
+			cancels = append(cancels, exec.cancel)
+		}
+	}
+	a.execMu.Unlock()
+	for _, cancel := range cancels {
+		cancel(cause)
+	}
+	return len(cancels)
+}
+
+// activeWork is what an OnBeforeClose confirmation needs to decide whether
+// to ask (§5.0): live tabs (open or connecting), running commands and
+// requests awaiting approval.
+type activeWork struct {
+	Terminals int
+	Running   int
+	Pending   int
+}
+
+func (a *App) activeWork() activeWork {
+	work := activeWork{Running: int(a.runningTotal.Load())}
+	for _, rt := range a.terminalRuntime() {
+		work.Terminals += rt.Open + rt.Connecting
+	}
+	a.mu.RLock()
+	for _, req := range a.requests {
+		if req.Status == statePending {
+			work.Pending++
+		}
+	}
+	a.mu.RUnlock()
+	return work
+}
+
+func (w activeWork) any() bool {
+	return w.Terminals > 0 || w.Running > 0 || w.Pending > 0
 }
 
 // publicConnections strips secrets before data leaves the backend.
@@ -454,20 +784,36 @@ func sameTarget(x Connection, y Connection) bool {
 		x.BaudRate == y.BaudRate
 }
 
-// DisconnectConnection closes the interactive terminal attached to the
-// connection, if any.
+// DisconnectConnection closes every terminal tab of the connection and
+// cancels its running MCP / approved commands (§5.1). The confirmation
+// dialog is the frontend's job.
 func (a *App) DisconnectConnection(id string) ActionResult {
-	conn, ok := a.findConnection(strings.TrimSpace(id))
+	conn, ok := a.connectionByID(strings.TrimSpace(id))
 	if !ok {
-		return ActionResult{OK: false, Message: "接続先が見つかりません"}
+		return ActionResult{OK: false, Code: "not_found", Message: "接続先が見つかりません"}
 	}
-	a.closeTerminalsForConnection(conn.ID)
-	return ActionResult{OK: true, Message: fmt.Sprintf("%s のセッションを切断しました", conn.Name)}
+	k := a.closeTerminalsForConnection(conn.ID)
+	j := a.cancelExecsForConnection(conn.ID, errDisconnected)
+	a.sessionsChanged()
+	return ActionResult{
+		OK:      true,
+		ID:      conn.ID,
+		Message: fmt.Sprintf("%s を切断しました（ターミナル %d 件・実行中コマンド %d 件を終了）", conn.Name, k, j),
+	}
 }
 
 // SaveConnection creates (empty ID) or updates (ID set, rename allowed) a
 // connection. The database is written first; memory only changes on success.
+// Open tabs are kept: saving must not drop the user's shells.
 func (a *App) SaveConnection(connection Connection) ActionResult {
+	result := a.saveConnection(connection)
+	if result.OK {
+		a.sessionsChanged() // the sessions list (names, new rows) follows a.conns
+	}
+	return result
+}
+
+func (a *App) saveConnection(connection Connection) ActionResult {
 	connection = normalizeConnection(connection)
 	if connection.Name == "" {
 		return ActionResult{OK: false, Message: "接続先名は必須です"}
@@ -564,6 +910,7 @@ func (a *App) DeleteConnection(id string) ActionResult {
 	a.conns = next
 	delete(a.sshPassphrases, conn.ID)
 	a.mu.Unlock()
+	a.sessionsChanged()
 
 	return ActionResult{OK: true, Message: fmt.Sprintf("%s を削除しました。コマンド履歴は監査用に残しています", conn.Name)}
 }

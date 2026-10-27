@@ -780,6 +780,14 @@ func TestNonLoopbackListenRequiresBearer(t *testing.T) {
 func TestEnvTokenIsNotPersisted(t *testing.T) {
 	isolateEnv(t)
 	t.Setenv("SSH_GETE_TOKEN", "from-env-token")
+	// A free port, so the test does not depend on 8787 being unused (an
+	// installed ssh-gete may be listening there).
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SSH_GETE_MCP_ADDR", listener.Addr().String())
+	_ = listener.Close()
 	app := NewApp()
 	if r := app.SaveMCPSettings(app.GetMCPSettings()); !r.OK {
 		t.Fatal(r.Message)
@@ -829,4 +837,3 @@ func TestAgentApprovalBypassPersists(t *testing.T) {
 		t.Fatalf("revoke failed")
 	}
 }
-

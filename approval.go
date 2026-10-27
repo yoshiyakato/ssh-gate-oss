@@ -172,7 +172,7 @@ func (a *App) approve(id string, command string, allowRiskIncrease bool, grantBy
 		a.finishRequest(running, stateFailed, commandResult{}, errors.New("対象ホストが接続先一覧にありません"))
 		return ActionResult{OK: false, Message: "対象ホストが接続先一覧にありません" + bypassNote}
 	}
-	result, execErr := a.executeSSH(context.Background(), conn, command, 0)
+	result, execErr := a.executeSSH(a.appCtx, conn, command, 0)
 	if execErr != nil && !isExitError(execErr) {
 		a.finishRequest(running, stateFailed, result, execErr)
 		return ActionResult{OK: false, Message: fmt.Sprintf("%s の実行に失敗しました: %s%s", id, explainSSHError(conn, execErr), bypassNote)}
@@ -185,9 +185,15 @@ func (a *App) approve(id string, command string, allowRiskIncrease bool, grantBy
 	return ActionResult{OK: true, Message: fmt.Sprintf("%s を承認し、実行しました%s", id, bypassNote)}
 }
 
-// finishRequest records the outcome of a running request.
+// finishRequest records the outcome of a running request. An execution
+// stopped by app shutdown is recorded as interrupted whatever state the
+// caller picked; one stopped by DisconnectConnection stays failed with
+// ErrorKind "canceled".
 func (a *App) finishRequest(running CommandRequest, state string, result commandResult, execErr error) CommandRequest {
 	from := running.Status
+	if errors.Is(execErr, errShuttingDown) {
+		state = stateInterrupted
+	}
 	updated, err := a.transitionRequest(running.ID, []string{from}, func(r *CommandRequest) {
 		r.Status = state
 		r.Stdout = result.Stdout
@@ -337,7 +343,9 @@ func (a *App) executeSSH(parent context.Context, conn Connection, command string
 	if timeoutOverride > 0 {
 		timeout = time.Duration(min(timeoutOverride, 3600)) * time.Second
 	}
-	ctx, cancel := context.WithTimeout(parent, timeout)
+	tracked, done := a.trackExec(parent, conn.ID)
+	defer done()
+	ctx, cancel := context.WithTimeout(tracked, timeout)
 	defer cancel()
 	a.mu.RLock()
 	outputCap := a.mcp.MaxOutputKB * 1024
@@ -347,7 +355,19 @@ func (a *App) executeSSH(parent context.Context, conn Connection, command string
 	if outputCap <= 0 {
 		outputCap = defaultOutputCap
 	}
-	return runSSHCommand(ctx, conn, command, outputCap, strictHostKey)
+	res, err := runSSHCommand(ctx, conn, command, outputCap, strictHostKey)
+	if err != nil {
+		// Carry the cancel cause so finishRequest can tell a disconnect or
+		// shutdown apart from a plain timeout or network error.
+		// Shutdown wins whatever cause the tracked context carries: an MCP
+		// call's r.Context() may have been cancelled by the server closing.
+		if cause := context.Cause(tracked); errors.Is(cause, errDisconnected) || errors.Is(cause, errShuttingDown) {
+			err = fmt.Errorf("%w: %w", cause, err)
+		} else if errors.Is(context.Cause(a.appCtx), errShuttingDown) {
+			err = fmt.Errorf("%w: %w", errShuttingDown, err)
+		}
+	}
+	return res, err
 }
 
 func isExitError(err error) bool {
@@ -360,6 +380,8 @@ func classifyExecError(err error) string {
 	switch {
 	case err == nil:
 		return ""
+	case errors.Is(err, errDisconnected), errors.Is(err, errShuttingDown):
+		return "canceled"
 	case isExitError(err):
 		return "exit_nonzero"
 	case errors.Is(err, context.DeadlineExceeded):

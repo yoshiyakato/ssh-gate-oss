@@ -15,10 +15,16 @@ body {
 }
 
 .app-sidebar {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  max-height: 100vh;
+  overflow-y: auto;
   background: linear-gradient(180deg, var(--ssh-sidebar), var(--ssh-sidebar-deep));
 }
 
 .sidebar-brand {
+  flex: 0 0 auto;
   min-height: 64px;
 }
 
@@ -41,9 +47,11 @@ body {
   background: rgba(255, 255, 255, .12);
 }
 
+/* AdminLTE の固定 height より flex-basis が優先されるので、状態欄の残りを nav が使う */
 .sidebar-wrapper {
+  flex: 1 1 0;
+  min-height: 8rem;
   padding: .75rem;
-  padding-bottom: 13.75rem;
 }
 
 .sidebar-menu .nav-link {
@@ -57,10 +65,8 @@ body {
 }
 
 .sidebar-status {
-  position: absolute;
-  right: .75rem;
-  bottom: .75rem;
-  left: .75rem;
+  flex: 0 0 auto;
+  margin: auto .75rem .75rem;
   padding: .85rem;
   color: rgba(255, 255, 255, .92);
   background: rgba(0, 0, 0, .18);
@@ -68,41 +74,11 @@ body {
   border-radius: .5rem;
 }
 
-.status-line {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: .75rem;
-  margin-bottom: .35rem;
-  font-size: .78rem;
-}
-
 .status-heading {
   margin-bottom: .55rem;
   color: rgba(255, 255, 255, .92);
   font-size: .82rem;
   font-weight: 800;
-}
-
-.status-line span {
-  color: rgba(255, 255, 255, .68);
-}
-
-.status-line strong {
-  font-size: .86rem;
-}
-
-.status-value {
-  min-width: 0;
-  max-width: 8.5rem;
-  overflow: hidden;
-  text-align: right;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.status-badge {
-  min-width: 4.5rem;
 }
 
 .company-name {
@@ -263,36 +239,6 @@ body {
   white-space: pre-wrap;
 }
 
-.xterm-host {
-  height: 62vh;
-  min-height: 340px;
-  padding: .5rem;
-  background: #0b1120;
-  border-radius: .5rem;
-}
-
-.xterm-host .xterm {
-  height: 100%;
-}
-
-.terminal-detail {
-  display: grid;
-  grid-template-columns: auto 1fr;
-  gap: .35rem .85rem;
-  margin: 0;
-}
-
-.terminal-detail dt {
-  color: var(--bs-secondary-color);
-  font-size: .8rem;
-  font-weight: 700;
-}
-
-.terminal-detail dd {
-  margin: 0;
-  word-break: break-all;
-}
-
 .ssh-summary {
   min-height: 104px;
   box-shadow: none;
@@ -399,13 +345,517 @@ body {
   border-radius: .5rem;
 }
 
+.side-section {
+  margin-top: .75rem;
+}
+
+.side-section-title {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  margin-bottom: .45rem;
+  color: rgba(255, 255, 255, .92);
+  font-size: .82rem;
+  font-weight: 800;
+}
+
+.side-section-title::after {
+  content: "";
+  flex: 1 1 auto;
+  height: 1px;
+  background: rgba(255, 255, 255, .16);
+}
+
+.side-summary {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: .5rem;
+  margin-bottom: .35rem;
+  color: rgba(255, 255, 255, .68);
+  font-size: .76rem;
+}
+
+.side-summary-error {
+  color: #ffb4a8;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.side-session-row {
+  display: flex;
+  align-items: center;
+  gap: .35rem;
+  width: 100%;
+  min-width: 0;
+  padding: .28rem .35rem;
+  color: rgba(255, 255, 255, .92);
+  background: transparent;
+  border: 0;
+  border-radius: .35rem;
+  font-size: .78rem;
+  text-align: left;
+}
+
+.side-session-row:hover,
+.side-session-row:focus-visible {
+  background: rgba(255, 255, 255, .1);
+}
+
+.side-session-row:focus-visible,
+.side-more:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, .7);
+  outline-offset: 1px;
+}
+
+.side-session-row .bi {
+  flex: 0 0 auto;
+  color: rgba(255, 255, 255, .6);
+}
+
+.side-symbol {
+  flex: 0 0 1em;
+  color: #7ee2b8;
+  text-align: center;
+}
+
+.side-session-row.is-error .side-symbol,
+.side-session-row.is-error .side-meta {
+  color: #ffb4a8;
+}
+
+.side-session-row.is-serial .side-symbol {
+  color: #c4b5fd;
+}
+
+.side-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.side-meta {
+  flex: 0 0 auto;
+  max-width: 55%;
+  overflow: hidden;
+  color: rgba(255, 255, 255, .68);
+  font-size: .74rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.side-more {
+  display: block;
+  width: 100%;
+  margin-top: .15rem;
+  padding: .2rem .35rem;
+  color: rgba(255, 255, 255, .76);
+  background: transparent;
+  border: 0;
+  border-radius: .35rem;
+  font-size: .76rem;
+  font-weight: 700;
+  text-align: left;
+}
+
+.side-more:hover,
+.side-more:focus-visible {
+  color: #fff;
+  background: rgba(255, 255, 255, .1);
+}
+
+.side-empty {
+  padding: .2rem .35rem;
+  color: rgba(255, 255, 255, .6);
+  font-size: .76rem;
+}
+
+.side-mcp-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .3rem;
+  margin-bottom: .3rem;
+  padding: 0 .35rem;
+  color: rgba(255, 255, 255, .8);
+  font-size: .76rem;
+}
+
+.side-mcp-line code {
+  color: rgba(255, 255, 255, .92);
+  font-size: .74rem;
+}
+
+.side-storage-error {
+  display: flex;
+  align-items: flex-start;
+  gap: .35rem;
+  margin-top: .65rem;
+  padding: .45rem .55rem;
+  color: #ffe1a8;
+  background: rgba(255, 176, 32, .14);
+  border: 1px solid rgba(255, 176, 32, .4);
+  border-radius: .4rem;
+  font-size: .76rem;
+  font-weight: 700;
+}
+
+/* #terminal-dock は描き直さない常設の置き場。隠したスタックをここに閉じ込め、ページのスクロール量に響かせない */
+#terminal-dock {
+  position: relative;
+  overflow: hidden;
+  overflow: clip;
+}
+
+.terminal-stack {
+  width: 100%;
+}
+
+/* display:none にすると幅が取れず fit できないので、hidden の間も箱は残して見えなくする */
+.terminal-stack[hidden] {
+  display: block;
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.term-pane {
+  height: 62vh;
+  min-height: 340px;
+  padding: .5rem;
+  background: #0b1120;
+  border-radius: .5rem;
+}
+
+.term-pane:not(.is-active) {
+  display: none;
+}
+
+.term-pane .xterm {
+  height: 100%;
+}
+
+.term-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: .5rem .75rem;
+  margin-bottom: .5rem;
+  border-bottom: 1px solid var(--bs-border-color);
+}
+
+.term-tabs {
+  display: flex;
+  flex: 1 1 auto;
+  gap: .25rem;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.term-tab {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  max-width: 16rem;
+  margin-bottom: -1px;
+  color: var(--bs-secondary-color);
+  background: var(--bs-tertiary-bg);
+  border: 1px solid var(--bs-border-color);
+  border-radius: .45rem .45rem 0 0;
+}
+
+.term-tab > button {
+  min-width: 0;
+  padding: .4rem .6rem;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  font-size: .86rem;
+  font-weight: 700;
+}
+
+.term-tab > button[data-action="term-activate"] {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.term-tab:hover {
+  color: var(--bs-body-color);
+}
+
+.term-tab.is-active {
+  color: var(--bs-body-color);
+  background: var(--bs-body-bg);
+  border-bottom-color: var(--bs-body-bg);
+  box-shadow: inset 0 2px 0 var(--ssh-accent);
+}
+
+.term-tab.is-starting > button[data-action="term-activate"] {
+  opacity: .7;
+  font-style: italic;
+}
+
+.term-tab.is-exited {
+  border-style: dashed;
+}
+
+.term-tab.is-exited > button[data-action="term-activate"] {
+  color: var(--bs-secondary-color);
+  text-decoration: line-through;
+  text-decoration-color: rgba(var(--bs-secondary-rgb), .6);
+}
+
+/* "(接続中…)" / "(終了)" next to the label. inline-block keeps the exited
+   tab's strikethrough off the status word itself. */
+.term-tab-status {
+  display: inline-block;
+  margin-left: .2rem;
+  color: var(--bs-secondary-color);
+  font-size: .76rem;
+  font-weight: 600;
+  font-style: normal;
+  text-decoration: none;
+}
+
+.term-tab > .term-tab-reconnect {
+  margin: 0 .1rem;
+  padding: .12rem .45rem;
+  color: var(--ssh-accent);
+  border: 1px solid currentColor;
+  border-radius: .3rem;
+  font-size: .74rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.term-tab > .term-tab-reconnect:hover,
+.term-tab > .term-tab-reconnect:focus-visible {
+  color: #fff;
+  background: var(--ssh-accent);
+  border-color: var(--ssh-accent);
+}
+
+.term-tab > .term-tab-close {
+  flex: 0 0 auto;
+  padding: .3rem .4rem;
+  line-height: 1;
+  border-radius: .3rem;
+}
+
+.term-tab > .term-tab-close:hover,
+.term-tab > .term-tab-close:focus-visible {
+  color: var(--bs-danger);
+  background: rgba(var(--bs-danger-rgb), .1);
+}
+
+.term-tab > button:focus-visible {
+  outline: 2px solid var(--ssh-accent);
+  outline-offset: -2px;
+}
+
+.term-new {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: .5rem;
+  padding-bottom: .4rem;
+}
+
+.term-new .form-select {
+  width: auto;
+  min-width: 10rem;
+  max-width: 18rem;
+}
+
+.term-new .btn {
+  white-space: nowrap;
+}
+
+.term-empty {
+  min-height: 240px;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: .5rem;
+  padding: 2rem 1rem;
+  color: var(--bs-secondary-color);
+  background: var(--bs-tertiary-bg);
+  border: 1px dashed var(--bs-border-color);
+  border-radius: .5rem;
+  text-align: center;
+}
+
+.editor-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .5rem;
+}
+
+.editor-header .card-title,
+.editor-header h5 {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.badge-save-saved,
+.badge-save-modified,
+.badge-save-new,
+.badge-conn-connected,
+.badge-conn-connecting,
+.badge-conn-disconnected,
+.badge-conn-error,
+.badge-conn-in_use {
+  display: inline-flex;
+  align-items: center;
+  gap: .3rem;
+  padding: .28rem .55rem;
+  border: 1px solid transparent;
+  border-radius: .4rem;
+  font-size: .76rem;
+  font-weight: 800;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.badge-save-saved {
+  color: var(--bs-success-text-emphasis);
+  background: var(--bs-success-bg-subtle);
+  border-color: var(--bs-success-border-subtle);
+}
+
+.badge-save-modified {
+  color: var(--bs-warning-text-emphasis);
+  background: var(--bs-warning-bg-subtle);
+  border-color: var(--bs-warning-border-subtle);
+}
+
+.badge-save-new {
+  color: var(--bs-info-text-emphasis);
+  background: var(--bs-info-bg-subtle);
+  border-color: var(--bs-info-border-subtle);
+  border-style: dashed;
+}
+
+.badge-conn-connected {
+  color: var(--bs-success-text-emphasis);
+  background: var(--bs-success-bg-subtle);
+  border-color: var(--bs-success-border-subtle);
+}
+
+.badge-conn-connecting {
+  color: var(--bs-info-text-emphasis);
+  background: var(--bs-info-bg-subtle);
+  border-color: var(--bs-info-border-subtle);
+}
+
+.badge-conn-disconnected {
+  color: var(--bs-secondary-text-emphasis);
+  background: var(--bs-secondary-bg-subtle);
+  border-color: var(--bs-secondary-border-subtle);
+}
+
+.badge-conn-error {
+  color: var(--bs-danger-text-emphasis);
+  background: var(--bs-danger-bg-subtle);
+  border-color: var(--bs-danger-border-subtle);
+}
+
+.badge-conn-in_use {
+  color: var(--bs-primary-text-emphasis);
+  background: var(--bs-primary-bg-subtle);
+  border-color: var(--bs-primary-border-subtle);
+}
+
+.dirty-mark {
+  flex: 0 0 auto;
+  margin-left: .3rem;
+  color: var(--bs-warning);
+  font-size: .8em;
+  line-height: 1;
+}
+
+.ssh-list .list-group-item.active .dirty-mark {
+  color: #ffe1a8;
+}
+
+.editor-alert {
+  margin-bottom: 1rem;
+  word-break: break-word;
+}
+
+.editor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .5rem;
+}
+
+.editor-actions .vr {
+  align-self: stretch;
+  margin: 0 .25rem;
+}
+
+/* 押せない理由を title で見せるため、Bootstrap の pointer-events:none を戻す */
+.editor-actions .btn:disabled,
+.editor-actions .btn.disabled {
+  pointer-events: auto;
+  cursor: not-allowed;
+}
+
+#editor-modal-root:empty {
+  display: none;
+}
+
+#editor-modal-root .modal {
+  overflow-y: auto;
+}
+
+#editor-modal-root .modal-footer {
+  flex-wrap: wrap;
+  gap: .5rem;
+}
+
+#editor-modal-root .modal-footer > * {
+  margin: 0;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .term-tab.is-starting > button[data-action="term-activate"] {
+    animation: term-starting 1.2s ease-in-out infinite;
+  }
+}
+
+@keyframes term-starting {
+  50% {
+    opacity: .35;
+  }
+}
+
 @media (max-width: 991.98px) {
-  .sidebar-status {
-    position: static;
-    margin: .75rem;
+  .sidebar-wrapper {
+    min-height: 6rem;
   }
 
-  .sidebar-wrapper {
-    padding-bottom: .75rem;
+  .term-new {
+    flex: 1 1 100%;
+  }
+
+  .term-new .form-select {
+    flex: 1 1 auto;
+    max-width: none;
   }
 }

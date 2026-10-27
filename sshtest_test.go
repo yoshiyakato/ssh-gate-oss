@@ -28,14 +28,17 @@ const (
 //	sleep <sec>   waits, then exits 0
 //	yes           writes output until the channel closes
 //
-// Every exec is appended to execLog.
+// Every exec is appended to execLog. It also serves interactive shells
+// (pty-req, window-change, shell; see runTestShell), and KillAll drops every
+// client connection while it keeps listening.
 type sshTestServer struct {
 	listener net.Listener
 	config   *ssh.ServerConfig
 
-	mu      sync.Mutex
-	execLog []string
-	conns   []net.Conn
+	mu       sync.Mutex
+	execLog  []string
+	conns    []net.Conn
+	ptySizes []string // "pty 132x40", "win 100x30"
 }
 
 func newSSHTestServer(t *testing.T) *sshTestServer {
@@ -74,6 +77,35 @@ func (s *sshTestServer) Close() {
 	for _, c := range s.conns {
 		_ = c.Close()
 	}
+}
+
+// KillAll closes every client connection (simulating a dropped link) but
+// keeps the listener, so new connections still succeed.
+func (s *sshTestServer) KillAll() {
+	s.mu.Lock()
+	conns := s.conns
+	s.conns = nil
+	s.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
+}
+
+// PtySizes returns the pty-req / window-change sizes received so far.
+func (s *sshTestServer) PtySizes() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.ptySizes...)
+}
+
+func (s *sshTestServer) recordPtySize(req *ssh.Request) bool {
+	size, ok := parsePtySize(req)
+	if ok {
+		s.mu.Lock()
+		s.ptySizes = append(s.ptySizes, size)
+		s.mu.Unlock()
+	}
+	return ok
 }
 
 func (s *sshTestServer) Port() int {
@@ -138,7 +170,24 @@ func (s *sshTestServer) handleConn(nc net.Conn) {
 func (s *sshTestServer) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
 	defer ch.Close()
 	for req := range reqs {
-		if req.Type != "exec" {
+		switch req.Type {
+		case "pty-req", "window-change":
+			_ = req.Reply(s.recordPtySize(req), nil)
+			continue
+		case "shell":
+			_ = req.Reply(true, nil)
+			go func() {
+				for r := range reqs {
+					ok := r.Type == "window-change" && s.recordPtySize(r)
+					if r.WantReply {
+						_ = r.Reply(ok, nil)
+					}
+				}
+			}()
+			sendExitStatus(ch, runTestShell(ch, nil))
+			return
+		case "exec":
+		default:
 			_ = req.Reply(false, nil)
 			continue
 		}
@@ -151,11 +200,92 @@ func (s *sshTestServer) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) 
 		s.mu.Lock()
 		s.execLog = append(s.execLog, payload.Command)
 		s.mu.Unlock()
-		status := s.run(ch, payload.Command)
-		var buf [4]byte
-		binary.BigEndian.PutUint32(buf[:], uint32(status))
-		_, _ = ch.SendRequest("exit-status", false, buf[:])
+		sendExitStatus(ch, s.run(ch, payload.Command))
 		return
+	}
+}
+
+func sendExitStatus(ch ssh.Channel, status int) {
+	var buf [4]byte
+	binary.BigEndian.PutUint32(buf[:], uint32(status))
+	_, _ = ch.SendRequest("exit-status", false, buf[:])
+}
+
+// parsePtySize decodes a pty-req or window-change payload as "pty CxR" /
+// "win CxR".
+func parsePtySize(req *ssh.Request) (string, bool) {
+	switch req.Type {
+	case "pty-req":
+		var p struct {
+			Term          string
+			Cols, Rows    uint32
+			Width, Height uint32
+			Modes         string
+		}
+		if err := ssh.Unmarshal(req.Payload, &p); err != nil {
+			return "", false
+		}
+		return fmt.Sprintf("pty %dx%d", p.Cols, p.Rows), true
+	case "window-change":
+		var p struct{ Cols, Rows, Width, Height uint32 }
+		if err := ssh.Unmarshal(req.Payload, &p); err != nil {
+			return "", false
+		}
+		return fmt.Sprintf("win %dx%d", p.Cols, p.Rows), true
+	}
+	return "", false
+}
+
+// runTestShell greets with "welcome <user>" (a stand-in for the MOTD), then
+// answers one command per input line until exit or EOF:
+//
+//	echo <text>   prints text
+//	exit <n>      exits with status n
+//	yes           writes output until the channel closes
+//	seq ...       no output (input-order probe)
+//
+// record, if non-nil, receives every input line. It returns the exit status.
+func runTestShell(ch ssh.Channel, record func(string)) int {
+	_, _ = fmt.Fprintf(ch, "welcome %s\r\n", sshTestUser)
+	var line []byte
+	buf := make([]byte, 4096)
+	for {
+		n, err := ch.Read(buf)
+		for _, c := range buf[:n] {
+			if c != '\r' && c != '\n' {
+				line = append(line, c)
+				continue
+			}
+			if len(line) == 0 {
+				continue
+			}
+			command := string(line)
+			line = line[:0]
+			if record != nil {
+				record(command)
+			}
+			name, arg, _ := strings.Cut(command, " ")
+			switch name {
+			case "echo":
+				_, _ = fmt.Fprintf(ch, "%s\r\n", arg)
+			case "exit":
+				code, _ := strconv.Atoi(arg)
+				return code
+			case "yes":
+				chunk := []byte(strings.Repeat("y\r\n", 1024))
+				for {
+					if _, err := ch.Write(chunk); err != nil {
+						return 0
+					}
+				}
+			case "seq":
+			default:
+				_, _ = fmt.Fprintf(ch, "unknown command: %s\r\n", command)
+			}
+		}
+		if err != nil {
+			return 0
+		}
 	}
 }
 
