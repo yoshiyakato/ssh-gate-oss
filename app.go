@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +30,23 @@ const (
 	defaultMCPAddr   = "127.0.0.1:8787"
 	defaultOutputCap = 128 * 1024
 	maxMCPAgents     = 256
+	// defaultBypassTTL is how long an approval-bypass grant lasts (§5.5).
+	defaultBypassTTL = 8 * time.Hour
+	// defaultBypassMaxRisk is the highest risk a bypass grant covers; High is
+	// always queued regardless.
+	defaultBypassMaxRisk = "Medium"
+	// agentTokenPrefix marks per-agent tokens so they are distinguishable
+	// from the shared MCP token.
+	agentTokenPrefix = "sga_"
+	// pendingRequestTTL is how long a request waits for a human before it
+	// expires. It matches the client_request_id deduplication window.
+	pendingRequestTTL = 24 * time.Hour
+	// expirySweepInterval is how often pending requests and bypass grants are
+	// checked for expiry in the background.
+	expirySweepInterval = 30 * time.Second
+	// shutdownDrainTimeout is how long shutdown waits for running MCP
+	// executions before cancelling them (§5.0 step 2).
+	shutdownDrainTimeout = 5 * time.Second
 )
 
 type App struct {
@@ -44,16 +63,37 @@ type App struct {
 	mcpToken          string
 	// mcpEnvToken comes from SSH_GETE_TOKEN. It overrides mcpToken at runtime
 	// and is never written to SQLite.
-	mcpEnvToken    string
-	mcpAgents      map[string]time.Time
-	agentPolicies  map[string]AgentPolicy
+	mcpEnvToken   string
+	mcpAgents     map[string]time.Time
+	agentPolicies map[string]AgentPolicy
+	// agentTokens maps agent name to its per-agent token (hash only). A
+	// request authenticated with one may use that agent's approval bypass.
+	agentTokens map[string]AgentToken
+	// policyMu serializes agent policy and token mutations across the
+	// SQLite write and the in-memory publish, so concurrent grant/revoke or
+	// issue/revoke end in the same order in both. It is taken before a.mu
+	// (never while holding a.mu) and nothing blocks on it while holding a.mu.
+	policyMu       sync.Mutex
 	sshPassphrases map[string]string
-	// requestsChanged is closed and replaced whenever a request changes state,
-	// waking get_request_status long-polls.
-	requestsChanged chan struct{}
+	// reqCond (L = &a.mu) is broadcast whenever a request is added, changes
+	// state or is deleted, waking get_request_status long-polls.
+	reqCond *sync.Cond
+	// mcpRuntime holds the execution and long-poll slots of the MCP server
+	// (mcp_status.go). Its zero value is ready to use.
+	mcpRuntime mcpRuntime
+	// now is the clock for expiry decisions; tests may replace it.
+	now func() time.Time
+
+	// appCtx is cancelled on shutdown; wg counts background loops started
+	// from it so shutdown can wait for them before closing the store.
+	appCtx    context.Context
+	appCancel context.CancelFunc
+	wg        sync.WaitGroup
 
 	lifecycleMu sync.Mutex
 	mcpServer   *http.Server
+	// mcpServerStop is mcpServer's stop signal (mcp_status.go).
+	mcpServerStop *mcpListenerStop
 
 	termMu sync.Mutex
 	term   *terminalSession
@@ -69,11 +109,16 @@ type Connection struct {
 	AuthMethod string `json:"authMethod"`
 	// Credential is the key path for key auth, or the password for password
 	// auth. Passwords are write-only: they are never sent back to the UI.
-	Credential      string   `json:"credential"`
-	CredentialSet   bool     `json:"credentialSet"`
-	KeyPassphrase   string   `json:"keyPassphrase,omitempty"`
-	SerialPort      string   `json:"serialPort"`
-	BaudRate        int      `json:"baudRate"`
+	Credential    string `json:"credential"`
+	CredentialSet bool   `json:"credentialSet"`
+	KeyPassphrase string `json:"keyPassphrase,omitempty"`
+	SerialPort    string `json:"serialPort"`
+	BaudRate      int    `json:"baudRate"`
+	// DataBits (5-8), Parity (none/odd/even/mark/space) and StopBits
+	// ("1"/"1.5"/"2") are serial-only. RTS/CTS flow control is not supported.
+	DataBits        int      `json:"dataBits"`
+	Parity          string   `json:"parity"`
+	StopBits        string   `json:"stopBits"`
 	ConnectTimeout  int      `json:"connectTimeout"`
 	CommandTimeout  int      `json:"commandTimeout"`
 	Tags            []string `json:"tags"`
@@ -104,6 +149,8 @@ const (
 	stateSucceeded     = "succeeded"
 	stateFailed        = "failed"
 	stateRejected      = "rejected"
+	stateExpired       = "expired"
+	stateWithdrawn     = "withdrawn"
 	stateInterrupted   = "interrupted"
 	stateAutoRunning   = "auto_running"
 	stateAutoSucceeded = "auto_succeeded"
@@ -132,12 +179,60 @@ type CommandRequest struct {
 	ExitCode        *int   `json:"exitCode"`
 	ErrorKind       string `json:"errorKind"`
 	ClientRequestID string `json:"clientRequestId,omitempty"`
+	// ExpiresAt is when a pending request becomes expired (RFC3339).
+	ExpiresAt string `json:"expiresAt"`
+	// TargetFP is user@host:port of the connection when the request was
+	// made, so the approval screen can show whether the target changed since.
+	TargetFP string `json:"targetFp"`
 }
 
+// AgentPolicy is an approval-bypass grant. It only takes effect for requests
+// authenticated with that agent's own token (see AgentToken).
 type AgentPolicy struct {
 	AgentName      string `json:"agentName"`
 	ApprovalBypass bool   `json:"approvalBypass"`
 	UpdatedAt      string `json:"updatedAt"`
+	// MaxRisk is the highest risk auto-executed (Low or Medium; default
+	// Medium). High is always queued.
+	MaxRisk string `json:"maxRisk"`
+	// ScopeConnIDs limits the grant to these connections; empty means all.
+	ScopeConnIDs []string `json:"scopeConnIds"`
+	GrantedAt    string   `json:"grantedAt"`
+	GrantedBy    string   `json:"grantedBy"`
+	// ExpiresAt ends the grant (RFC3339). Empty means GrantedAt (or
+	// UpdatedAt for legacy rows) + defaultBypassTTL.
+	ExpiresAt string `json:"expiresAt"`
+	// Derived, never persisted.
+	Active   bool `json:"active"`
+	HasToken bool `json:"hasToken"`
+}
+
+// AgentToken is a per-agent Bearer token. Only the SHA-256 of the token is
+// kept; the token itself is shown once when issued.
+type AgentToken struct {
+	AgentName string `json:"agentName"`
+	TokenHash string `json:"-"`
+	// Bypass allows this token to use the agent's approval-bypass grant.
+	Bypass    bool   `json:"bypass"`
+	CreatedAt string `json:"createdAt"`
+	// Preview is a non-secret hint (prefix + last 4 characters).
+	Preview string `json:"preview"`
+}
+
+// mcpCaller is who sent an MCP request, as established by authentication
+// (authenticateMCP), not by the self-declared agent_name.
+type mcpCaller struct {
+	// Agent is the agent bound to the presented per-agent token; empty for
+	// the shared token or an unauthenticated loopback client.
+	Agent string
+	// Shared reports that the shared Bearer token authenticated the request.
+	Shared bool
+}
+
+// mayBypassAs reports whether the caller proved it is agentName. The shared
+// token proves only "some client of this gateway", so it never qualifies.
+func (c mcpCaller) mayBypassAs(agentName string) bool {
+	return c.Agent != "" && strings.TrimSpace(agentName) == c.Agent
 }
 
 type MCPSettings struct {
@@ -184,6 +279,7 @@ type DashboardData struct {
 	Connections   []Connection     `json:"connections"`
 	Requests      []CommandRequest `json:"requests"`
 	AgentPolicies []AgentPolicy    `json:"agentPolicies"`
+	AgentTokens   []AgentToken     `json:"agentTokens"`
 	MCP           MCPSettings      `json:"mcp"`
 	StorageError  string           `json:"storageError"`
 }
@@ -223,9 +319,12 @@ func NewApp() *App {
 		legacyMCPSettings: legacyMCPSettings,
 		mcpAgents:         map[string]time.Time{},
 		agentPolicies:     map[string]AgentPolicy{},
+		agentTokens:       map[string]AgentToken{},
 		sshPassphrases:    map[string]string{},
-		requestsChanged:   make(chan struct{}),
+		now:               time.Now,
 	}
+	app.reqCond = sync.NewCond(&app.mu)
+	app.appCtx, app.appCancel = context.WithCancel(context.Background())
 
 	store, err := openStore(dbPath)
 	if err != nil {
@@ -286,7 +385,34 @@ func NewApp() *App {
 		for _, policy := range policies {
 			app.agentPolicies[policy.AgentName] = policy
 		}
+		tokens, err := store.loadAgentTokens()
+		if err != nil {
+			log.Printf("load agent tokens from sqlite: %v", err)
+		}
+		for _, token := range tokens {
+			app.agentTokens[token.AgentName] = token
+		}
 	}
+	// Pending rows written before expires_at existed get a full lifetime from
+	// now, instead of expiring the moment the update is installed.
+	for i := range app.requests {
+		req := app.requests[i]
+		if req.Status != statePending || req.ExpiresAt != "" {
+			continue
+		}
+		req.ExpiresAt = app.clock().Add(pendingRequestTTL).Format(time.RFC3339)
+		if store != nil {
+			if err := store.updateCommandRequestFrom(req, statePending); err != nil {
+				log.Printf("set expiry of %s: %v", req.ID, err)
+				continue
+			}
+		}
+		app.requests[i] = req
+	}
+	// Expire what lapsed while the app was not running, then keep sweeping.
+	app.expireOverdue()
+	app.wg.Add(1)
+	go app.runExpirySweeper(app.appCtx)
 	return app
 }
 
@@ -303,9 +429,14 @@ func (a *App) startup(ctx context.Context) {
 	}
 }
 
+// shutdown follows the §5.0 order: stop accepting MCP, drain running MCP
+// executions, close terminals, stop background loops, then close the store.
 func (a *App) shutdown(ctx context.Context) {
-	a.CloseTerminal()
 	a.stopMCPServer(ctx)
+	a.drainMCPCommands(shutdownDrainTimeout)
+	a.CloseTerminal()
+	a.appCancel()
+	a.wg.Wait()
 	if err := a.store.Close(); err != nil {
 		log.Printf("close sqlite store: %v", err)
 	}
@@ -325,7 +456,8 @@ func (a *App) GetInitialData() DashboardData {
 	return DashboardData{
 		Connections:   publicConnections(a.conns),
 		Requests:      cloneRequests(a.requests),
-		AgentPolicies: cloneAgentPolicies(a.agentPolicies),
+		AgentPolicies: a.agentPoliciesViewLocked(),
+		AgentTokens:   a.agentTokensViewLocked(),
 		MCP:           a.mcpSnapshotLocked(),
 		StorageError:  a.storageError,
 	}
@@ -415,6 +547,15 @@ func (a *App) testConnectionConfig(conn Connection, passphrase string) ActionRes
 		a.mu.Unlock()
 	}
 	message := fmt.Sprintf("%s へのSSH疎通を確認しました", displayName)
+	// A GUI test is the one place an unknown host key gets recorded (TOFU),
+	// so show what is now trusted.
+	if keys, err := recordedHostKeys(hostKeyAddress(conn)); err == nil && len(keys) > 0 {
+		fingerprints := make([]string, 0, len(keys))
+		for _, key := range keys {
+			fingerprints = append(fingerprints, key.Type+" "+key.Fingerprint)
+		}
+		message += "（ホスト鍵: " + strings.Join(fingerprints, ", ") + "）"
+	}
 	a.recordConnectionTest(conn, "ok", message)
 	return ActionResult{OK: true, Message: message, ID: conn.ID}
 }
@@ -451,7 +592,7 @@ func (a *App) recordConnectionTest(tested Connection, result string, message str
 func sameTarget(x Connection, y Connection) bool {
 	return x.connectionType() == y.connectionType() && x.Host == y.Host && x.Port == y.Port && x.User == y.User &&
 		x.AuthMethod == y.AuthMethod && x.Credential == y.Credential && x.SerialPort == y.SerialPort &&
-		x.BaudRate == y.BaudRate
+		x.BaudRate == y.BaudRate && x.DataBits == y.DataBits && x.Parity == y.Parity && x.StopBits == y.StopBits
 }
 
 // DisconnectConnection closes the interactive terminal attached to the
@@ -476,9 +617,19 @@ func (a *App) SaveConnection(connection Connection) ActionResult {
 		if connection.SerialPort == "" {
 			return ActionResult{OK: false, Message: "シリアルポートを選択してください"}
 		}
+		if message := validateSerialParams(connection); message != "" {
+			return ActionResult{OK: false, Message: message}
+		}
+		// A serial row must not keep SSH leftovers: the password would stay
+		// in SQLite, and the host would still match MCP host lookups.
 		connection.Host, connection.User, connection.Credential = "", "", ""
-	} else if connection.Host == "" || connection.User == "" {
-		return ActionResult{OK: false, Message: "ホスト、ユーザー名は必須です"}
+		connection.MCPFirstTrust = false
+	} else {
+		if connection.Host == "" || connection.User == "" {
+			return ActionResult{OK: false, Message: "ホスト、ユーザー名は必須です"}
+		}
+		connection.SerialPort, connection.BaudRate = "", 0
+		connection.DataBits, connection.Parity, connection.StopBits = 0, "", ""
 	}
 	if a.store == nil {
 		return ActionResult{OK: false, Message: errStoreUnavailable.Error()}
@@ -511,7 +662,7 @@ func (a *App) SaveConnection(connection Connection) ActionResult {
 	}
 
 	previous := a.conns[index]
-	if connection.usesPassword() && previous.usesPassword() && connection.Credential == "" {
+	if connection.Type != "Serial" && connection.usesPassword() && previous.usesPassword() && connection.Credential == "" {
 		connection.Credential = previous.Credential // write-only field left blank: keep it
 	}
 	connection.LastTestResult = previous.LastTestResult
@@ -687,28 +838,60 @@ func (a *App) connectedAgentsLocked() int {
 	return count
 }
 
+// setAgentApprovalBypass grants (with the default limits: Medium, all
+// connections, defaultBypassTTL) or revokes an agent's approval bypass. The
+// grant only takes effect for requests made with the agent's own token.
 func (a *App) setAgentApprovalBypass(agentName string, enabled bool) ActionResult {
+	a.policyMu.Lock()
+	defer a.policyMu.Unlock()
+	return a.setAgentApprovalBypassLocked(agentName, enabled)
+}
+
+// setAgentApprovalBypassLocked is setAgentApprovalBypass for callers that
+// already hold a.policyMu.
+func (a *App) setAgentApprovalBypassLocked(agentName string, enabled bool) ActionResult {
 	agentName = strings.TrimSpace(agentName)
 	if agentName == "" {
 		return ActionResult{OK: false, Message: "エージェント名が不足しています"}
 	}
-	policy := AgentPolicy{
-		AgentName:      agentName,
-		ApprovalBypass: enabled,
-		UpdatedAt:      nowRFC3339(),
+	now := a.clock()
+	a.mu.RLock()
+	policy, existed := a.agentPolicies[agentName]
+	a.mu.RUnlock()
+	policy.AgentName = agentName
+	policy.ApprovalBypass = enabled
+	policy.UpdatedAt = now.Format(time.RFC3339)
+	if enabled {
+		policy.MaxRisk = defaultBypassMaxRisk
+		policy.ScopeConnIDs = []string{}
+		policy.GrantedAt = policy.UpdatedAt
+		policy.GrantedBy = decidedByGUI
+		policy.ExpiresAt = now.Add(defaultBypassTTL).Format(time.RFC3339)
+	} else if !existed {
+		return ActionResult{OK: true, Message: fmt.Sprintf("%s には承認省略が設定されていません", agentName)}
 	}
+	if err := a.saveAgentPolicy(policy); err != nil {
+		return ActionResult{OK: false, Message: fmt.Sprintf("%s の承認省略設定を保存できません: %v", agentName, err)}
+	}
+	if enabled {
+		return ActionResult{OK: true, Message: fmt.Sprintf("%s の承認省略を有効にしました（%s まで）", agentName, policy.ExpiresAt)}
+	}
+	return ActionResult{OK: true, Message: fmt.Sprintf("%s の承認省略を取り消しました", agentName)}
+}
+
+// saveAgentPolicy persists the policy, then publishes it in memory. Callers
+// hold a.policyMu so the two steps are not interleaved with another write.
+func (a *App) saveAgentPolicy(policy AgentPolicy) error {
+	policy.Active, policy.HasToken = false, false
 	if a.store != nil {
 		if err := a.store.saveAgentPolicy(policy); err != nil {
-			return ActionResult{OK: false, Message: fmt.Sprintf("%s の承認省略設定を保存できません: %v", agentName, err)}
+			return err
 		}
 	}
 	a.mu.Lock()
-	a.agentPolicies[agentName] = policy
+	a.agentPolicies[policy.AgentName] = policy
 	a.mu.Unlock()
-	if enabled {
-		return ActionResult{OK: true, Message: fmt.Sprintf("%s の承認省略を有効にしました", agentName)}
-	}
-	return ActionResult{OK: true, Message: fmt.Sprintf("%s の承認省略を取り消しました", agentName)}
+	return nil
 }
 
 // RevokeAgentApprovalBypass turns approval bypass off for an agent.
@@ -716,15 +899,249 @@ func (a *App) RevokeAgentApprovalBypass(agentName string) ActionResult {
 	return a.setAgentApprovalBypass(agentName, false)
 }
 
+// RevokeAllAgentApprovalBypasses turns approval bypass off for every agent.
+func (a *App) RevokeAllAgentApprovalBypasses() ActionResult {
+	a.mu.RLock()
+	names := make([]string, 0, len(a.agentPolicies))
+	for name, policy := range a.agentPolicies {
+		if policy.ApprovalBypass {
+			names = append(names, name)
+		}
+	}
+	a.mu.RUnlock()
+	slices.Sort(names)
+	var failed []string
+	for _, name := range names {
+		if result := a.setAgentApprovalBypass(name, false); !result.OK {
+			failed = append(failed, name)
+		}
+	}
+	if len(failed) > 0 {
+		return ActionResult{OK: false, Message: "承認省略を取り消せなかったエージェントがあります: " + strings.Join(failed, ", ")}
+	}
+	return ActionResult{OK: true, Message: fmt.Sprintf("承認省略を %d 件取り消しました", len(names))}
+}
+
+// ListAgentApprovalBypasses returns the granted bypasses (expired ones are
+// swept first), newest grant first. Active is false when the agent has no
+// token yet, because the grant cannot take effect without one.
+func (a *App) ListAgentApprovalBypasses() []AgentPolicy {
+	a.expireAgentPolicies()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	out := []AgentPolicy{}
+	for _, policy := range a.agentPoliciesViewLocked() {
+		if policy.ApprovalBypass {
+			out = append(out, policy)
+		}
+	}
+	slices.SortFunc(out, func(x, y AgentPolicy) int { return strings.Compare(y.GrantedAt, x.GrantedAt) })
+	return out
+}
+
+// agentApprovalBypassEnabled reports whether agentName holds an unexpired
+// bypass grant (independent of whether it has a token).
 func (a *App) agentApprovalBypassEnabled(agentName string) bool {
 	agentName = strings.TrimSpace(agentName)
 	if agentName == "" {
 		return false
 	}
+	now := a.clock()
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	policy, ok := a.agentPolicies[agentName]
-	return ok && policy.ApprovalBypass
+	return ok && policyActiveAt(policy, now)
+}
+
+// agentBypassCovers reports whether the agent's token and grant together
+// allow auto-executing a command of this risk on conn.
+func (a *App) agentBypassCovers(agentName string, conn Connection, risk string) bool {
+	now := a.clock()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	token, ok := a.agentTokens[agentName]
+	if !ok || !token.Bypass {
+		return false
+	}
+	policy, ok := a.agentPolicies[agentName]
+	return ok && policyAllows(policy, risk, conn.ID, now)
+}
+
+// agentPoliciesViewLocked returns the policies sorted by name with the
+// derived fields filled. Callers hold a.mu.
+func (a *App) agentPoliciesViewLocked() []AgentPolicy {
+	now := a.clock()
+	out := make([]AgentPolicy, 0, len(a.agentPolicies))
+	for _, policy := range a.agentPolicies {
+		policy.ScopeConnIDs = append([]string{}, policy.ScopeConnIDs...)
+		token, hasToken := a.agentTokens[policy.AgentName]
+		policy.HasToken = hasToken
+		policy.Active = policyActiveAt(policy, now) && hasToken && token.Bypass
+		out = append(out, policy)
+	}
+	slices.SortFunc(out, func(x, y AgentPolicy) int { return strings.Compare(x.AgentName, y.AgentName) })
+	return out
+}
+
+// IssueAgentToken creates (or rotates) the per-agent Bearer token for
+// agentName. Only its hash is stored; the token is returned once. A request
+// made with it is attributed to agentName and may use that agent's approval
+// bypass, which the shared token never can.
+func (a *App) IssueAgentToken(agentName string) ActionResult {
+	agentName = strings.TrimSpace(agentName)
+	if agentName == "" {
+		return ActionResult{OK: false, Message: "エージェント名を入力してください"}
+	}
+	if a.store == nil {
+		return ActionResult{OK: false, Message: errStoreUnavailable.Error()}
+	}
+	secret, token, err := newAgentToken(agentName, true)
+	if err != nil {
+		return ActionResult{OK: false, Message: err.Error()}
+	}
+	a.policyMu.Lock()
+	defer a.policyMu.Unlock()
+	if err := a.store.saveAgentToken(token); err != nil {
+		return ActionResult{OK: false, Message: fmt.Sprintf("%s のトークンを保存できません: %v", agentName, err)}
+	}
+	a.mu.Lock()
+	a.agentTokens[agentName] = token
+	a.mu.Unlock()
+	return ActionResult{
+		OK:      true,
+		Message: fmt.Sprintf("%s 専用のトークンを発行しました。MCPクライアントの Authorization: Bearer に設定してください（この画面を離れると再表示できません）", agentName),
+		Token:   secret,
+	}
+}
+
+// RevokeAgentToken deletes the agent's token and its bypass grant, so a
+// later re-issued token does not silently inherit the old grant.
+func (a *App) RevokeAgentToken(agentName string) ActionResult {
+	agentName = strings.TrimSpace(agentName)
+	a.policyMu.Lock()
+	defer a.policyMu.Unlock()
+	a.mu.RLock()
+	_, ok := a.agentTokens[agentName]
+	a.mu.RUnlock()
+	if !ok {
+		return ActionResult{OK: false, Message: fmt.Sprintf("%s のトークンは発行されていません", agentName)}
+	}
+	if a.store != nil {
+		if _, err := a.store.deleteAgentToken(agentName); err != nil {
+			return ActionResult{OK: false, Message: fmt.Sprintf("%s のトークンを削除できません: %v", agentName, err)}
+		}
+	}
+	a.mu.Lock()
+	delete(a.agentTokens, agentName)
+	a.mu.Unlock()
+	note := ""
+	if a.agentApprovalBypassEnabled(agentName) {
+		if result := a.setAgentApprovalBypassLocked(agentName, false); result.OK {
+			note = "。承認省略も取り消しました"
+		} else {
+			note = "（承認省略の取り消しに失敗: " + result.Message + "）"
+		}
+	}
+	return ActionResult{OK: true, Message: fmt.Sprintf("%s のトークンを失効させました%s", agentName, note)}
+}
+
+// ListAgentTokens returns the issued per-agent tokens (no secrets).
+func (a *App) ListAgentTokens() []AgentToken {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.agentTokensViewLocked()
+}
+
+func (a *App) agentTokensViewLocked() []AgentToken {
+	out := make([]AgentToken, 0, len(a.agentTokens))
+	for _, token := range a.agentTokens {
+		token.TokenHash = ""
+		out = append(out, token)
+	}
+	slices.SortFunc(out, func(x, y AgentToken) int { return strings.Compare(x.AgentName, y.AgentName) })
+	return out
+}
+
+func (a *App) agentHasToken(agentName string) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	_, ok := a.agentTokens[strings.TrimSpace(agentName)]
+	return ok
+}
+
+// lookupAgentToken resolves a presented Bearer token to its agent and the
+// token's bypass flag. Hashes are compared in constant time against every
+// issued token; the store is not touched, so a.mu is held only briefly.
+func (a *App) lookupAgentToken(presented string) (string, bool, bool) {
+	if !strings.HasPrefix(presented, agentTokenPrefix) {
+		return "", false, false
+	}
+	want := []byte(hashAgentToken(presented))
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	var match AgentToken
+	found := false
+	for _, token := range a.agentTokens {
+		if subtle.ConstantTimeCompare([]byte(token.TokenHash), want) == 1 {
+			match, found = token, true
+		}
+	}
+	return match.AgentName, match.Bypass, found
+}
+
+// authenticateMCP establishes the caller of an MCP (or audit) request. A
+// per-agent token is always honoured and binds the caller to that agent.
+// Otherwise, with Bearer enabled the shared token is required; with it off
+// the (loopback-only) caller is anonymous. ok=false means 401.
+func (a *App) authenticateMCP(r *http.Request, settings MCPSettings, sharedToken string) (mcpCaller, bool) {
+	if presented, found := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); found {
+		if agent, _, ok := a.lookupAgentToken(strings.TrimSpace(presented)); ok {
+			return mcpCaller{Agent: agent}, true
+		}
+	}
+	if !settings.BearerEnabled {
+		return mcpCaller{}, true
+	}
+	if checkBearer(r, sharedToken) {
+		return mcpCaller{Shared: true}, true
+	}
+	return mcpCaller{}, false
+}
+
+// GetHostKeyInfo returns the host keys ssh-gete has recorded for the
+// connection's host:port, for the GUI to show the fingerprints.
+func (a *App) GetHostKeyInfo(connID string) (HostKeyInfo, error) {
+	return a.hostKeyFingerprint(strings.TrimSpace(connID))
+}
+
+// ResetHostKey forgets the recorded host keys for the connection's host:port
+// (after a legitimate key change). The next GUI connection test records the
+// current key; MCP runs fail with hostkey_unknown until then.
+func (a *App) ResetHostKey(connID string) ActionResult {
+	connID = strings.TrimSpace(connID)
+	conn, ok := a.connectionByID(connID)
+	if !ok {
+		return ActionResult{OK: false, Message: "接続先が見つかりません"}
+	}
+	removed, err := a.resetHostKey(connID)
+	if err != nil {
+		return ActionResult{OK: false, Message: fmt.Sprintf("%s のホスト鍵をリセットできません: %v", conn.Name, err), ID: conn.ID}
+	}
+	if removed == 0 {
+		return ActionResult{OK: true, Message: fmt.Sprintf("%s のホスト鍵は記録されていません", conn.Name), ID: conn.ID}
+	}
+	return ActionResult{
+		OK:      true,
+		Message: fmt.Sprintf("%s（%s）のホスト鍵 %d 件を削除しました。同じホストとポートの接続先すべてに影響します。接続テストで新しい鍵の指紋を確認してください", conn.Name, hostKeyAddress(conn), removed),
+		ID:      conn.ID,
+	}
+}
+
+func (a *App) clock() time.Time {
+	if a.now != nil {
+		return a.now()
+	}
+	return time.Now()
 }
 
 func (a *App) connectionByID(id string) (Connection, bool) {
@@ -783,15 +1200,18 @@ func explainSSHError(conn Connection, err error) string {
 		}
 		return fmt.Sprintf("公開鍵認証に失敗しました。ユーザー名、鍵ファイルパス、接続先ユーザーの ~/.ssh/authorized_keys、またはssh-agent登録鍵を確認してください。パスワードで接続する場合は認証方式を「パスワード保管」に変更してください。詳細: %v", err)
 	}
+	switch hostKeyErrorKind(err) {
+	case "hostkey_unknown":
+		return "このホストの鍵はまだ記録されていません。ssh-gete の接続先画面で「接続テスト」を一度実行し、表示された指紋を確認してから再度お試しください。"
+	case "hostkey":
+		return fmt.Sprintf("ホスト鍵が記録済みのものと一致しません。中間者攻撃の可能性があります。接続先のホスト鍵が正当に変わった場合のみ、接続先画面でホスト鍵をリセットしてから接続テストをやり直してください。詳細: %v", err)
+	}
 	var missing *passphraseMissingError
 	if errors.As(err, &missing) {
 		return "SSH鍵がパスフレーズで保護されています。パスフレーズを入力するか、ssh-agent に鍵を登録してください。"
 	}
 	if strings.Contains(lower, "no such file") || strings.Contains(lower, "read ssh key") {
 		return fmt.Sprintf("SSH鍵ファイルを読めません。鍵ファイルパスを確認してください。詳細: %v", err)
-	}
-	if strings.Contains(lower, "key mismatch") {
-		return fmt.Sprintf("known_hosts のホスト鍵が一致しません。中間者攻撃の可能性があります。接続先のホスト鍵が正当に変わった場合のみ ~/.ssh/known_hosts の該当行を更新してください。詳細: %v", err)
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "タイムアウトしました。ホスト名・ポート・ファイアウォール、またはコマンドの実行時間を確認してください。"
@@ -803,7 +1223,9 @@ func normalizeConnection(connection Connection) Connection {
 	connection.ID = strings.TrimSpace(connection.ID)
 	connection.Name = strings.TrimSpace(connection.Name)
 	connection.Type = connection.connectionType()
-	connection.Host = strings.TrimSpace(connection.Host)
+	// Lowercased like hostKeyAddress, so the saved host, the dial and the
+	// known_hosts identity agree.
+	connection.Host = strings.ToLower(strings.TrimSpace(connection.Host))
 	connection.User = strings.TrimSpace(connection.User)
 	if !connection.usesPassword() {
 		connection.Credential = strings.TrimSpace(connection.Credential)
@@ -823,13 +1245,46 @@ func normalizeConnection(connection Connection) Connection {
 	if connection.AuthMethod == "" {
 		connection.AuthMethod = "SSH鍵認証"
 	}
-	if connection.Type == "Serial" && connection.BaudRate <= 0 {
-		connection.BaudRate = 115200
+	if connection.Type == "Serial" {
+		if connection.BaudRate <= 0 {
+			connection.BaudRate = 115200
+		}
+		if connection.DataBits == 0 {
+			connection.DataBits = 8
+		}
+		connection.Parity = strings.ToLower(strings.TrimSpace(connection.Parity))
+		if connection.Parity == "" {
+			connection.Parity = "none"
+		}
+		connection.StopBits = strings.TrimSpace(connection.StopBits)
+		if connection.StopBits == "" {
+			connection.StopBits = "1"
+		}
 	}
 	if connection.Tags == nil {
 		connection.Tags = []string{}
 	}
 	return connection
+}
+
+var (
+	serialParities = []string{"none", "odd", "even", "mark", "space"}
+	serialStopBits = []string{"1", "1.5", "2"}
+)
+
+// validateSerialParams checks a normalized serial connection's line settings
+// and returns a user-facing message, or "" when they are valid.
+func validateSerialParams(conn Connection) string {
+	if conn.DataBits < 5 || conn.DataBits > 8 {
+		return "データビットは 5〜8 で指定してください"
+	}
+	if !slices.Contains(serialParities, conn.Parity) {
+		return "パリティは none / odd / even / mark / space のいずれかを指定してください"
+	}
+	if !slices.Contains(serialStopBits, conn.StopBits) {
+		return "ストップビットは 1 / 1.5 / 2 のいずれかを指定してください"
+	}
+	return ""
 }
 
 func appConfigDir() string {
@@ -1099,14 +1554,6 @@ func cloneConnections(in []Connection) []Connection {
 func cloneRequests(in []CommandRequest) []CommandRequest {
 	out := make([]CommandRequest, len(in))
 	copy(out, in)
-	return out
-}
-
-func cloneAgentPolicies(in map[string]AgentPolicy) []AgentPolicy {
-	out := make([]AgentPolicy, 0, len(in))
-	for _, policy := range in {
-		out = append(out, policy)
-	}
 	return out
 }
 

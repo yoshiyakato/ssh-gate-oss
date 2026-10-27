@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -17,6 +18,23 @@ import (
 const latestProtocolVersion = "2025-06-18"
 
 var supportedProtocolVersions = []string{"2025-06-18", "2025-03-26"}
+
+const (
+	maxClientRequestIDLen = 200
+	maxCandidates         = 10
+	// get_command_history limit (also used by Store.loadCommandHistory).
+	defaultHistoryLimit   = 20
+	maxHistoryLimit       = 500
+	outputTruncatedMarker = "[ssh-gete: output truncated]"
+)
+
+// requestStates are the state codes agents may filter on (§5.3).
+var requestStates = []string{
+	statePending, stateRunning, stateSucceeded, stateFailed, stateRejected, stateExpired, stateWithdrawn,
+	stateInterrupted, stateAutoRunning, stateAutoSucceeded, stateAutoFailed,
+}
+
+var errorKinds = []string{"connect", "auth", "hostkey", "hostkey_unknown", "timeout", "exit_nonzero", "canceled"}
 
 type rpcRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -41,6 +59,10 @@ func rpcErrorResponse(id json.RawMessage, code int, message string) rpcResponse 
 	return rpcResponse{JSONRPC: "2.0", ID: id, Error: &rpcError{Code: code, Message: message}}
 }
 
+func invalidParams(message string) *rpcError {
+	return &rpcError{Code: -32602, Message: message}
+}
+
 type initializeParams struct {
 	ProtocolVersion string `json:"protocolVersion"`
 }
@@ -51,10 +73,11 @@ type toolCallParams struct {
 }
 
 type executeCommandArgs struct {
-	Host            string `json:"host"`
-	Command         string `json:"command"`
-	Reason          string `json:"reason"`
-	AgentName       string `json:"agent_name"`
+	Host      string `json:"host"`
+	Command   string `json:"command"`
+	Reason    string `json:"reason"`
+	AgentName string `json:"agent_name"`
+	// RequestedBy is the pre-v1 name of agent_name.
 	RequestedBy     string `json:"requested_by"`
 	ClientRequestID string `json:"client_request_id"`
 	TimeoutSeconds  int    `json:"timeout_seconds"`
@@ -77,6 +100,7 @@ type historyArgs struct {
 	State     string `json:"state"`
 	AgentName string `json:"agent_name"`
 	Limit     int    `json:"limit"`
+	AllAgents bool   `json:"all_agents"`
 }
 
 func (a *App) handleMCP(w http.ResponseWriter, r *http.Request, settings MCPSettings, token string) {
@@ -86,7 +110,8 @@ func (a *App) handleMCP(w http.ResponseWriter, r *http.Request, settings MCPSett
 		writeJSON(w, http.StatusMethodNotAllowed, rpcErrorResponse(nil, -32600, "POST only"))
 		return
 	}
-	if settings.BearerEnabled && !checkBearer(r, token) {
+	caller, ok := a.authenticateMCP(r, settings, token)
+	if !ok {
 		writeUnauthorized(w)
 		return
 	}
@@ -115,6 +140,8 @@ func (a *App) handleMCP(w http.ResponseWriter, r *http.Request, settings MCPSett
 	}
 	if len(req.ID) == 0 {
 		// Notifications (and stray responses) get no JSON-RPC reply.
+		// notifications/cancelled is not handled: a dropped HTTP request is
+		// the cancellation signal.
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
@@ -123,7 +150,9 @@ func (a *App) handleMCP(w http.ResponseWriter, r *http.Request, settings MCPSett
 		return
 	}
 
-	result, rpcErr := a.dispatchMCP(r.Context(), req)
+	// r.Context() ends when the client disconnects; tools treat that as
+	// cancellation.
+	result, rpcErr := a.dispatchMCP(r.Context(), caller, req)
 	writeJSON(w, http.StatusOK, rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: result, Error: rpcErr})
 }
 
@@ -133,7 +162,7 @@ func (a *App) handleAudit(w http.ResponseWriter, r *http.Request, settings MCPSe
 		writeJSON(w, http.StatusMethodNotAllowed, rpcErrorResponse(nil, -32600, "GET only"))
 		return
 	}
-	if settings.BearerEnabled && !checkBearer(r, token) {
+	if _, ok := a.authenticateMCP(r, settings, token); !ok {
 		writeUnauthorized(w)
 		return
 	}
@@ -145,6 +174,12 @@ func (a *App) handleAudit(w http.ResponseWriter, r *http.Request, settings MCPSe
 	requests := cloneRequests(a.requests[:min(limit, len(a.requests))])
 	agents := a.connectedAgentsLocked()
 	a.mu.RUnlock()
+	// The listener is reachable by agents: withhold the target address and
+	// the local error detail, as list_hosts and get_request_status do.
+	for i := range requests {
+		requests[i].Stderr = agentStderr(requests[i].Stderr, requests[i].ErrorKind)
+		requests[i].TargetFP = ""
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"requests":         requests,
 		"connected_agents": agents,
@@ -176,7 +211,7 @@ func (a *App) rememberMCPAgent(r *http.Request) {
 	a.mcp.ConnectedAgents = a.connectedAgentsLocked()
 }
 
-func (a *App) dispatchMCP(ctx context.Context, req rpcRequest) (any, *rpcError) {
+func (a *App) dispatchMCP(ctx context.Context, caller mcpCaller, req rpcRequest) (any, *rpcError) {
 	switch req.Method {
 	case "initialize":
 		protocolVersion := latestProtocolVersion
@@ -191,9 +226,9 @@ func (a *App) dispatchMCP(ctx context.Context, req rpcRequest) (any, *rpcError) 
 			},
 			"serverInfo": map[string]any{
 				"name":    appName,
-				"version": "0.2.0",
+				"version": "0.3.0",
 			},
-			"instructions": "ssh-gete は人間の承認を挟む SSH ゲートウェイです。execute_command は原則として承認キューに入り、結果は get_request_status(request_ids, wait_seconds) で待って取得します。",
+			"instructions": "ssh-gete は人間の承認を挟む SSH ゲートウェイです。execute_command は原則として承認キューに入り、結果は get_request_status(request_ids, wait_seconds) で待って取得します。再送には同じ client_request_id を付けてください。",
 		}, nil
 	case "ping":
 		return map[string]any{}, nil
@@ -202,153 +237,321 @@ func (a *App) dispatchMCP(ctx context.Context, req rpcRequest) (any, *rpcError) 
 	case "tools/call":
 		var params toolCallParams
 		if err := json.Unmarshal(req.Params, &params); err != nil {
-			return nil, &rpcError{Code: -32602, Message: "invalid tool params"}
+			return nil, invalidParams("invalid tool params")
 		}
-		if len(params.Arguments) == 0 {
+		if len(params.Arguments) == 0 || string(params.Arguments) == "null" {
 			params.Arguments = json.RawMessage(`{}`)
 		}
-		return a.callMCPTool(ctx, params)
+		return a.callMCPTool(ctx, caller, params)
 	default:
 		return nil, &rpcError{Code: -32601, Message: "method not found"}
 	}
 }
 
-func (a *App) callMCPTool(ctx context.Context, params toolCallParams) (any, *rpcError) {
+// decodeToolArgs enforces additionalProperties:false: unknown fields and
+// wrong types are JSON-RPC invalid params, not tool errors.
+func decodeToolArgs(raw json.RawMessage, into any) *rpcError {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(into); err != nil {
+		return invalidParams("invalid arguments: " + err.Error())
+	}
+	if decoder.More() {
+		return invalidParams("invalid arguments: trailing data")
+	}
+	return nil
+}
+
+func (a *App) callMCPTool(ctx context.Context, caller mcpCaller, params toolCallParams) (any, *rpcError) {
 	switch params.Name {
 	case "list_hosts":
 		var args listHostsArgs
-		if err := json.Unmarshal(params.Arguments, &args); err != nil {
-			return nil, &rpcError{Code: -32602, Message: "invalid arguments"}
+		if err := decodeToolArgs(params.Arguments, &args); err != nil {
+			return nil, err
 		}
 		return toolResult(map[string]any{"hosts": a.listHostsForAgent(args)}, false), nil
 	case "get_command_history":
 		var args historyArgs
-		if err := json.Unmarshal(params.Arguments, &args); err != nil {
-			return nil, &rpcError{Code: -32602, Message: "invalid arguments"}
+		if err := decodeToolArgs(params.Arguments, &args); err != nil {
+			return nil, err
 		}
-		return toolResult(map[string]any{"requests": a.commandHistory(args)}, false), nil
+		return a.commandHistoryTool(caller, args)
 	case "get_request_status":
 		var args requestStatusArgs
-		if err := json.Unmarshal(params.Arguments, &args); err != nil {
-			return nil, &rpcError{Code: -32602, Message: "invalid arguments"}
+		if err := decodeToolArgs(params.Arguments, &args); err != nil {
+			return nil, err
 		}
-		if len(args.RequestIDs) == 0 || len(args.RequestIDs) > 20 {
-			return nil, &rpcError{Code: -32602, Message: "request_ids must contain 1-20 ids"}
-		}
-		return toolResult(map[string]any{"requests": a.requestStatus(ctx, args)}, false), nil
+		return a.requestStatusTool(ctx, args)
 	case "execute_command", "request_command_execution":
 		var args executeCommandArgs
-		if err := json.Unmarshal(params.Arguments, &args); err != nil {
-			return nil, &rpcError{Code: -32602, Message: "invalid arguments"}
+		if err := decodeToolArgs(params.Arguments, &args); err != nil {
+			return nil, err
 		}
-		return a.executeCommandTool(ctx, args)
+		return a.executeCommandTool(ctx, caller, args)
 	default:
-		return nil, &rpcError{Code: -32602, Message: "unknown tool"}
+		return nil, invalidParams("unknown tool: " + params.Name)
 	}
 }
 
+// listHostsForAgent returns the connections with their live state. Serial
+// rows carry only name/type/executable/in_use: no host, port, credential or
+// fingerprint ever leaves through MCP.
 func (a *App) listHostsForAgent(args listHostsArgs) []map[string]any {
 	a.mu.RLock()
 	conns := cloneConnections(a.conns)
 	pending := map[string]int{}
 	inflight := map[string]int{}
+	inflightSince := map[string]string{}
 	for _, req := range a.requests {
+		if req.ConnectionID == "" {
+			continue
+		}
 		switch req.Status {
 		case statePending:
 			pending[req.ConnectionID]++
 		case stateRunning, stateAutoRunning:
 			inflight[req.ConnectionID]++
+			// RFC3339 in one zone sorts lexically.
+			if since := inflightSince[req.ConnectionID]; since == "" || (req.DecidedAt != "" && req.DecidedAt < since) {
+				inflightSince[req.ConnectionID] = req.DecidedAt
+			}
 		}
 	}
 	a.mu.RUnlock()
+	// terminalCounts takes termMu; a.mu is released first (§5.0).
 	terminals := a.terminalCounts()
+	tag := strings.TrimSpace(args.Tag)
 
 	hosts := make([]map[string]any, 0, len(conns))
 	for _, conn := range conns {
-		if args.Tag != "" && !slices.Contains(conn.Tags, args.Tag) {
+		if tag != "" && !slices.ContainsFunc(conn.Tags, func(t string) bool { return strings.EqualFold(strings.TrimSpace(t), tag) }) {
+			continue
+		}
+		if conn.connectionType() == "Serial" {
+			inUse := terminals[conn.ID] > 0
+			if args.ConnectedOnly && !inUse {
+				continue
+			}
+			hosts = append(hosts, map[string]any{
+				"name":       conn.Name,
+				"type":       "serial",
+				"executable": false,
+				"in_use":     inUse,
+			})
 			continue
 		}
 		connected := terminals[conn.ID] > 0 || inflight[conn.ID] > 0
 		if args.ConnectedOnly && !connected {
 			continue
 		}
-		serial := conn.connectionType() == "Serial"
-		entry := map[string]any{
-			"name":        conn.Name,
-			"type":        strings.ToLower(conn.connectionType()),
-			"executable":  !serial,
-			"tags":        conn.Tags,
-			"description": conn.Description,
-			"connected":   connected,
+		tags := conn.Tags
+		if tags == nil {
+			tags = []string{}
 		}
-		if !serial {
-			entry["open_terminals"] = terminals[conn.ID]
-			entry["inflight"] = inflight[conn.ID]
-			entry["pending_approvals"] = pending[conn.ID]
+		entry := map[string]any{
+			"name":              conn.Name,
+			"type":              "ssh",
+			"executable":        true,
+			"tags":              tags,
+			"description":       conn.Description,
+			"connected":         connected,
+			"open_terminals":    terminals[conn.ID],
+			"inflight":          inflight[conn.ID],
+			"pending_approvals": pending[conn.ID],
+		}
+		// Terminal start times are not exposed yet, so connected_since is
+		// only reported when MCP executions alone keep the connection open.
+		if terminals[conn.ID] == 0 && inflightSince[conn.ID] != "" {
+			entry["connected_since"] = inflightSince[conn.ID]
 		}
 		hosts = append(hosts, entry)
 	}
 	return hosts
 }
 
-func (a *App) executeCommandTool(ctx context.Context, args executeCommandArgs) (any, *rpcError) {
+func (a *App) executeCommandTool(ctx context.Context, caller mcpCaller, args executeCommandArgs) (any, *rpcError) {
 	args.Host = strings.TrimSpace(args.Host)
 	args.Command = strings.TrimSpace(args.Command)
 	args.ClientRequestID = strings.TrimSpace(args.ClientRequestID)
 	if args.Host == "" || args.Command == "" {
-		return nil, &rpcError{Code: -32602, Message: "host and command are required"}
+		return nil, invalidParams("host and command are required")
+	}
+	if len(args.ClientRequestID) > maxClientRequestIDLen {
+		return nil, invalidParams(fmt.Sprintf("client_request_id must be at most %d bytes", maxClientRequestIDLen))
+	}
+	if args.TimeoutSeconds < 0 || args.TimeoutSeconds > 3600 {
+		return nil, invalidParams("timeout_seconds must be 1-3600")
 	}
 	agentName := commandAgentName(args)
-	if agentName == "" {
-		return nil, &rpcError{Code: -32602, Message: "agent_name is required"}
+	if caller.Agent != "" {
+		if agentName == "" {
+			agentName = caller.Agent
+		} else if agentName != caller.Agent {
+			return toolError("unauthorized_bypass", "agent_name does not match the agent token", nil), nil
+		}
 	}
-	if existing, ok := a.findRequestByClientID(agentName, args.ClientRequestID); ok {
-		out := requestView(existing, true)
-		out["deduplicated"] = true
-		return toolResult(out, false), nil
+	if agentName == "" {
+		return nil, invalidParams("agent_name is required")
 	}
 
-	conn, candidates, ok := a.resolveConnection(args.Host)
+	// The key lock spans lookup and creation so concurrent retries with the
+	// same client_request_id create one request.
+	unlock := func() {}
+	if args.ClientRequestID != "" {
+		unlock = a.mcpRuntime.lockKey(agentName + "\x00" + args.ClientRequestID)
+	}
+	defer unlock()
+	if existing, ok := a.existingClientRequest(agentName, args.ClientRequestID); ok {
+		out := executeView(existing)
+		out["deduplicated"] = true
+		// Same isError rule as the original answer (runBypassedCommand).
+		return toolResult(out, executeFailed(existing)), nil
+	}
+
+	conn, matches, ok := a.resolveConnection(args.Host)
 	if !ok {
-		kind, message := "host_not_found", "host not found"
-		if len(candidates) > 1 {
-			kind, message = "ambiguous_host", "host matches several connections; use the connection name"
-		} else {
-			candidates = a.connectionNames(10)
+		if len(matches) > 1 {
+			return toolError("ambiguous_host", "host matches several connections; use the connection name",
+				map[string]any{"candidates": matches[:min(len(matches), maxCandidates)]}), nil
 		}
-		return toolResult(map[string]any{"error_kind": kind, "message": message, "candidates": candidates}, true), nil
+		return toolError("host_not_found", "host not found; use a name from list_hosts",
+			map[string]any{"candidates": a.hostCandidates(args.Host, maxCandidates)}), nil
 	}
 	if conn.connectionType() == "Serial" {
-		return toolResult(map[string]any{
-			"error_kind": "serial_not_supported",
-			"message":    "serial connections are interactive-only; not executable via MCP",
-		}, true), nil
+		return toolError("serial_not_supported", "serial connections are interactive-only; not executable via MCP", nil), nil
 	}
 
 	risk := classifyRisk(args.Command)
-	if a.needsHumanApproval(conn, risk, args.Command, agentName, args.ForceQueue) {
+	if a.needsHumanApproval(conn, risk, args.Command, caller, agentName, args.ForceQueue) {
 		req, err := a.queueCommand(conn, args.Command, args.Reason, agentName, risk, args.ClientRequestID)
 		if err != nil {
-			return toolResult(map[string]any{"error_kind": "storage", "message": err.Error()}, true), nil
+			return toolError("storage", err.Error(), nil), nil
 		}
-		out := requestView(req, false)
-		out["requires_approval"] = true
-		out["auto_executed"] = false
-		out["next_action"] = "call get_request_status with this request_id and wait_seconds to receive the result after human approval"
+		out := executeView(req)
+		// Approval bypass needs the agent's own token; with the shared token
+		// (or none) a grant for this name is ignored.
+		if !args.ForceQueue && !caller.mayBypassAs(agentName) && a.agentApprovalBypassEnabled(agentName) {
+			out["notice"] = "approval bypass is granted to this agent name but only works with its agent token; queued for human approval"
+		}
 		return toolResult(out, false), nil
 	}
-
-	req, err := a.executeCommandAndLog(ctx, conn, args.Command, args.Reason, agentName, risk, args.ClientRequestID, args.TimeoutSeconds)
-	if err != nil {
-		return toolResult(map[string]any{"error_kind": "storage", "message": err.Error()}, true), nil
-	}
-	out := requestView(req, true)
-	out["requires_approval"] = false
-	out["auto_executed"] = true
-	return toolResult(out, req.Status == stateAutoFailed), nil
+	return a.runBypassedCommand(ctx, conn, args, agentName, risk, unlock), nil
 }
 
-// requestView is the agent-facing shape of a request.
+// runBypassedCommand executes an approval-bypassed command. The request is
+// persisted as auto_running first (a crash still leaves an audit record), and
+// the agent waits at most RequestTimeout: after that it gets state=running and
+// the command keeps going, detached from the HTTP request. Until then an HTTP
+// disconnect cancels the command (recorded as interrupted).
+func (a *App) runBypassedCommand(ctx context.Context, conn Connection, args executeCommandArgs, agentName string, risk string, unlockKey func()) any {
+	execCtx, cancel, ok := a.mcpRuntime.acquireExec(a.appCtx)
+	if !ok {
+		return busyResult()
+	}
+	req := newCommandRequest(conn, args.Command, args.Reason, agentName, risk, stateAutoRunning)
+	req.ExecutedCommand = args.Command
+	req.ApprovedRisk = risk
+	req.DecidedBy = "bypass:" + agentName
+	req.DecidedAt = req.RequestedAt
+	req.ClientRequestID = args.ClientRequestID
+	if err := a.recordCommandRequest(req); err != nil {
+		cancel()
+		a.mcpRuntime.releaseExec()
+		return toolError("storage", err.Error(), nil)
+	}
+	// Recorded: a retry now finds it by client_request_id.
+	unlockKey()
+
+	// While the agent waits synchronously, an HTTP disconnect cancels the run.
+	// The listener being stopped or restarted by ssh-gete also ends ctx (via
+	// http.Server.Close), but is not a disconnect: the run is detached and
+	// left to drainMCPCommands.
+	listenerStop := listenerStopping(ctx)
+	stopWatch := context.AfterFunc(ctx, func() {
+		if !isClosed(listenerStop) {
+			cancel()
+		}
+	})
+	done := make(chan CommandRequest, 1)
+	go func() {
+		defer a.mcpRuntime.releaseExec()
+		defer cancel()
+		result, execErr := a.executeSSH(execCtx, conn, args.Command, args.TimeoutSeconds)
+		state := stateAutoSucceeded
+		switch {
+		case execErr == nil:
+		case errors.Is(execErr, context.Canceled):
+			state = stateInterrupted
+		default:
+			state = stateAutoFailed
+		}
+		final := a.finishRequest(req, state, result, execErr)
+		if final.ID == "" {
+			final = req
+			final.Status = state
+		}
+		done <- final
+	}()
+
+	timer := time.NewTimer(a.syncResponseLimit())
+	defer timer.Stop()
+	select {
+	case final := <-done:
+		stopWatch()
+		return toolResult(executeView(final), executeFailed(final))
+	case <-timer.C:
+		// Detach: from here on only shutdown cancels the command.
+		stopWatch()
+	case <-listenerStop:
+		// Answer state=running before the listener closes; the run goes on.
+		stopWatch()
+	case <-ctx.Done():
+	}
+	current := req
+	if latest, ok := a.findRequest(req.ID); ok {
+		current = latest
+	}
+	return toolResult(executeView(current), false)
+}
+
+// syncResponseLimit is how long execute_command waits for a bypassed command
+// before answering state=running.
+func (a *App) syncResponseLimit() time.Duration {
+	a.mu.RLock()
+	seconds := a.mcp.RequestTimeout
+	a.mu.RUnlock()
+	return timeoutSeconds(seconds, 30)
+}
+
+func busyResult() any {
+	return toolError("server_busy", fmt.Sprintf("too many commands running (max %d); retry later or use force_queue", maxMCPExec),
+		map[string]any{"retry_after_ms": busyRetryAfter.Milliseconds()})
+}
+
+func (a *App) requestStatusTool(ctx context.Context, args requestStatusArgs) (any, *rpcError) {
+	if len(args.RequestIDs) == 0 || len(args.RequestIDs) > 20 {
+		return nil, invalidParams("request_ids must contain 1-20 ids")
+	}
+	if args.WaitSeconds < 0 || args.WaitSeconds > 60 {
+		return nil, invalidParams("wait_seconds must be 0-60")
+	}
+	includeOutput := args.IncludeOutput == nil || *args.IncludeOutput
+	wait := time.Duration(args.WaitSeconds) * time.Second
+	// A listener stop answers a long-poll with the current state instead of
+	// cutting it off without a response.
+	ctx, cancel := withListenerStop(ctx)
+	defer cancel()
+	if wait > 0 {
+		if !a.mcpRuntime.acquireWaiter() {
+			return busyResult(), nil
+		}
+		defer a.mcpRuntime.releaseWaiter()
+	}
+	return toolResult(map[string]any{"requests": a.requestStatus(ctx, args.RequestIDs, wait, includeOutput)}, false), nil
+}
+
+// requestView is the agent-facing shape of a request (get_request_status and,
+// without output, get_command_history).
 func requestView(req CommandRequest, includeOutput bool) map[string]any {
 	out := map[string]any{
 		"request_id":        req.ID,
@@ -356,34 +559,64 @@ func requestView(req CommandRequest, includeOutput bool) map[string]any {
 		"state":             req.Status,
 		"risk":              req.Risk,
 		"requested_command": req.Command,
+		"executed_command":  req.ExecutedCommand,
+		"modified_by_human": req.ExecutedCommand != "" && req.ExecutedCommand != req.Command,
+		"requested_by":      req.RequestedBy,
 		"requested_at":      req.RequestedAt,
+		"timed_out":         req.ErrorKind == "timeout",
+		"stdout_truncated":  strings.Contains(req.Stdout, outputTruncatedMarker),
+		"stderr_truncated":  strings.Contains(req.Stderr, outputTruncatedMarker),
 	}
-	if req.ExecutedCommand != "" {
-		out["executed_command"] = req.ExecutedCommand
-		out["modified_by_human"] = req.ExecutedCommand != req.Command
+	if req.ClientRequestID != "" {
+		out["client_request_id"] = req.ClientRequestID
 	}
 	if req.DecidedBy != "" {
 		out["decided_by"] = req.DecidedBy
 		out["decided_at"] = req.DecidedAt
+	}
+	if req.ExpiresAt != "" {
+		out["expires_at"] = req.ExpiresAt
 	}
 	if req.ExitCode != nil {
 		out["exit_code"] = *req.ExitCode
 	}
 	if req.ErrorKind != "" {
 		out["error_kind"] = req.ErrorKind
-		out["timed_out"] = req.ErrorKind == "timeout"
 	}
 	if req.FinishedAt != "" {
 		out["finished_at"] = req.FinishedAt
-		out["duration"] = req.Duration
+		if d, err := time.ParseDuration(req.Duration); err == nil {
+			out["duration_ms"] = d.Milliseconds()
+		}
 	}
 	if includeOutput && requestIsFinal(req.Status) {
 		out["stdout"] = req.Stdout
-		out["stderr"] = req.Stderr
-		out["stdout_truncated"] = strings.HasSuffix(req.Stdout, "[ssh-gete: output truncated]")
-		out["stderr_truncated"] = strings.HasSuffix(req.Stderr, "[ssh-gete: output truncated]")
+		out["stderr"] = agentStderr(req.Stderr, req.ErrorKind)
 	}
 	return out
+}
+
+// executeView is execute_command's answer: the request plus how it was
+// handled and what the agent should do next.
+func executeView(req CommandRequest) map[string]any {
+	out := requestView(req, true)
+	autoExecuted := strings.HasPrefix(req.DecidedBy, "bypass:")
+	out["auto_executed"] = autoExecuted
+	out["requires_approval"] = !autoExecuted
+	switch {
+	case !requestIsFinal(req.Status):
+		out["next_action"] = "call get_request_status with this request_id and wait_seconds to receive the result"
+	case req.ErrorKind == "hostkey_unknown":
+		out["next_action"] = "the host key is not trusted yet; ask the human to connect once from the ssh-gete GUI and verify the fingerprint"
+	}
+	return out
+}
+
+// executeFailed is execute_command's isError rule: an approval-bypassed run
+// that failed or was interrupted. Queued requests report their outcome
+// through get_request_status, so their execute_command answer is not an error.
+func executeFailed(req CommandRequest) bool {
+	return req.Status == stateAutoFailed || (req.Status == stateInterrupted && strings.HasPrefix(req.DecidedBy, "bypass:"))
 }
 
 func requestIsFinal(state string) bool {
@@ -394,93 +627,92 @@ func requestIsFinal(state string) bool {
 	return true
 }
 
-// requestStatus returns the requested entries, long-polling up to
-// wait_seconds while all of them are still open (pending/running).
-func (a *App) requestStatus(ctx context.Context, args requestStatusArgs) []map[string]any {
-	includeOutput := args.IncludeOutput == nil || *args.IncludeOutput
-	wait := time.Duration(min(max(args.WaitSeconds, 0), 60)) * time.Second
-	deadline := time.NewTimer(wait)
-	defer deadline.Stop()
-	for {
-		a.mu.RLock()
-		changed := a.requestsChanged
-		views := make([]map[string]any, 0, len(args.RequestIDs))
-		anyFinal := false
-		for _, id := range args.RequestIDs {
-			found := false
-			for _, req := range a.requests {
-				if req.ID == id {
-					views = append(views, requestView(req, includeOutput))
-					anyFinal = anyFinal || requestIsFinal(req.Status)
-					found = true
-					break
-				}
-			}
-			if !found {
-				views = append(views, map[string]any{"request_id": id, "error_kind": "not_found"})
-				anyFinal = true
-			}
-		}
-		a.mu.RUnlock()
-		if anyFinal || wait == 0 {
-			return views
-		}
-		select {
-		case <-changed:
-		case <-deadline.C:
-			return views
-		case <-ctx.Done():
-			return views
-		}
+// commandHistoryTool returns summaries (no stdout/stderr), newest first. It
+// is scoped to the calling agent: the agent token's name, else agent_name.
+// all_agents lifts the scope, only for Bearer-authenticated callers.
+func (a *App) commandHistoryTool(caller mcpCaller, args historyArgs) (any, *rpcError) {
+	if args.Limit < 0 {
+		return nil, invalidParams("limit must be 1-500")
 	}
-}
-
-func (a *App) commandHistory(args historyArgs) []map[string]any {
 	limit := args.Limit
-	if limit <= 0 {
-		limit = 20
+	if limit == 0 {
+		limit = defaultHistoryLimit
 	}
-	limit = min(limit, 500)
-	var connID string
-	if args.Host != "" {
-		if conn, ok := a.findConnection(args.Host); ok {
-			connID = conn.ID
+	limit = min(limit, maxHistoryLimit)
+	args.State = strings.TrimSpace(args.State)
+	if args.State != "" && !slices.Contains(requestStates, args.State) {
+		return nil, invalidParams("unknown state: " + args.State)
+	}
+	agent := strings.TrimSpace(args.AgentName)
+	if caller.Agent != "" {
+		if agent != "" && agent != caller.Agent {
+			return toolError("unauthorized_bypass", "agent_name does not match the agent token", nil), nil
+		}
+		agent = caller.Agent
+	}
+	if args.AllAgents {
+		if !a.bearerAuthenticated(caller) {
+			return toolError("unauthorized_bypass", "all_agents requires Bearer authentication", nil), nil
+		}
+		agent = ""
+	} else if agent == "" {
+		return nil, invalidParams("agent_name is required (or all_agents with Bearer authentication)")
+	}
+
+	filter := historyFilter{HostName: strings.TrimSpace(args.Host), State: args.State, RequestedBy: agent, Limit: limit}
+	if filter.HostName != "" {
+		if conn, _, ok := a.resolveConnection(filter.HostName); ok {
+			filter.ConnectionID = conn.ID
 		}
 	}
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	out := []map[string]any{}
-	for _, req := range a.requests {
-		if len(out) >= limit {
-			break
-		}
-		if args.Host != "" && req.ConnectionID != connID && req.Host != args.Host {
-			continue
-		}
-		if args.State != "" && req.Status != args.State {
-			continue
-		}
-		if args.AgentName != "" && req.RequestedBy != args.AgentName {
-			continue
-		}
+	requests, err := a.commandHistory(filter)
+	if err != nil {
+		return toolError("storage", err.Error(), nil), nil
+	}
+	out := make([]map[string]any, 0, len(requests))
+	for _, req := range requests {
 		out = append(out, requestView(req, false))
 	}
-	return out
+	scope := agent
+	if scope == "" {
+		scope = "*"
+	}
+	return toolResult(map[string]any{"requests": out, "agent": scope}, false), nil
 }
 
-func (a *App) connectionNames(limit int) []string {
+// bearerAuthenticated reports whether Bearer auth is on and the caller
+// presented a valid token (shared or per-agent).
+func (a *App) bearerAuthenticated(caller mcpCaller) bool {
+	a.mu.RLock()
+	enabled := a.mcp.BearerEnabled
+	a.mu.RUnlock()
+	return enabled && (caller.Shared || caller.Agent != "")
+}
+
+// hostCandidates suggests SSH connection names for an unknown host: names
+// containing ref first, then the rest, at most limit. Only names are matched:
+// ranking by conn.Host would let an agent recover hidden addresses prefix by
+// prefix. Exact host matching stays in resolveConnection.
+func (a *App) hostCandidates(ref string, limit int) []string {
+	lower := strings.ToLower(strings.TrimSpace(ref))
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	names := []string{}
+	var near, rest []string
 	for _, conn := range a.conns {
-		if len(names) >= limit {
-			break
+		if conn.connectionType() != "SSH" {
+			continue
 		}
-		if conn.connectionType() == "SSH" {
-			names = append(names, conn.Name)
+		if lower != "" && strings.Contains(strings.ToLower(conn.Name), lower) {
+			near = append(near, conn.Name)
+		} else {
+			rest = append(rest, conn.Name)
 		}
 	}
-	return names
+	names := append(near, rest...)
+	if names == nil {
+		names = []string{}
+	}
+	return names[:min(len(names), limit)]
 }
 
 func commandAgentName(args executeCommandArgs) string {
@@ -490,84 +722,183 @@ func commandAgentName(args executeCommandArgs) string {
 	return strings.TrimSpace(args.RequestedBy)
 }
 
+// toolError is a tool-level failure: isError with the code in both the text
+// block and structuredContent.
+func toolError(code string, message string, extra map[string]any) any {
+	value := map[string]any{"error_kind": code, "message": message}
+	for k, v := range extra {
+		value[k] = v
+	}
+	return toolResult(value, true)
+}
+
 func mcpTools() []map[string]any {
 	str := func(description string) map[string]any {
 		return map[string]any{"type": "string", "description": description}
 	}
+	boolean := func(description string) map[string]any {
+		return map[string]any{"type": "boolean", "description": description}
+	}
+	strArray := map[string]any{"type": "array", "items": map[string]any{"type": "string"}}
+	errorProps := map[string]any{
+		"error_kind":     str("ツールエラーのコード（host_not_found / ambiguous_host / serial_not_supported / server_busy / unauthorized_bypass）または実行エラーの種類"),
+		"message":        str("エラーの説明"),
+		"candidates":     map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "maxItems": maxCandidates, "description": "候補の接続先名"},
+		"retry_after_ms": map[string]any{"type": "integer", "description": "server_busy のとき、再試行までの目安（ミリ秒）"},
+	}
+	requestProps := map[string]any{
+		"request_id":        str("要求 ID"),
+		"connection":        str("解決済みの接続先名"),
+		"state":             map[string]any{"type": "string", "enum": requestStates},
+		"risk":              map[string]any{"type": "string", "enum": []string{"Low", "Medium", "High"}},
+		"requested_command": str("要求されたコマンド"),
+		"executed_command":  str("実際に実行した（する）コマンド。承認時に人間が修正した場合は異なる"),
+		"modified_by_human": boolean("承認時に人間がコマンドを修正したか"),
+		"requested_by":      str("要求元エージェント名"),
+		"requested_at":      str("要求日時（RFC3339）"),
+		"client_request_id": str("冪等キー"),
+		"decided_by":        str("承認・拒否した主体（gui / bypass:<agent>）"),
+		"decided_at":        str("承認・拒否の日時"),
+		"expires_at":        str("承認待ちの期限"),
+		"exit_code":         map[string]any{"type": "integer"},
+		"error_kind":        map[string]any{"type": "string", "description": "実行エラーの種類: " + strings.Join(errorKinds, " / ")},
+		"timed_out":         boolean("実行がタイムアウトしたか"),
+		"duration_ms":       map[string]any{"type": "integer"},
+		"finished_at":       str("終了日時"),
+		"stdout":            str("標準出力（終了後のみ）"),
+		"stderr":            str("標準エラー（終了後のみ）"),
+		"stdout_truncated":  boolean("stdout が上限で切り詰められたか"),
+		"stderr_truncated":  boolean("stderr が上限で切り詰められたか"),
+		"message":           str("request_id が見つからないときの説明"),
+	}
+	executeProps := map[string]any{
+		"requires_approval": boolean("人間の承認が必要か"),
+		"auto_executed":     boolean("承認省略で即時実行されたか"),
+		"deduplicated":      boolean("同じ client_request_id の既存要求を返したか"),
+		"next_action":       str("次に呼ぶべき操作"),
+		"notice":            str("補足（承認省略が無効化された理由など）"),
+	}
+	for k, v := range requestProps {
+		executeProps[k] = v
+	}
+	for k, v := range errorProps {
+		executeProps[k] = v
+	}
+	object := func(props map[string]any) map[string]any {
+		return map[string]any{"type": "object", "properties": props}
+	}
+	withErrors := func(props map[string]any) map[string]any {
+		merged := map[string]any{}
+		for k, v := range props {
+			merged[k] = v
+		}
+		for k, v := range errorProps {
+			merged[k] = v
+		}
+		return object(merged)
+	}
+
 	executeSchema := map[string]any{
 		"type": "object",
 		"properties": map[string]any{
 			"host":              str("接続先名（list_hosts の name）"),
 			"command":           str("実行するコマンド"),
 			"reason":            str("実行理由（承認者に表示されます）"),
-			"agent_name":        str("要求元エージェント名。例: claude-desktop, codex-local"),
-			"client_request_id": str("冪等キー。同じ値での再送は新規実行せず既存の request_id を返します（24時間）"),
-			"force_queue":       map[string]any{"type": "boolean", "description": "承認省略が許可されていても承認キューに入れる"},
+			"agent_name":        str("要求元エージェント名。例: claude-desktop, codex-local（エージェント用トークンで認証した場合は省略可、指定するならトークンの名前と一致させる）"),
+			"requested_by":      str("非推奨: agent_name の旧名"),
+			"client_request_id": map[string]any{"type": "string", "maxLength": maxClientRequestIDLen, "description": "冪等キー。同じ agent_name と値での再送は新規実行せず既存の request_id を返します（24時間）"},
+			"force_queue":       boolean("承認省略が許可されていても承認キューに入れる"),
 			"timeout_seconds":   map[string]any{"type": "integer", "minimum": 1, "maximum": 3600, "description": "実行タイムアウト（省略時は接続先の設定）"},
 		},
-		"required":             []string{"host", "command", "agent_name"},
+		"required":             []string{"host", "command"},
 		"additionalProperties": false,
+	}
+	hostProps := map[string]any{
+		"name":              str("接続先名"),
+		"type":              map[string]any{"type": "string", "enum": []string{"ssh", "serial"}},
+		"executable":        boolean("MCP から実行できるか（serial は常に false）"),
+		"tags":              strArray,
+		"description":       str("接続先の説明"),
+		"connected":         boolean("ターミナルか実行中のコマンドで接続しているか"),
+		"connected_since":   str("接続開始の日時"),
+		"open_terminals":    map[string]any{"type": "integer"},
+		"inflight":          map[string]any{"type": "integer"},
+		"pending_approvals": map[string]any{"type": "integer"},
+		"in_use":            boolean("serial: このアプリのターミナルで使用中か"),
 	}
 	return []map[string]any{
 		{
 			"name":        "list_hosts",
 			"title":       "接続先一覧",
 			"description": "ssh-gete に登録された接続先と、接続中・実行中・承認待ちの件数を返します。type=serial の接続先は MCP から実行できません。",
-			"annotations": map[string]any{"readOnlyHint": true, "openWorldHint": false},
+			"annotations": map[string]any{"title": "接続先一覧", "readOnlyHint": true, "idempotentHint": true, "openWorldHint": false},
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"connected_only": map[string]any{"type": "boolean"},
+					"connected_only": boolean("接続中（serial は使用中）の接続先だけ返す"),
 					"tag":            str("このタグを持つ接続先だけ返す"),
 				},
 				"additionalProperties": false,
 			},
+			"outputSchema": withErrors(map[string]any{
+				"hosts": map[string]any{"type": "array", "items": object(hostProps)},
+			}),
 		},
 		{
-			"name":        "execute_command",
-			"title":       "コマンド実行を要求",
-			"description": "SSH コマンドの実行を要求します。原則として人間の承認キューに入り state=pending と request_id を返します。結果は get_request_status で待って取得してください。Bearer 認証済みで承認省略を許可されたエージェントの Low/Medium リスク コマンドのみ即時実行されます（High は常に承認必須）。",
-			"annotations": map[string]any{"destructiveHint": true, "openWorldHint": true},
-			"inputSchema": executeSchema,
+			"name":         "execute_command",
+			"title":        "コマンド実行を要求",
+			"description":  "SSH コマンドの実行を要求します。原則として人間の承認キューに入り state=pending と request_id を返します。結果は get_request_status で待って取得してください。エージェント用トークンで認証し承認省略を許可されたエージェントの Low/Medium リスク コマンドのみ即時実行されます（High は常に承認必須）。即時実行が RequestTimeout を超えると state=running を返し、実行は続きます。同時実行の上限を超えると server_busy と retry_after_ms を返します。",
+			"annotations":  map[string]any{"title": "コマンド実行を要求", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true},
+			"inputSchema":  executeSchema,
+			"outputSchema": object(executeProps),
 		},
 		{
-			"name":        "request_command_execution",
-			"title":       "コマンド実行を要求（旧名）",
-			"description": "execute_command の別名です（非推奨）。",
-			"annotations": map[string]any{"destructiveHint": true, "openWorldHint": true},
-			"inputSchema": executeSchema,
+			"name":         "request_command_execution",
+			"title":        "コマンド実行を要求（旧名）",
+			"description":  "非推奨: execute_command の別名です。入力も出力も execute_command と同じです。",
+			"annotations":  map[string]any{"title": "コマンド実行を要求（旧名）", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true},
+			"inputSchema":  executeSchema,
+			"outputSchema": object(executeProps),
 		},
 		{
 			"name":        "get_request_status",
 			"title":       "要求の状態を取得",
-			"description": "request_id の状態と結果を返します。wait_seconds を指定すると、承認・実行が終わるかその秒数が経つまで待ってから返します。",
-			"annotations": map[string]any{"readOnlyHint": true, "openWorldHint": false},
+			"description": "request_id の状態と結果を返します。wait_seconds を指定すると、いずれかの要求が終了状態（succeeded / failed / rejected など）になるかその秒数が経つまで待ってから返します。",
+			"annotations": map[string]any{"title": "要求の状態を取得", "readOnlyHint": true, "idempotentHint": true, "openWorldHint": false},
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"request_ids":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1, "maxItems": 20},
-					"wait_seconds":   map[string]any{"type": "integer", "minimum": 0, "maximum": 60},
-					"include_output": map[string]any{"type": "boolean", "description": "stdout/stderr を含める（既定 true）"},
+					"wait_seconds":   map[string]any{"type": "integer", "minimum": 0, "maximum": 60, "description": "状態が変わるまで待つ最大秒数（既定 0）"},
+					"include_output": boolean("stdout/stderr を含める（既定 true）"),
 				},
 				"required":             []string{"request_ids"},
 				"additionalProperties": false,
 			},
+			"outputSchema": withErrors(map[string]any{
+				"requests": map[string]any{"type": "array", "items": object(requestProps)},
+			}),
 		},
 		{
 			"name":        "get_command_history",
 			"title":       "コマンド履歴",
-			"description": "承認キューと実行履歴の要約（stdout なし）を新しい順に返します。",
-			"annotations": map[string]any{"readOnlyHint": true, "openWorldHint": false},
+			"description": "承認キューと実行履歴の要約（stdout なし）を新しい順に返します。既定では呼び出し元のエージェント（エージェント用トークンの名前、または agent_name）の分だけを返します。all_agents は Bearer 認証時のみ使えます。",
+			"annotations": map[string]any{"title": "コマンド履歴", "readOnlyHint": true, "idempotentHint": true, "openWorldHint": false},
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"host":       str("接続先名で絞り込み"),
-					"state":      str("pending / running / succeeded / failed / rejected / interrupted / auto_succeeded / auto_failed"),
-					"agent_name": str("要求元エージェントで絞り込み"),
-					"limit":      map[string]any{"type": "integer", "minimum": 1, "maximum": 500},
+					"state":      map[string]any{"type": "string", "enum": requestStates},
+					"agent_name": str("呼び出し元のエージェント名（エージェント用トークンで認証した場合は省略可）"),
+					"limit":      map[string]any{"type": "integer", "minimum": 1, "maximum": maxHistoryLimit, "description": "件数（既定 20）"},
+					"all_agents": boolean("すべてのエージェントの履歴を返す（Bearer 認証時のみ）"),
 				},
 				"additionalProperties": false,
 			},
+			"outputSchema": withErrors(map[string]any{
+				"requests": map[string]any{"type": "array", "items": object(requestProps)},
+				"agent":    str("絞り込んだエージェント名（all_agents のときは *）"),
+			}),
 		},
 	}
 }
@@ -598,26 +929,106 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+// classifyRisk rates a command for the approval queue. The command is split
+// into words on whitespace, shell separators (; | & ( ) ` newline), quotes and
+// redirections, so "true;rm x", "a&&rm x" and "sh -c 'rm x'" are seen as
+// containing rm. A word in command position (or under a bin directory) is
+// reduced to its basename, so "/bin/rm x" is rm. The phrases below are then
+// matched against those normalized words.
 func classifyRisk(command string) string {
-	lower := strings.ToLower(command)
-	highPatterns := []string{
-		" rm ", "rm -", "rm\t", "mkfs", "dd if=", "shutdown", "reboot", "halt",
-		"systemctl restart", "systemctl stop", "service restart", "service stop",
-		"iptables", "ufw ", "userdel", "passwd ", "chown -r", "chmod -r",
+	words := riskWords(strings.ToLower(command))
+	normalized := " " + strings.Join(words, " ") + " "
+	highWords := map[string]bool{
+		"rm": true, "shred": true, "shutdown": true, "reboot": true, "halt": true, "poweroff": true,
+		"iptables": true, "ip6tables": true, "nft": true, "ufw": true, "userdel": true, "passwd": true,
 	}
-	for _, pattern := range highPatterns {
-		if strings.Contains(" "+lower+" ", pattern) {
+	highPhrases := []string{
+		" dd if=", " systemctl restart ", " systemctl stop ", " service restart ", " service stop ",
+		" chown -r", " chmod -r", " find -delete ",
+	}
+	mediumWords := map[string]bool{
+		"sudo": true, "apt": true, "apt-get": true, "yum": true, "dnf": true, "brew": true,
+		"mv": true, "truncate": true,
+	}
+	mediumPhrases := []string{" docker rm", " docker stop ", " kubectl delete ", " cp -r"}
+
+	sawFind := false
+	for _, word := range words {
+		if highWords[word] || strings.HasPrefix(word, "mkfs") {
+			return "High"
+		}
+		if word == "find" {
+			sawFind = true
+		}
+		if sawFind && word == "-delete" {
 			return "High"
 		}
 	}
-	mediumPatterns := []string{
-		"sudo ", "apt ", "apt-get ", "yum ", "dnf ", "brew ", "docker rm",
-		"docker stop", "kubectl delete", "mv ", "cp -r", "truncate",
+	for _, phrase := range highPhrases {
+		if strings.Contains(normalized, phrase) {
+			return "High"
+		}
 	}
-	for _, pattern := range mediumPatterns {
-		if strings.Contains(" "+lower+" ", pattern) {
+	for _, word := range words {
+		if mediumWords[word] {
+			return "Medium"
+		}
+	}
+	for _, phrase := range mediumPhrases {
+		if strings.Contains(normalized, phrase) {
 			return "Medium"
 		}
 	}
 	return "Low"
+}
+
+// riskWords splits a lowercased command into the words classifyRisk matches.
+// A word in command position (the first of a pipeline segment, or after a
+// wrapper such as sudo, env, xargs or find -exec) and any word under a bin
+// directory (/usr/sbin/reboot) are reduced to their basename.
+func riskWords(lower string) []string {
+	wrappers := map[string]bool{
+		"sudo": true, "doas": true, "env": true, "nohup": true, "exec": true, "command": true,
+		"builtin": true, "xargs": true, "time": true, "nice": true, "ionice": true, "timeout": true,
+		"-exec": true, "-execdir": true, "-ok": true, "-okdir": true, "then": true, "do": true,
+		"else": true, "!": true,
+	}
+	var words []string
+	var current strings.Builder
+	commandPosition := true
+	flush := func() {
+		if current.Len() == 0 {
+			return
+		}
+		word := current.String()
+		current.Reset()
+		if commandPosition || strings.Contains(word, "bin/") {
+			if slash := strings.LastIndexByte(word, '/'); slash >= 0 && slash < len(word)-1 {
+				word = word[slash+1:]
+			}
+		}
+		words = append(words, word)
+		switch {
+		case wrappers[word]:
+			commandPosition = true
+		case commandPosition && (strings.Contains(word, "=") || strings.HasPrefix(word, "-")):
+			// VAR=value prefixes and wrapper flags keep the next word in
+			// command position.
+		default:
+			commandPosition = false
+		}
+	}
+	for _, r := range lower {
+		switch r {
+		case ' ', '\t', '\r', '\'', '"', '<', '>':
+			flush()
+		case ';', '|', '&', '(', ')', '`', '\n', '{', '}':
+			flush()
+			commandPosition = true
+		default:
+			current.WriteRune(r)
+		}
+	}
+	flush()
+	return words
 }
