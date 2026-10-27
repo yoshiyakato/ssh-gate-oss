@@ -11,15 +11,17 @@ import logoUrl from './assets/ssh-gate-logo.png';
 import {
   ApproveCommand,
   ApproveCommandAndBypassAgent,
+  ApproveCommandConfirmed,
   CloseTerminal,
   DeleteConnection,
   DeleteCommandRequest,
   DeleteMCPSettings,
-  DisconnectConnection,
+  GenerateMCPToken,
   GetInitialData,
   ListSerialPorts,
   RejectCommand,
   ResizeTerminal,
+  RevokeAgentApprovalBypass,
   SaveConnection,
   SaveMCPSettings,
   SendTerminalInput,
@@ -50,7 +52,7 @@ const I18N = {
     'lang.toggleLabel': '言語',
 
     'ssh.connected': '接続中',
-    'ssh.disconnected': '切断中',
+    'ssh.disconnected': '未接続',
     'mcp.status.running': '起動中',
     'mcp.status.error': 'エラー',
     'mcp.status.stopped': '停止中',
@@ -113,6 +115,48 @@ const I18N = {
     'delCmd.body2': '承認待ちの場合もキューから消えます。',
 
     'test.lastResult': '直近の接続テスト結果',
+    'test.lastTest': '最終テスト',
+    'test.ok': '成功',
+    'test.failed': '失敗',
+    'test.never': '未確認',
+    'conn.test': '接続テスト',
+    'conn.openTerminal': 'ターミナルを開く',
+    'conn.saveFirst': '先に保存してください',
+    'conn.saved': '保存済み',
+    'conn.modified': '未保存の変更あり',
+    'conn.new': '未保存（新規）',
+    'conn.discardConfirm': '未保存の変更を破棄しますか？',
+    'conn.keyPath': '鍵ファイルパス',
+    'conn.password': 'パスワード',
+    'conn.passwordSet': '設定済み（変更する場合のみ入力）',
+    'conn.passwordUnset': '未設定',
+    'storage.error': '保存先エラー：設定を保存できません',
+    'cmd.status.running': '実行中',
+    'cmd.status.succeeded': '完了',
+    'cmd.status.failed': '失敗',
+    'cmd.status.rejected': '拒否',
+    'cmd.status.interrupted': '中断（結果不明）',
+    'cmd.status.auto_running': '自動実行中',
+    'cmd.status.auto_succeeded': '自動実行済み',
+    'cmd.status.auto_failed': '自動実行失敗',
+    'cmd.editHint': '必要ならここで修正してから承認できます（修正内容は監査ログに残ります）',
+    'cmd.edited': '修正あり：元の要求',
+    'cmd.riskConfirm': 'リスクが上がっています。このまま実行しますか？',
+    'cmd.executedCommand': '実行したコマンド',
+    'cmd.exitCode': '終了コード',
+    'cmd.decided': '承認',
+    'cmd.bypassNeedsBearer': '承認省略にはBearerトークンが必要です（MCP待受設定で発行）',
+    'cmd.revokeBypass': '承認省略を取り消す',
+    'mcp.bypassOff': 'Bearer認証が無効なため、エージェントの「承認省略」は停止しています。名乗るだけで省略できてしまうためです。',
+    'mcp.generateToken': 'トークンを発行してBearerを有効化',
+    'mcp.tokenOnce': '発行したトークン（この画面を離れると再表示できません）',
+    'mcp.tokenFromEnv': '環境変数 SSH_GETE_TOKEN で指定中（保存されません）',
+    'mcp.localURL': 'このPCから',
+    'mcp.lanURL': 'LANから（既定ルートのIF）',
+    'mcp.lanUnreachable': '到達不可：待受が {addr} のため。LANから使うには待受を 0.0.0.0 にし、Bearerを有効にしてください',
+    'mcp.lanNone': 'LANのIPを検出できません',
+    'mcp.baseURLHint': 'Base URL（リバースプロキシ経由のときだけ指定）',
+    'mcp.usage.getStatus': '承認・実行の完了を待って結果を取得',
 
     'cmd.queueTitle': '承認キュー',
     'cmd.queueWaiting': '件待機',
@@ -210,8 +254,8 @@ const I18N = {
     'mcp.connectURL': '接続URL',
     'mcp.usageTitle': 'エージェント用usage',
     'mcp.usage.listHosts': '登録済みSSH接続先を確認',
-    'mcp.usage.executeCommand': '承認キューへ登録（自動実行なし）',
-    'mcp.usage.requestExec': '理由付きで承認キューへ登録',
+    'mcp.usage.executeCommand': '承認キューへ登録（Bearer認証済みの承認省略エージェントのみ即時実行）',
+    'mcp.usage.requestExec': 'execute_command の旧名（非推奨）',
     'mcp.usage.getHistory': '承認状態と実行結果を取得',
     'mcp.refreshed': 'MCP状態を更新しました',
     'mcp.deleteConfirm': 'MCPサーバー待受設定を削除し、待受を停止します。よろしいですか？',
@@ -235,7 +279,7 @@ const I18N = {
     'lang.toggleLabel': 'Language',
 
     'ssh.connected': 'Connected',
-    'ssh.disconnected': 'Disconnected',
+    'ssh.disconnected': 'Not connected',
     'mcp.status.running': 'Running',
     'mcp.status.error': 'Error',
     'mcp.status.stopped': 'Stopped',
@@ -298,6 +342,48 @@ const I18N = {
     'delCmd.body2': 'Pending requests are also removed from the queue.',
 
     'test.lastResult': 'Latest connection test result',
+    'test.lastTest': 'Last test',
+    'test.ok': 'OK',
+    'test.failed': 'Failed',
+    'test.never': 'Not checked',
+    'conn.test': 'Test Connection',
+    'conn.openTerminal': 'Open Terminal',
+    'conn.saveFirst': 'Save changes first',
+    'conn.saved': 'Saved',
+    'conn.modified': 'Unsaved changes',
+    'conn.new': 'Not saved yet',
+    'conn.discardConfirm': 'Discard unsaved changes?',
+    'conn.keyPath': 'Key File Path',
+    'conn.password': 'Password',
+    'conn.passwordSet': 'Set (enter only to change)',
+    'conn.passwordUnset': 'Not set',
+    'storage.error': 'Storage error: changes cannot be saved',
+    'cmd.status.running': 'Running',
+    'cmd.status.succeeded': 'Completed',
+    'cmd.status.failed': 'Failed',
+    'cmd.status.rejected': 'Rejected',
+    'cmd.status.interrupted': 'Interrupted (outcome unknown)',
+    'cmd.status.auto_running': 'Auto-running',
+    'cmd.status.auto_succeeded': 'Auto-completed',
+    'cmd.status.auto_failed': 'Auto-failed',
+    'cmd.editHint': 'You may edit the command before approving (edits are kept in the audit log)',
+    'cmd.edited': 'Edited — originally requested',
+    'cmd.riskConfirm': 'The risk increased. Run it anyway?',
+    'cmd.executedCommand': 'Executed command',
+    'cmd.exitCode': 'Exit code',
+    'cmd.decided': 'Approved',
+    'cmd.bypassNeedsBearer': 'Approval bypass requires a Bearer token (issue one in MCP settings)',
+    'cmd.revokeBypass': 'Revoke approval bypass',
+    'mcp.bypassOff': 'Bearer auth is off, so agent approval bypass is disabled — an agent name alone proves nothing.',
+    'mcp.generateToken': 'Issue token and enable Bearer',
+    'mcp.tokenOnce': 'Issued token (not shown again after you leave this page)',
+    'mcp.tokenFromEnv': 'Set by SSH_GETE_TOKEN environment variable (not stored)',
+    'mcp.localURL': 'From this PC',
+    'mcp.lanURL': 'From LAN (default-route interface)',
+    'mcp.lanUnreachable': 'Unreachable: listening on {addr}. To use it from the LAN, listen on 0.0.0.0 with Bearer enabled',
+    'mcp.lanNone': 'No LAN address detected',
+    'mcp.baseURLHint': 'Base URL (only behind a reverse proxy)',
+    'mcp.usage.getStatus': 'Wait for approval/execution and get the result',
 
     'cmd.queueTitle': 'Approval Queue',
     'cmd.queueWaiting': 'waiting',
@@ -305,7 +391,7 @@ const I18N = {
     'cmd.historyTitle': 'Command History',
     'cmd.historyEmpty': 'No history yet',
     'cmd.unknownAgent': 'Unidentified agent',
-    'cmd.status.pending': '承認待ち',
+    'cmd.status.pending': 'Awaiting approval',
     'cmd.approveTitle': 'Execution Approval',
     'cmd.approveSubtitle': 'Review the command, reason, and output history requested by the MCP client.',
     'cmd.detailTitle': 'Command Detail',
@@ -395,8 +481,8 @@ const I18N = {
     'mcp.connectURL': 'Connection URL',
     'mcp.usageTitle': 'Agent Usage',
     'mcp.usage.listHosts': 'List registered SSH connections',
-    'mcp.usage.executeCommand': 'Add to approval queue (no auto-execute)',
-    'mcp.usage.requestExec': 'Add to approval queue with a reason',
+    'mcp.usage.executeCommand': 'Queue for approval (only Bearer-authenticated bypass agents run immediately)',
+    'mcp.usage.requestExec': 'Legacy alias of execute_command (deprecated)',
     'mcp.usage.getHistory': 'Get approval status and execution results',
     'mcp.refreshed': 'MCP status refreshed',
     'mcp.deleteConfirm': 'This deletes the MCP server listener settings and stops the listener. Continue?',
@@ -443,6 +529,8 @@ const state = {
   dirty: {
     connections: false,
     settings: false,
+    // The approval command textarea was edited; polling must not reset it.
+    approval: false,
   },
   passphrase: {
     open: false,
@@ -452,6 +540,7 @@ const state = {
   },
   deleteConnection: {
     open: false,
+    connectionId: '',
     connectionName: '',
   },
   deleteCommand: {
@@ -468,7 +557,8 @@ const state = {
     label: '',
   },
   serialPorts: [],
-  toast: '',
+  // Token returned by GenerateMCPToken; kept only until the user leaves the page.
+  issuedToken: '',
 };
 
 const BAUD_RATES = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600];
@@ -521,21 +611,46 @@ function mcpStatusBadge(status, className = '') {
 }
 
 function sshStatusClass(status) {
-  if (status === 'Online') return 'text-bg-success';
-  if (status === 'Error') return 'text-bg-danger';
-  return 'text-bg-secondary';
+  return status === 'connected' ? 'text-bg-success' : 'text-bg-secondary';
 }
 
 function sshStatusLabel(status) {
-  if (status === 'Online') return t('ssh.connected');
-  return t('ssh.disconnected');
+  return status === 'connected' ? t('ssh.connected') : t('ssh.disconnected');
 }
 
-// Request status is a backend-provided string. Only the pending value has an
-// EN translation; other statuses (executed, rejected, ...) pass through as-is.
+// Request status is a backend state code (pending, running, succeeded, ...).
 function requestStatusLabel(status) {
-  if (status === '承認待ち') return t('cmd.status.pending');
-  return status;
+  const key = `cmd.status.${status}`;
+  const label = t(key);
+  return label === key ? status : label;
+}
+
+function requestStatusClass(status) {
+  if (status === 'pending') return 'text-bg-warning';
+  if (status === 'running' || status === 'auto_running') return 'text-bg-info';
+  if (status === 'succeeded' || status === 'auto_succeeded') return 'text-bg-success';
+  if (status === 'failed' || status === 'auto_failed' || status === 'interrupted') return 'text-bg-danger';
+  return 'text-bg-secondary';
+}
+
+function formatTimestamp(value) {
+  if (!value) return '-';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function lastTestLabel(connection) {
+  if (!connection.lastTestResult) return `${t('test.lastTest')}: ${t('test.never')}`;
+  const outcome = connection.lastTestResult === 'ok' ? t('test.ok') : t('test.failed');
+  return `${t('test.lastTest')}: ${outcome} ${formatTimestamp(connection.lastTestAt)}`;
+}
+
+function lastTestClass(connection) {
+  if (connection.lastTestResult === 'ok') return 'text-bg-success';
+  if (connection.lastTestResult === 'failed') return 'text-bg-danger';
+  return 'text-bg-secondary';
 }
 
 function sshStatusBadge(status, className = '') {
@@ -543,15 +658,13 @@ function sshStatusBadge(status, className = '') {
 }
 
 function mcpEndpoint(mcp) {
-  const base = String(mcp.baseURL || `http://${mcp.listenAddress || '127.0.0.1'}:${mcp.port || 8787}`).replace(/\/+$/, '');
-  const path = String(mcp.mcpPath || '/mcp');
-  return `${base}${path.startsWith('/') ? path : `/${path}`}`;
+  return mcp.localURL || `http://127.0.0.1:${mcp.port || 8787}${mcp.mcpPath || '/mcp'}`;
 }
 
 function agentConfig(mcp) {
-  const server = { url: mcpEndpoint(mcp) };
+  const server = { type: 'http', url: mcpEndpoint(mcp) };
   if (mcp.bearerEnabled) {
-    server.headers = { Authorization: 'Bearer ${SSH_GETE_TOKEN}' };
+    server.headers = { Authorization: `Bearer ${state.issuedToken || '<発行したトークン>'}` };
   }
   return JSON.stringify({ mcpServers: { 'ssh-gete': server } }, null, 2);
 }
@@ -575,14 +688,20 @@ async function copyText(text) {
   showToast(t('common.copied'));
 }
 
+// The toast lives outside #app so showing/hiding it never re-renders the
+// page (a full render would reset unsaved form input and the terminal).
 function showToast(message) {
-  state.toast = message;
-  render();
+  let root = document.querySelector('#toast-root');
+  if (!root) {
+    root = document.createElement('div');
+    root.id = 'toast-root';
+    document.body.appendChild(root);
+  }
+  root.innerHTML = message
+    ? `<div class="toast show align-items-center text-bg-dark border-0 ssh-toast"><div class="d-flex"><div class="toast-body">${escapeHtml(message)}</div></div></div>`
+    : '';
   window.clearTimeout(showToast.timer);
-  showToast.timer = window.setTimeout(() => {
-    state.toast = '';
-    render();
-  }, 3200);
+  showToast.timer = window.setTimeout(() => { root.innerHTML = ''; }, 3200);
 }
 
 async function refreshData({ silent = false } = {}) {
@@ -590,6 +709,7 @@ async function refreshData({ silent = false } = {}) {
     const next = await GetInitialData();
     const protectConnections = state.active === 'connections' && state.dirty.connections;
     const protectSettings = state.active === 'settings' && state.dirty.settings;
+    const protectApproval = state.active === 'commands' && state.dirty.approval;
     const protectModal = state.passphrase.open || state.deleteConnection.open || state.deleteCommand.open;
     // The live xterm must not be torn down by the periodic poll.
     const protectTerminal = state.active === 'terminal';
@@ -600,7 +720,7 @@ async function refreshData({ silent = false } = {}) {
       mcp: protectSettings ? state.data.mcp : next.mcp,
     };
     if (state.selectedConnection >= state.data.connections.length) state.selectedConnection = 0;
-    if (!protectConnections && !protectSettings && !protectModal && !protectTerminal) render();
+    if (!protectConnections && !protectSettings && !protectApproval && !protectModal && !protectTerminal) render();
   } catch (error) {
     if (!silent) {
       app.innerHTML = `<div class="fatal-error">${escapeHtml(t('fatal.init'))}<pre>${escapeHtml(error)}</pre></div>`;
@@ -609,9 +729,8 @@ async function refreshData({ silent = false } = {}) {
 }
 
 function shell(content) {
-  const waitCount = state.data.requests.filter((request) => request.status === '承認待ち').length;
+  const waitCount = state.data.requests.filter((request) => request.status === 'pending').length;
   const mcp = state.data.mcp ?? {};
-  const currentConnection = state.data.connections[state.selectedConnection] ?? state.data.connections[0] ?? {};
   return `
     <div class="app-wrapper">
       <nav class="app-header navbar navbar-expand bg-body">
@@ -671,11 +790,11 @@ function shell(content) {
           </div>
           <div class="status-line">
             <span>${escapeHtml(t('status.sshSession'))}</span>
-            ${sshStatusBadge(currentConnection.status, 'status-badge')}
+            ${sshStatusBadge(state.terminal.connected ? 'connected' : '', 'status-badge')}
           </div>
           <div class="status-line">
             <span>${escapeHtml(t('status.currentConnection'))}</span>
-            <strong class="status-value" title="${escapeHtml(currentConnection.name || '-')}">${escapeHtml(currentConnection.name || '-')}</strong>
+            <strong class="status-value" title="${escapeHtml(state.terminal.label || '-')}">${escapeHtml(state.terminal.label || '-')}</strong>
           </div>
           <div class="status-line">
             <span>${escapeHtml(t('status.listenPort'))}</span>
@@ -711,7 +830,7 @@ function shell(content) {
           </div>
         </div>
       </main>
-      ${state.toast ? `<div class="toast show align-items-center text-bg-dark border-0 ssh-toast"><div class="d-flex"><div class="toast-body">${escapeHtml(state.toast)}</div></div></div>` : ''}
+      ${state.data.storageError ? `<div class="alert alert-danger storage-error m-0 rounded-0">${escapeHtml(t('storage.error'))}: ${escapeHtml(state.data.storageError)}</div>` : ''}
       ${state.passphrase.open ? passphraseModal() : ''}
       ${state.deleteConnection.open ? deleteConnectionModal() : ''}
       ${state.deleteCommand.open ? deleteCommandModal() : ''}
@@ -730,9 +849,15 @@ function navItem(id, icon, label, badge = 0) {
   `;
 }
 
+function connectionSaveState(connection) {
+  if (!connection.id) return 'new';
+  return state.dirty.connections ? 'modified' : 'saved';
+}
+
 function renderConnections() {
   const connections = state.data.connections ?? [];
   const selected = connections[state.selectedConnection] ?? connections[0] ?? {};
+  const saveState = connectionSaveState(selected);
   return `
     <div class="row g-3">
       <div class="col-12 col-xl-4">
@@ -767,7 +892,10 @@ function renderConnections() {
                 <h3 class="card-title fw-bold mb-1">${escapeHtml(t('conn.editTitle'))}</h3>
                 <div class="text-secondary small">${escapeHtml(t('conn.editSubtitle'))}</div>
               </div>
-              <span class="badge ${selected.status === 'Online' ? 'text-bg-success' : selected.status === 'Error' ? 'text-bg-danger' : 'text-bg-secondary'}">${escapeHtml(t('conn.reachability'))} ${escapeHtml(selected.status || 'Unknown')}</span>
+              <div class="d-flex flex-column align-items-end gap-1">
+                <span class="badge ${saveState === 'saved' ? 'text-bg-secondary' : 'text-bg-warning'}">${escapeHtml(t(`conn.${saveState}`))}</span>
+                <span class="badge ${lastTestClass(selected)}" title="${escapeHtml(selected.lastTestMessage || '')}">${escapeHtml(lastTestLabel(selected))}</span>
+              </div>
             </div>
           </div>
           <div class="card-body">
@@ -788,17 +916,18 @@ function renderConnections() {
             </div>
             ${connectionTestResult()}
           </div>
-          <div class="card-footer d-flex gap-2">
-            ${(selected.type === 'Serial') ? '' : `
-            <button class="btn btn-primary" type="button" data-action="connect-ssh">
-              <i class="bi bi-plug-fill me-1"></i>${escapeHtml(t('conn.connect'))}
-            </button>
-            <button class="btn btn-outline-secondary" type="button" data-action="disconnect-ssh">
-              <i class="bi bi-plug me-1"></i>${escapeHtml(t('conn.disconnect'))}
-            </button>`}
+          <div class="card-footer d-flex gap-2 flex-wrap">
+            <button class="btn btn-primary" type="submit">${escapeHtml(t('common.save'))}</button>
+            <button class="btn btn-outline-secondary" type="button" data-action="cancel-connection" ${saveState === 'saved' ? 'disabled' : ''}>${escapeHtml(t('common.cancel'))}</button>
             <div class="ms-auto d-flex gap-2">
-              <button class="btn btn-outline-secondary" type="button">${escapeHtml(t('common.cancel'))}</button>
-              <button class="btn btn-primary" type="submit">${escapeHtml(t('common.save'))}</button>
+              <button class="btn btn-outline-primary" type="button" data-action="connect-ssh">
+                <i class="bi bi-activity me-1"></i>${escapeHtml(t('conn.test'))}
+              </button>
+              <span title="${saveState === 'saved' ? '' : escapeHtml(t('conn.saveFirst'))}">
+                <button class="btn btn-outline-dark" type="button" data-action="open-terminal" ${saveState === 'saved' ? '' : 'disabled'}>
+                  <i class="bi bi-terminal-fill me-1"></i>${escapeHtml(t('conn.openTerminal'))}
+                </button>
+              </span>
             </div>
           </div>
         </form>
@@ -834,7 +963,6 @@ function passphraseModal() {
 }
 
 function connectionRow(connection, index) {
-  const statusClass = connection.status === 'Online' ? 'success' : connection.status === 'Error' ? 'danger' : 'secondary';
   const activeClass = index === state.selectedConnection ? 'active' : '';
   const isSerial = connection.type === 'Serial';
   const subtitle = isSerial
@@ -850,9 +978,9 @@ function connectionRow(connection, index) {
           </div>
           <small>${subtitle}</small>
         </div>
-        <span class="badge text-bg-${statusClass}">${escapeHtml(connection.status || 'Unknown')}</span>
+        <span class="badge ${lastTestClass(connection)}" title="${escapeHtml(lastTestLabel(connection))}">${escapeHtml(connection.id ? (connection.lastTestResult === 'ok' ? t('test.ok') : connection.lastTestResult === 'failed' ? t('test.failed') : t('test.never')) : t('conn.new'))}</span>
       </button>
-      <button class="btn btn-sm connection-trash" type="button" data-action="delete-connection" data-connection-name="${escapeHtml(connection.name)}" aria-label="${escapeHtml(connection.name)} ${escapeHtml(t('conn.deleteAria'))}">
+      <button class="btn btn-sm connection-trash" type="button" data-action="delete-connection" data-connection-id="${escapeHtml(connection.id || '')}" data-connection-name="${escapeHtml(connection.name)}" aria-label="${escapeHtml(connection.name)} ${escapeHtml(t('conn.deleteAria'))}">
         <i class="bi bi-trash"></i>
       </button>
     </div>
@@ -933,13 +1061,13 @@ function connectionTestResult() {
 function selectedCommandRequest() {
   const requests = state.data.requests ?? [];
   return requests.find((request) => request.id === state.selectedRequestId)
-    ?? requests.find((request) => request.status === '承認待ち')
+    ?? requests.find((request) => request.status === 'pending')
     ?? null;
 }
 
 function renderCommands() {
   const requests = state.data.requests ?? [];
-  const queueRequests = requests.filter((request) => request.status === '承認待ち');
+  const queueRequests = requests.filter((request) => request.status === 'pending');
   const selected = selectedCommandRequest();
   const selectedId = selected?.id ?? '';
   return `
@@ -982,9 +1110,9 @@ function requestRow(request, selectedId) {
       <div class="d-flex align-items-start justify-content-between gap-2">
         <div>
           <div class="fw-bold">${escapeHtml(request.id)}</div>
-          <small>${escapeHtml(request.requestedBy || t('cmd.unknownAgent'))} / ${escapeHtml(request.requestedAt)}</small>
+          <small>${escapeHtml(request.host || '-')} / ${escapeHtml(request.requestedBy || t('cmd.unknownAgent'))} / ${escapeHtml(formatTimestamp(request.requestedAt))}</small>
         </div>
-        <span class="badge text-bg-secondary">${escapeHtml(requestStatusLabel(request.status))}</span>
+        <span class="badge ${requestStatusClass(request.status)}">${escapeHtml(requestStatusLabel(request.status))}</span>
       </div>
       <code class="d-block mt-2 small text-truncate">${escapeHtml(request.command)}</code>
     </button>
@@ -993,7 +1121,10 @@ function requestRow(request, selectedId) {
 
 function commandDetail(selected) {
   const bypassEnabled = agentBypassEnabled(selected.requestedBy);
-  const pending = selected.status === '承認待ち';
+  const pending = selected.status === 'pending';
+  const bypassAllowed = Boolean(state.data.mcp?.bypassAllowed);
+  const executed = selected.executedCommand || '';
+  const edited = executed && executed !== selected.command;
   return `
     <div class="card card-outline ${pending ? 'card-warning' : 'card-secondary'} h-100">
       <div class="card-header">
@@ -1002,22 +1133,27 @@ function commandDetail(selected) {
             <h3 class="card-title fw-bold mb-1">${escapeHtml(pending ? t('cmd.approveTitle') : t('cmd.detailTitle'))}</h3>
             <div class="text-secondary small">${escapeHtml(pending ? t('cmd.approveSubtitle') : t('cmd.detailSubtitle'))}</div>
           </div>
-          <span class="badge ${pending ? 'text-bg-warning' : 'text-bg-secondary'}">${escapeHtml(requestStatusLabel(selected.status))}</span>
+          <span class="badge ${requestStatusClass(selected.status)}">${escapeHtml(requestStatusLabel(selected.status))}</span>
         </div>
       </div>
       <div class="card-body">
         <div class="command-agent mb-3">
           <span>${escapeHtml(t('cmd.agent'))}</span>
           <strong>${escapeHtml(selected.requestedBy || t('cmd.unknownAgent'))}</strong>
-          ${bypassEnabled ? `<em>${escapeHtml(t('cmd.bypassing'))}</em>` : ''}
+          ${bypassEnabled ? `<em>${escapeHtml(t('cmd.bypassing'))}</em> <button class="btn btn-link btn-sm p-0 ms-2" type="button" data-action="revoke-bypass" data-agent-name="${escapeHtml(selected.requestedBy)}">${escapeHtml(t('cmd.revokeBypass'))}</button>` : ''}
         </div>
+        <div class="small text-secondary mb-3">${escapeHtml(selected.host || '-')} · ${escapeHtml(formatTimestamp(selected.requestedAt))} · risk ${escapeHtml(selected.risk)}${selected.decidedAt ? ` · ${escapeHtml(t('cmd.decided'))} ${escapeHtml(formatTimestamp(selected.decidedAt))} (${escapeHtml(selected.decidedBy)})` : ''}${selected.exitCode !== null && selected.exitCode !== undefined ? ` · ${escapeHtml(t('cmd.exitCode'))} ${escapeHtml(selected.exitCode)}` : ''}</div>
 
         <div class="mb-3">
           <div class="d-flex justify-content-between align-items-center mb-2">
             <h5 class="fw-bold mb-0">${escapeHtml(t('cmd.plannedCommand'))}</h5>
             <button class="btn btn-outline-secondary btn-sm" type="button" data-action="copy-command">${escapeHtml(t('common.copy'))}</button>
           </div>
-          <pre class="command-block"><code>${escapeHtml(selected.command)}</code></pre>
+          ${pending
+            ? `<textarea class="form-control font-monospace" id="approval-command" rows="3" spellcheck="false" autocapitalize="none" autocorrect="off">${escapeHtml(selected.command)}</textarea>
+               <div class="form-text">${escapeHtml(t('cmd.editHint'))}</div>`
+            : `<pre class="command-block"><code>${escapeHtml(executed || selected.command)}</code></pre>
+               ${edited ? `<div class="small text-warning-emphasis mt-1">${escapeHtml(t('cmd.edited'))}: <code>${escapeHtml(selected.command)}</code></div>` : ''}`}
         </div>
 
         <div class="mb-3">
@@ -1036,9 +1172,11 @@ function commandDetail(selected) {
         </button>
         ${pending ? `
         <button class="btn btn-danger" type="button" data-action="reject-command">${escapeHtml(t('cmd.reject'))}</button>
-        <button class="btn btn-outline-primary" type="button" data-action="approve-bypass-agent">
-          ${escapeHtml(t('cmd.approveBypass'))}
-        </button>
+        <span title="${bypassAllowed ? '' : escapeHtml(t('cmd.bypassNeedsBearer'))}">
+          <button class="btn btn-outline-primary" type="button" data-action="approve-bypass-agent" ${bypassAllowed ? '' : 'disabled'}>
+            ${escapeHtml(t('cmd.approveBypass'))}
+          </button>
+        </span>
         <button class="btn btn-primary ms-auto" type="button" data-action="approve-command">${escapeHtml(t('cmd.approve'))}</button>
         ` : ''}
       </div>
@@ -1133,7 +1271,7 @@ function terminalConnectionDetail(connection) {
       [t('term.detail.user'), connection.user],
       [t('term.detail.authMethod'), connection.authMethod],
       [t('term.detail.tags'), (connection.tags ?? []).join(', ')],
-      [t('term.detail.state'), connection.status],
+      [t('term.detail.state'), lastTestLabel(connection)],
       [t('term.detail.description'), connection.description],
     ];
   return `
@@ -1264,13 +1402,13 @@ function renderSettings() {
               ${inputCol(t('mcp.listenAddress'), 'listenAddress', mcp.listenAddress)}
               ${inputCol(t('mcp.port'), 'port', mcp.port, 'number')}
               ${selectCol(t('mcp.transport'), 'transport', mcp.transport, ['Streamable HTTP'])}
-              ${inputCol(t('mcp.baseURL'), 'baseURL', mcp.baseURL)}
+              ${inputCol(t('mcp.baseURLHint'), 'baseURL', mcp.baseURL)}
               ${inputCol(t('mcp.mcpPath'), 'mcpPath', mcp.mcpPath)}
               ${inputCol(t('mcp.healthPath'), 'healthPath', mcp.healthPath)}
               ${inputCol(t('mcp.auditPath'), 'auditPath', mcp.auditPath)}
               ${inputCol(t('mcp.tokenName'), 'tokenName', mcp.tokenName)}
               ${inputCol(t('mcp.tokenInput'), 'tokenInput', '', 'password')}
-              ${readonlyCol(t('mcp.tokenPreview'), mcp.tokenPreview)}
+              ${readonlyCol(t('mcp.tokenPreview'), mcp.tokenFromEnv ? t('mcp.tokenFromEnv') : mcp.tokenPreview)}
               ${inputCol(t('mcp.allowedOrigins'), 'allowedOrigins', (mcp.allowedOrigins ?? []).join(', '), 'text', 'col-12')}
               ${selectCol(t('mcp.tlsMode'), 'tlsMode', mcp.tlsMode, ['ローカル平文', '内蔵TLS（未実装）', 'リバースプロキシ終端'], 'col-12 col-md-6', { 'ローカル平文': t('mcp.tls.local'), '内蔵TLS（未実装）': t('mcp.tls.builtin'), 'リバースプロキシ終端': t('mcp.tls.proxy') })}
               ${selectCol(t('mcp.proxyMode'), 'proxyMode', mcp.proxyMode, ['無効', 'nginx', 'Caddy', 'Cloudflare Tunnel'], 'col-12 col-md-6', { '無効': t('mcp.proxy.disabled') })}
@@ -1285,6 +1423,19 @@ function renderSettings() {
               ${checkCol(t('mcp.requireApprovalWriteOp'), 'requireApprovalWriteOp', mcp.requireApprovalWriteOp)}
               ${readonlyCol(t('mcp.configPath'), mcp.configPath, 'col-12')}
             </div>
+            ${mcp.bypassAllowed ? '' : `
+            <div class="alert alert-warning mt-3 mb-0 d-flex align-items-center justify-content-between gap-3">
+              <span>${escapeHtml(t('mcp.bypassOff'))}</span>
+              ${mcp.tokenFromEnv ? '' : `<button class="btn btn-warning btn-sm flex-shrink-0" type="button" data-action="generate-token"><i class="bi bi-key me-1"></i>${escapeHtml(t('mcp.generateToken'))}</button>`}
+            </div>`}
+            ${state.issuedToken ? `
+            <div class="alert alert-success mt-3 mb-0">
+              <div class="fw-bold mb-1">${escapeHtml(t('mcp.tokenOnce'))}</div>
+              <div class="input-group">
+                <input class="form-control font-monospace" value="${escapeHtml(state.issuedToken)}" readonly>
+                <button class="btn btn-outline-secondary" type="button" data-action="copy-token"><i class="bi bi-copy"></i></button>
+              </div>
+            </div>` : ''}
             <div class="callout callout-info mt-3 mb-0">${escapeHtml(t('mcp.callout'))}</div>
             ${mcp.lastError ? `<div class="alert alert-danger mt-3 mb-0">${escapeHtml(mcp.lastError)}</div>` : ''}
           </div>
@@ -1305,11 +1456,21 @@ function renderSettings() {
             ${endpointRow('Health', mcp.healthPath, t('mcp.noAuth'))}
             ${endpointRow('Audit API', mcp.auditPath, mcp.bearerEnabled ? t('mcp.bearerRequired') : t('mcp.noAuth'))}
             <div class="mt-3">
-              <label class="form-label fw-bold">${escapeHtml(t('mcp.connectURL'))}</label>
+              <label class="form-label fw-bold">${escapeHtml(t('mcp.connectURL'))} — ${escapeHtml(t('mcp.localURL'))}</label>
               <div class="input-group">
                 <input class="form-control" value="${escapeHtml(endpoint)}" readonly>
                 <button class="btn btn-outline-secondary" type="button" data-action="copy-mcp-endpoint"><i class="bi bi-copy"></i></button>
               </div>
+            </div>
+            <div class="mt-3">
+              <label class="form-label fw-bold">${escapeHtml(t('mcp.connectURL'))} — ${escapeHtml(t('mcp.lanURL'))}</label>
+              ${mcp.lanURL ? `
+              <div class="input-group">
+                <input class="form-control ${mcp.lanReachable ? '' : 'text-secondary'}" value="${escapeHtml(mcp.lanURL)}" readonly>
+                <button class="btn btn-outline-secondary" type="button" data-action="copy-lan-url" ${mcp.lanReachable ? '' : 'disabled'}><i class="bi bi-copy"></i></button>
+              </div>
+              ${mcp.lanReachable ? '' : `<div class="form-text text-warning-emphasis">${escapeHtml(t('mcp.lanUnreachable').replace('{addr}', mcp.listenAddress || '127.0.0.1'))}</div>`}`
+              : `<div class="form-text">${escapeHtml(t('mcp.lanNone'))}</div>`}
             </div>
           </div>
         </div>
@@ -1326,6 +1487,7 @@ function renderSettings() {
               ${usageRow('list_hosts', t('mcp.usage.listHosts'))}
               ${usageRow('execute_command', t('mcp.usage.executeCommand'))}
               ${usageRow('request_command_execution', t('mcp.usage.requestExec'))}
+              ${usageRow('get_request_status', t('mcp.usage.getStatus'))}
               ${usageRow('get_command_history', t('mcp.usage.getHistory'))}
             </div>
           </div>
@@ -1372,9 +1534,21 @@ function connectionSSHFields(selected) {
     ${inputCol(t('conn.port'), 'port', selected.port, 'number')}
     ${inputCol(t('conn.user'), 'user', selected.user)}
     ${selectCol(t('conn.authMethod'), 'authMethod', selected.authMethod, ['SSH鍵認証', 'パスワード保管'], 'col-12 col-md-6', { 'SSH鍵認証': t('conn.authKey'), 'パスワード保管': t('conn.authPassword') })}
-    ${inputCol(t('conn.credential'), 'credential', selected.credential)}
+    ${String(selected.authMethod || '').includes('パスワード') ? passwordCol(selected) : inputCol(t('conn.keyPath'), 'credential', selected.credential)}
     ${inputCol(t('conn.connectTimeout'), 'connectTimeout', selected.connectTimeout, 'number')}
     ${inputCol(t('conn.commandTimeout'), 'commandTimeout', selected.commandTimeout, 'number')}
+  `;
+}
+
+// Passwords are write-only: the backend never returns them, so the field is
+// empty and a blank value on save keeps the stored password.
+function passwordCol(selected) {
+  const placeholder = selected.credentialSet ? t('conn.passwordSet') : t('conn.passwordUnset');
+  return `
+    <div class="col-12 col-md-6">
+      <label class="form-label fw-bold">${escapeHtml(t('conn.password'))}</label>
+      <input class="form-control" name="credential" type="password" value="${escapeHtml(selected.credential || '')}" placeholder="${escapeHtml(placeholder)}" autocomplete="new-password" autocapitalize="none" autocorrect="off" spellcheck="false">
+    </div>
   `;
 }
 
@@ -1401,7 +1575,7 @@ function connectionSerialFields(selected) {
     <div class="col-12 col-md-6">
       <label class="form-label fw-bold">${escapeHtml(t('conn.baudRate'))}</label>
       <select class="form-select" name="baudRate">
-        ${BAUD_RATES.map((rate) => `<option value="${rate}" ${rate === baud ? 'selected' : ''}>${rate}</option>`).join('')}
+        ${[...new Set([...BAUD_RATES, Number(baud)])].sort((x, y) => x - y).map((rate) => `<option value="${rate}" ${rate === Number(baud) ? 'selected' : ''}>${rate}</option>`).join('')}
       </select>
     </div>
   `;
@@ -1459,10 +1633,10 @@ function historyTable(requests, selectedId) {
         <tbody>
           ${requests.map((request) => `
             <tr class="${request.id === selectedId ? 'table-active' : ''}" data-select-request="${escapeHtml(request.id)}" style="cursor:pointer">
-              <td>${escapeHtml(request.requestedAt)}</td>
-              <td>${escapeHtml(request.requestedBy || t('cmd.unknownAgent'))}</td>
-              <td><span class="badge text-bg-secondary">${escapeHtml(requestStatusLabel(request.status))}</span></td>
-              <td><code>${escapeHtml(request.command)}</code></td>
+              <td class="text-nowrap">${escapeHtml(formatTimestamp(request.requestedAt))}</td>
+              <td>${escapeHtml(request.host || '-')}<br><small class="text-secondary">${escapeHtml(request.requestedBy || t('cmd.unknownAgent'))}</small></td>
+              <td><span class="badge ${requestStatusClass(request.status)}">${escapeHtml(requestStatusLabel(request.status))}</span></td>
+              <td><code>${escapeHtml(request.executedCommand || request.command)}</code></td>
               <td>${escapeHtml(request.reason || '-')}</td>
               <td class="text-end">
                 <button class="btn btn-outline-danger btn-sm" type="button" data-action="delete-command-request" data-command-request-id="${escapeHtml(request.id)}" title="${escapeHtml(t('cmd.deleteHistory'))}">
@@ -1509,6 +1683,7 @@ function collectConnectionForm() {
   const pick = (key, fallback) => (key in data ? field(data, key) : (current[key] ?? fallback));
   const pickNum = (key, fallback) => (key in data ? Number(field(data, key, fallback)) : (current[key] ?? fallback));
   return {
+    id: current.id ?? '',
     name: pick('name', ''),
     type: pick('type', 'SSH'),
     host: pick('host', ''),
@@ -1523,8 +1698,11 @@ function collectConnectionForm() {
     tags: ('tags' in data ? field(data, 'tags') : (current.tags ?? []).join(', '))
       .split(',').map((tag) => tag.trim()).filter(Boolean),
     description: pick('description', ''),
-    status: current.status ?? 'Unknown',
-    lastChecked: current.lastChecked ?? '-',
+    credentialSet: current.credentialSet ?? false,
+    mcpFirstTrust: current.mcpFirstTrust ?? false,
+    lastTestResult: current.lastTestResult ?? '',
+    lastTestAt: current.lastTestAt ?? '',
+    lastTestMessage: current.lastTestMessage ?? '',
   };
 }
 
@@ -1591,6 +1769,7 @@ app.addEventListener('click', async (event) => {
     if (state.active === 'terminal' && target !== 'terminal') {
       await teardownTerminal();
     }
+    if (state.active === 'settings' && target !== 'settings') state.issuedToken = '';
     state.active = target;
     render();
     return;
@@ -1601,11 +1780,11 @@ app.addEventListener('click', async (event) => {
 
   if (action === 'terminal-connect') {
     const connection = state.data.connections[state.selectedConnection];
-    if (!connection?.name) {
-      showToast(t('conn.notSelected'));
+    if (!connection?.id) {
+      showToast(connection ? t('conn.saveFirst') : t('conn.notSelected'));
       return;
     }
-    const result = await StartTerminal(connection.name);
+    const result = await StartTerminal(connection.id);
     if (result.ok) {
       state.terminal.connected = true;
       state.terminal.label = connection.name;
@@ -1639,7 +1818,15 @@ app.addEventListener('click', async (event) => {
     const selectedRequest = selectedCommandRequest();
 
     if (action === 'new-connection') {
+      const draftIndex = state.data.connections.findIndex((connection) => !connection.id);
+      if (draftIndex >= 0) {
+        state.selectedConnection = draftIndex;
+        render();
+        return;
+      }
+      if (state.dirty.connections && !window.confirm(t('conn.discardConfirm'))) return;
       state.data.connections.push({
+        id: '',
         name: t('conn.newName'),
         type: 'SSH',
         host: '127.0.0.1',
@@ -1653,8 +1840,7 @@ app.addEventListener('click', async (event) => {
         commandTimeout: 30,
         tags: [],
         description: '',
-        status: 'Unknown',
-        lastChecked: '-',
+        lastTestResult: '',
       });
       state.selectedConnection = state.data.connections.length - 1;
       state.dirty.connections = true;
@@ -1665,7 +1851,7 @@ app.addEventListener('click', async (event) => {
   if (action === 'connect-ssh') {
     const connectionToTest = collectConnectionForm();
     const result = await TestConnectionConfig(connectionToTest, '');
-    if (!result.ok && result.message.includes('passphrase protected')) {
+    if (!result.ok && result.code === 'needs_passphrase') {
       state.passphrase = {
         open: true,
         connectionName: connectionToTest.name || connectionToTest.host || t('conn.unsaved'),
@@ -1682,42 +1868,66 @@ app.addEventListener('click', async (event) => {
     };
     showToast(result.message);
     await refreshData({ silent: true });
+    render();
     return;
   }
 
-  if (action === 'disconnect-ssh') {
-    const result = await DisconnectConnection(collectConnectionForm().name);
-    state.connectionTest = {
-      ok: result.ok,
-      message: result.message,
-      target: '',
-    };
-    showToast(result.message);
+  if (action === 'cancel-connection') {
+    state.dirty.connections = false;
+    state.connectionTest = { ok: null, message: '', target: '' };
+    state.data.connections = state.data.connections.filter((connection) => connection.id);
     await refreshData({ silent: true });
+    render();
+    return;
+  }
+
+  if (action === 'open-terminal') {
+    if (!selectedConnection?.id || state.dirty.connections) {
+      showToast(t('conn.saveFirst'));
+      return;
+    }
+    state.active = 'terminal';
+    render();
+    const result = await StartTerminal(selectedConnection.id);
+    if (result.ok) {
+      state.terminal.connected = true;
+      state.terminal.label = selectedConnection.name;
+      render();
+      if (term) term.focus();
+    }
+    showToast(result.message);
     return;
   }
 
   if (action === 'delete-connection') {
+    const targetId = actionElement?.dataset.connectionId ?? selectedConnection?.id ?? '';
     const targetName = actionElement?.dataset.connectionName || selectedConnection?.name || '';
-    if (!targetName) return;
-    state.deleteConnection = { open: true, connectionName: targetName };
+    if (!targetId) {
+      // An unsaved draft is simply discarded.
+      state.data.connections = state.data.connections.filter((connection) => connection.id);
+      state.selectedConnection = Math.min(state.selectedConnection, Math.max(0, state.data.connections.length - 1));
+      state.dirty.connections = false;
+      render();
+      return;
+    }
+    state.deleteConnection = { open: true, connectionId: targetId, connectionName: targetName };
     render();
     return;
   }
 
   if (action === 'close-delete-connection') {
-    state.deleteConnection = { open: false, connectionName: '' };
+    state.deleteConnection = { open: false, connectionId: '', connectionName: '' };
     render();
     return;
   }
 
   if (action === 'confirm-delete-connection') {
-    const targetName = state.deleteConnection.connectionName;
-    if (!targetName) return;
-    const result = await DeleteConnection(targetName);
+    const targetId = state.deleteConnection.connectionId;
+    if (!targetId) return;
+    const result = await DeleteConnection(targetId);
     if (result.ok) {
-      const deletedIndex = state.data.connections.findIndex((connection) => connection.name === targetName);
-      state.data.connections = state.data.connections.filter((connection) => connection.name !== targetName);
+      const deletedIndex = state.data.connections.findIndex((connection) => connection.id === targetId);
+      state.data.connections = state.data.connections.filter((connection) => connection.id !== targetId);
       if (deletedIndex >= 0 && state.selectedConnection >= deletedIndex) {
         state.selectedConnection = Math.max(0, state.selectedConnection - 1);
       }
@@ -1726,7 +1936,7 @@ app.addEventListener('click', async (event) => {
       }
       state.dirty.connections = false;
     }
-    state.deleteConnection = { open: false, connectionName: '' };
+    state.deleteConnection = { open: false, connectionId: '', connectionName: '' };
     showToast(result.message);
     await refreshData({ silent: true });
     return;
@@ -1790,8 +2000,13 @@ app.addEventListener('click', async (event) => {
 
   if (action === 'approve-command') {
     if (!selectedRequest) return;
+    state.dirty.approval = false;
     const command = document.querySelector('#approval-command')?.value ?? selectedRequest.command ?? '';
-    const result = await ApproveCommand(selectedRequest.id ?? '', command);
+    actionElement.disabled = true;
+    let result = await ApproveCommand(selectedRequest.id ?? '', command);
+    if (!result.ok && result.code === 'risk_increased' && window.confirm(`${result.message}\n\n${t('cmd.riskConfirm')}`)) {
+      result = await ApproveCommandConfirmed(selectedRequest.id ?? '', command);
+    }
     // Keep the approved request selected so its stdout/stderr shows in the pane.
     state.selectedRequestId = selectedRequest.id ?? '';
     showToast(result.message);
@@ -1801,7 +2016,9 @@ app.addEventListener('click', async (event) => {
 
   if (action === 'approve-bypass-agent') {
     if (!selectedRequest) return;
-    const command = selectedRequest.command ?? '';
+    state.dirty.approval = false;
+    const command = document.querySelector('#approval-command')?.value ?? selectedRequest.command ?? '';
+    actionElement.disabled = true;
     const result = await ApproveCommandAndBypassAgent(selectedRequest.id ?? '', command);
     state.selectedRequestId = selectedRequest.id ?? '';
     showToast(result.message);
@@ -1809,8 +2026,36 @@ app.addEventListener('click', async (event) => {
     return;
   }
 
+  if (action === 'revoke-bypass') {
+    const result = await RevokeAgentApprovalBypass(actionElement.dataset.agentName ?? '');
+    showToast(result.message);
+    await refreshData({ silent: true });
+    return;
+  }
+
+  if (action === 'generate-token') {
+    const result = await GenerateMCPToken();
+    showToast(result.message);
+    if (result.token) state.issuedToken = result.token;
+    state.dirty.settings = false;
+    await refreshData({ silent: true });
+    render();
+    return;
+  }
+
+  if (action === 'copy-token') {
+    await copyText(state.issuedToken);
+    return;
+  }
+
+  if (action === 'copy-lan-url') {
+    await copyText(state.data.mcp?.lanURL ?? '');
+    return;
+  }
+
   if (action === 'reject-command') {
     if (!selectedRequest) return;
+    state.dirty.approval = false;
     const result = await RejectCommand(selectedRequest.id ?? '');
     showToast(result.message);
     await refreshData({ silent: true });
@@ -1835,8 +2080,18 @@ app.addEventListener('click', async (event) => {
 
   const connection = event.target.closest('[data-select-connection]');
   if (connection) {
-    state.selectedConnection = Number(connection.dataset.selectConnection);
+    const nextIndex = Number(connection.dataset.selectConnection);
+    if (nextIndex === state.selectedConnection) return;
+    if (state.dirty.connections && !window.confirm(t('conn.discardConfirm'))) return;
+    const target = state.data.connections[nextIndex];
     state.dirty.connections = false;
+    state.connectionTest = { ok: null, message: '', target: '' };
+    // Leaving an unsaved draft discards it.
+    state.data.connections = state.data.connections.filter((c) => c.id || c === target);
+    state.selectedConnection = Math.max(0, state.data.connections.indexOf(target));
+    await refreshData({ silent: true });
+    const reselected = state.data.connections.findIndex((c) => target?.id && c.id === target.id);
+    if (reselected >= 0) state.selectedConnection = reselected;
     render();
     return;
   }
@@ -1844,6 +2099,7 @@ app.addEventListener('click', async (event) => {
   const request = event.target.closest('[data-select-request]');
   if (request) {
     state.selectedRequestId = request.dataset.selectRequest;
+    state.dirty.approval = false;
     render();
   }
 });
@@ -1851,16 +2107,35 @@ app.addEventListener('click', async (event) => {
 app.addEventListener('submit', async (event) => {
   event.preventDefault();
   if (event.target.id === 'connection-form') {
-    const result = await SaveConnection(collectConnectionForm());
-    state.dirty.connections = false;
+    const form = collectConnectionForm();
+    const result = await SaveConnection(form);
     showToast(result.message);
+    if (!result.ok) {
+      // Keep the user's input: write it back into state and stay dirty.
+      state.data.connections[state.selectedConnection] = { ...state.data.connections[state.selectedConnection], ...form };
+      state.connectionTest = { ok: false, message: result.message, target: '' };
+      render();
+      return;
+    }
+    state.dirty.connections = false;
+    state.connectionTest = { ok: null, message: '', target: '' };
     await refreshData({ silent: true });
+    const savedIndex = state.data.connections.findIndex((connection) => connection.id === result.id);
+    if (savedIndex >= 0) state.selectedConnection = savedIndex;
+    render();
   }
   if (event.target.id === 'mcp-form') {
-    const result = await SaveMCPSettings(collectMCPForm());
-    state.dirty.settings = false;
+    const form = collectMCPForm();
+    const result = await SaveMCPSettings(form);
     showToast(result.message);
+    if (!result.ok) {
+      state.data.mcp = { ...state.data.mcp, ...form, lastError: result.message };
+      render();
+      return;
+    }
+    state.dirty.settings = false;
     await refreshData({ silent: true });
+    render();
   }
   if (event.target.id === 'passphrase-form') {
     const data = Object.fromEntries(new FormData(event.target));
@@ -1874,6 +2149,7 @@ app.addEventListener('submit', async (event) => {
     state.passphrase = { open: false, connectionName: '', value: '', connection: null };
     showToast(result.message);
     await refreshData({ silent: true });
+    render();
   }
 });
 
@@ -1882,6 +2158,7 @@ app.addEventListener('input', (event) => {
     state.passphrase.value = event.target.value;
     return;
   }
+  if (event.target.id === 'approval-command') state.dirty.approval = true;
   if (event.target.closest('#connection-form')) state.dirty.connections = true;
   if (event.target.closest('#mcp-form')) state.dirty.settings = true;
 });
@@ -1891,6 +2168,18 @@ app.addEventListener('change', (event) => {
   if (action === 'terminal-select-connection') {
     // The selector is disabled while connected, so this only fires before connecting.
     state.selectedConnection = Number(event.target.value);
+    render();
+    return;
+  }
+  if (event.target.closest('#connection-form') && event.target.name === 'authMethod') {
+    const form = collectConnectionForm();
+    const toPassword = form.authMethod.includes('パスワード');
+    const looksLikePath = /^(~|\/|[A-Za-z]:\\|%)/.test(form.credential);
+    // Never send a key path as a password (or a password as a key path).
+    if (toPassword && looksLikePath) form.credential = '';
+    if (!toPassword && !looksLikePath) form.credential = '';
+    state.data.connections[state.selectedConnection] = { ...state.data.connections[state.selectedConnection], ...form };
+    state.dirty.connections = true;
     render();
     return;
   }

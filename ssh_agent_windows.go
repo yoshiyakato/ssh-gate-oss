@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/Microsoft/go-winio"
 )
@@ -16,12 +17,13 @@ import (
 const windowsSSHAgentPipe = `\\.\pipe\openssh-ssh-agent`
 
 // dialSSHAgent connects to the Windows ssh-agent over its named pipe. An
-// explicit SSH_AUTH_SOCK (some tooling sets it to a pipe path) takes priority,
-// otherwise the default OpenSSH agent pipe is used.
+// SSH_AUTH_SOCK that names a pipe takes priority; a Unix-style value (set by
+// Git Bash / MSYS tooling) is ignored in favour of the default pipe.
 func dialSSHAgent() (net.Conn, error) {
 	pipe := strings.TrimSpace(os.Getenv("SSH_AUTH_SOCK"))
-	if pipe == "" {
+	if !strings.HasPrefix(pipe, `\\.\pipe\`) {
 		pipe = windowsSSHAgentPipe
 	}
-	return winio.DialPipe(pipe, nil)
+	timeout := 2 * time.Second
+	return winio.DialPipe(pipe, &timeout)
 }

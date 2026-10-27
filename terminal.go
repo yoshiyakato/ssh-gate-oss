@@ -22,6 +22,7 @@ const (
 // both build one of these and reuse SendTerminalInput / ResizeTerminal /
 // CloseTerminal unchanged.
 type terminalSession struct {
+	connID string
 	kind   string
 	label  string
 	stdin  io.Writer
@@ -84,7 +85,7 @@ func (a *App) StartTerminal(name string) ActionResult {
 func (a *App) startSSHSession(conn Connection) ActionResult {
 	a.mu.RLock()
 	strictHostKey := a.mcp.StrictHostKey
-	conn.KeyPassphrase = a.sshPassphrases[conn.Name]
+	conn.KeyPassphrase = a.sshPassphrases[conn.ID]
 	a.mu.RUnlock()
 
 	// The context only bounds the dial + handshake; the client persists after.
@@ -130,9 +131,10 @@ func (a *App) startSSHSession(conn Connection) ActionResult {
 	}
 
 	ts := &terminalSession{
-		kind:  "ssh",
-		label: conn.Name,
-		stdin: stdin,
+		connID: conn.ID,
+		kind:   "ssh",
+		label:  conn.Name,
+		stdin:  stdin,
 		resize: func(cols, rows int) error {
 			return session.WindowChange(rows, cols)
 		},
@@ -190,6 +192,7 @@ func (a *App) startSerialSession(conn Connection) ActionResult {
 
 	label := fmt.Sprintf("%s @ %d", portName, baud)
 	ts := &terminalSession{
+		connID: conn.ID,
 		kind:   "serial",
 		label:  label,
 		stdin:  port,
@@ -267,4 +270,62 @@ func (a *App) CloseTerminal() ActionResult {
 		ts.closeQuiet()
 	}
 	return ActionResult{OK: true, Message: "切断しました"}
+}
+
+// terminalCounts returns the number of open interactive sessions per
+// connection ID.
+func (a *App) terminalCounts() map[string]int {
+	a.termMu.Lock()
+	defer a.termMu.Unlock()
+	counts := map[string]int{}
+	if a.term != nil {
+		counts[a.term.connID]++
+	}
+	return counts
+}
+
+// closeTerminalsForConnection closes the interactive sessions attached to a
+// connection (on disconnect or delete).
+func (a *App) closeTerminalsForConnection(connID string) {
+	a.termMu.Lock()
+	ts := a.term
+	if ts != nil && ts.connID == connID {
+		a.term = nil
+	} else {
+		ts = nil
+	}
+	a.termMu.Unlock()
+	if ts != nil {
+		ts.closeQuiet()
+		a.emitTerminalExit("接続を切断しました")
+	}
+}
+
+// testSerialConnection checks that the port exists without opening it:
+// opening toggles DTR, which resets many boards, and fails with EBUSY while
+// our own terminal holds the port.
+func (a *App) testSerialConnection(conn Connection) ActionResult {
+	if conn.SerialPort == "" {
+		return ActionResult{OK: false, Message: "シリアルポートが設定されていません"}
+	}
+	a.termMu.Lock()
+	inUse := a.term != nil && a.term.kind == "serial" && a.term.connID == conn.ID && conn.ID != ""
+	a.termMu.Unlock()
+	if inUse {
+		return ActionResult{OK: true, Message: fmt.Sprintf("%s は使用中です（このアプリのターミナルで接続中）", conn.SerialPort), ID: conn.ID}
+	}
+	ports, err := serial.GetPortsList()
+	if err != nil {
+		return ActionResult{OK: false, Message: "シリアルポートを列挙できません: " + err.Error(), ID: conn.ID}
+	}
+	for _, port := range ports {
+		if port == conn.SerialPort {
+			message := fmt.Sprintf("%s を検出しました（利用可能）", conn.SerialPort)
+			a.recordConnectionTest(conn, "ok", message)
+			return ActionResult{OK: true, Message: message, ID: conn.ID}
+		}
+	}
+	message := fmt.Sprintf("%s が見つかりません。ケーブルの接続を確認してください", conn.SerialPort)
+	a.recordConnectionTest(conn, "failed", message)
+	return ActionResult{OK: false, Message: message, ID: conn.ID}
 }

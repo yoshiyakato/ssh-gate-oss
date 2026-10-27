@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 )
 
 // dialSSHAgent connects to the running ssh-agent over the Unix domain socket
@@ -16,5 +17,5 @@ func dialSSHAgent() (net.Conn, error) {
 	if socket == "" {
 		return nil, errors.New("SSH_AUTH_SOCK not set")
 	}
-	return net.Dial("unix", socket)
+	return net.DialTimeout("unix", socket, 2*time.Second)
 }
