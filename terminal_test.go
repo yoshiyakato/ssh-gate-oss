@@ -267,6 +267,10 @@ func waitUntil(t *testing.T, what string, cond func() bool) {
 
 func newTerminalTestApp(t *testing.T, conns ...Connection) (*App, *eventRecorder) {
 	t.Helper()
+	// A known_hosts per test: the OS reuses loopback ports, so a key one test
+	// recorded for 127.0.0.1:<port> would otherwise mismatch the next test's
+	// server on the same port.
+	isolateEnv(t)
 	rec := &eventRecorder{}
 	a := &App{
 		conns:          conns,
