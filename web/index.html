@@ -287,7 +287,7 @@
       <p class="sec-label" data-i18n="feat.label">機能</p>
       <h2 class="sec-title" data-i18n="feat.title">承認コンソールに必要なもの、ぜんぶ。</h2>
       <ul class="feat-list">
-        <li><span class="num">1</span><div class="ft"><h3 data-i18n="feat.f1.h">人間承認ゲートウェイ</h3><p data-i18n="feat.f1.p">エージェントの要求は承認キューへ。GUI で内容を確認し、必要ならコマンドを微修正してから実行できます。</p></div></li>
+        <li><span class="num">1</span><div class="ft"><h3 data-i18n="feat.f1.h">人間承認ゲートウェイ</h3><p data-i18n="feat.f1.p">エージェントの要求は承認キューへ。GUI で内容を確認し、承認したものだけが実行されます。</p></div></li>
         <li><span class="num">2</span><div class="ft"><h3 data-i18n="feat.f2.h">MCP サーバー内蔵</h3><p data-i18n="feat.f2.p">JSON-RPC 2.0 over HTTP で <code>list_hosts</code> / <code>execute_command</code> などを提供。Claude などの MCP クライアントから接続できます。</p></div></li>
         <li><span class="num">3</span><div class="ft"><h3 data-i18n="feat.f3.h">リスク分類</h3><p data-i18n="feat.f3.p">コマンドを High / Medium / Low に推定して表示。人間の判断を助けます（あくまで目安。実行可否は承認とポリシーが決めます）。</p></div></li>
         <li><span class="num">4</span><div class="ft"><h3 data-i18n="feat.f4.h">監査ログ</h3><p data-i18n="feat.f4.p">すべての要求・実行結果・所要時間を SQLite に記録。接続先を消しても履歴は残します。</p></div></li>
@@ -306,7 +306,7 @@
       <ol class="steps">
         <li data-i18n="how.s1"><b>エージェントが要求する</b> — <code>execute_command</code> でホスト・コマンド・理由を申請。</li>
         <li data-i18n="how.s2"><b>承認キューにためる</b> — 実行せず保留し、リスクを付けて GUI に表示。</li>
-        <li data-i18n="how.s3"><b>人間が承認する</b> — 内容を確認し、必要なら微修正して「承認して実行」。</li>
+        <li data-i18n="how.s3"><b>人間が承認する</b> — 内容を確認し、「承認して実行」か「拒否」を選ぶ。</li>
         <li data-i18n="how.s4"><b>実行して記録する</b> — SSH 実行。結果と所要時間を監査ログに残す。</li>
       </ol>
     </div>
@@ -526,7 +526,7 @@
       "feat.label": "機能",
       "feat.title": "承認コンソールに必要なもの、ぜんぶ。",
       "feat.f1.h": "人間承認ゲートウェイ",
-      "feat.f1.p": "エージェントの要求は承認キューへ。GUI で内容を確認し、必要ならコマンドを微修正してから実行できます。",
+      "feat.f1.p": "エージェントの要求は承認キューへ。GUI で内容を確認し、承認したものだけが実行されます。",
       "feat.f2.h": "MCP サーバー内蔵",
       "feat.f2.p": "JSON-RPC 2.0 over HTTP で <code>list_hosts</code> / <code>execute_command</code> などを提供。Claude などの MCP クライアントから接続できます。",
       "feat.f3.h": "リスク分類",
@@ -543,7 +543,7 @@
       "how.p": "人間が操作する GUI、状態を所有する Go バックエンド、機械が話す MCP。承認関門はその真ん中にあります。要求から実行までは、こう流れます。",
       "how.s1": "<b>エージェントが要求する</b> — <code>execute_command</code> でホスト・コマンド・理由を申請。",
       "how.s2": "<b>承認キューにためる</b> — 実行せず保留し、リスクを付けて GUI に表示。",
-      "how.s3": "<b>人間が承認する</b> — 内容を確認し、必要なら微修正して「承認して実行」。",
+      "how.s3": "<b>人間が承認する</b> — 内容を確認し、「承認して実行」か「拒否」を選ぶ。",
       "how.s4": "<b>実行して記録する</b> — SSH 実行。結果と所要時間を監査ログに残す。",
 
       "term.label": "ターミナル",
@@ -645,7 +645,7 @@
       "feat.label": "Features",
       "feat.title": "Everything an approval console needs.",
       "feat.f1.h": "Human approval gateway",
-      "feat.f1.p": "Agent requests go into the approval queue. Review them in the GUI and, if needed, tweak the command before running it.",
+      "feat.f1.p": "Agent requests go into the approval queue. Review them in the GUI; only what you approve gets run.",
       "feat.f2.h": "Built-in MCP server",
       "feat.f2.p": "Exposes <code>list_hosts</code> / <code>execute_command</code> and more over JSON-RPC 2.0 on HTTP. MCP clients such as Claude can connect.",
       "feat.f3.h": "Risk classification",
@@ -662,7 +662,7 @@
       "how.p": "A GUI the human operates, a Go backend that owns the state, and the MCP that machines speak — the approval gate sits right in the middle. From request to execution, the flow goes like this.",
       "how.s1": "<b>The agent makes a request</b> — submits host, command, and reason via <code>execute_command</code>.",
       "how.s2": "<b>Held in the approval queue</b> — not executed; held with a risk label and shown in the GUI.",
-      "how.s3": "<b>A human approves</b> — reviews the content, tweaks if needed, and clicks \"Approve & run.\"",
+      "how.s3": "<b>A human approves</b> — reviews the content and clicks \"Approve & run\" or \"Reject.\"",
       "how.s4": "<b>Execute and record</b> — runs over SSH and records the result and duration in the audit log.",
 
       "term.label": "Terminal",
