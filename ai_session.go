@@ -1155,6 +1155,9 @@ func (m *aiSessionManager) open(ctx context.Context, req aiOpenRequest) (*aiSess
 	close(s.openDone)
 
 	if err != nil {
+		// Decide before the cleanup below cancels sctx: only a close or
+		// cancellation that came first means "closed while opening".
+		closedWhileOpening := closing || sctx.Err() != nil
 		s.closeOnce.Do(func() {
 			s.cancel(&aiSessionClosedError{Reason: aiCloseOpenFailed})
 			s.out.Close()
@@ -1175,11 +1178,14 @@ func (m *aiSessionManager) open(ctx context.Context, req aiOpenRequest) (*aiSess
 		if code := aiSessErrorCode(err); code != "" {
 			return nil, false, err
 		}
-		if closing || sctx.Err() != nil {
+		if closedWhileOpening {
 			return nil, false, newAISessError(aiErrSessionClosed, "開いている途中で終了しました / closed while opening", map[string]any{"close_reason": s.closeReason})
 		}
-		return nil, false, &aiSessError{Code: aiErrConnectFailed, Message: err.Error(),
-			Extra: map[string]any{"error_kind": aiConnectErrorKind(err)}, cause: err}
+		// The dial error names the address; agents only get the kind, as
+		// list_hosts never reveals host or port.
+		kind := aiConnectErrorKind(err)
+		return nil, false, &aiSessError{Code: aiErrConnectFailed, Message: "接続に失敗しました / connect failed (" + kind + ")",
+			Extra: map[string]any{"error_kind": kind}, cause: err}
 	}
 	if closing {
 		// Closed (human / shutdown) while dialing: the transport was closed

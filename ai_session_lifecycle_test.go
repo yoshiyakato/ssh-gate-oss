@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"strings"
 	"sync"
@@ -270,5 +271,26 @@ func TestAISessionEnumsMatchMCPLists(t *testing.T) {
 		if !slices.Contains(mcpAISessionErrorCodes, code) {
 			t.Errorf("backend error %q is not in mcpAISessionErrorCodes", code)
 		}
+	}
+}
+
+// TestAISessionOpenFailureIsConnectFailed: a dial error is reported as
+// connect_failed with its error_kind, not as "closed while opening" (the
+// cleanup cancels the session context, which must not change the verdict).
+func TestAISessionOpenFailureIsConnectFailed(t *testing.T) {
+	e := newAITestApp(t)
+	e.factory.err = errors.New("dial tcp 10.0.0.9:22: connect: connection refused")
+	_, err := e.app.aiSessionMCPOpen(context.Background(), aiTestAgent, aiTestCaller(e.app),
+		openSessionArgs{Host: e.conn.Name, Reason: "調査", Mode: aiModeExec, Shell: aiShellSh})
+	if code := aiErrCode(err); code != aiErrConnectFailed {
+		t.Fatalf("open error = %v (code %q), want %s", err, code, aiErrConnectFailed)
+	}
+	var me *mcpAISessionErr
+	if !errors.As(err, &me) || me.Extra["error_kind"] != "connect" {
+		t.Fatalf("connect_failed without error_kind connect: %#v", err)
+	}
+	// The address in the dial error is not passed to the agent.
+	if strings.Contains(me.Message, "10.0.0.9") {
+		t.Fatalf("connect_failed leaks the address: %q", me.Message)
 	}
 }

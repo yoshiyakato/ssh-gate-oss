@@ -253,7 +253,7 @@ func (a *App) dispatchMCP(ctx context.Context, caller mcpCaller, req rpcRequest)
 			},
 			"serverInfo": map[string]any{
 				"name":    appName,
-				"version": "0.3.0",
+				"version": appVersion,
 			},
 			"instructions": "ssh-gete は人間の承認を挟む SSH ゲートウェイです。execute_command は原則として承認キューに入り、結果は get_request_status(request_ids, wait_seconds) で待って取得します。再送には同じ client_request_id を付けてください。cd や環境変数を保ったまま複数の行を順に送るときは、open_session / send_line / read_output / close_session（AI 専用セッション。GUI で有効にしたときだけ使えます）を使います。",
 		}, nil

@@ -2046,7 +2046,7 @@ func explainSSHError(conn Connection, err error) string {
 	}
 	switch hostKeyErrorKind(err) {
 	case "hostkey_unknown":
-		return "このホストの鍵はまだ記録されていません。ssh-gete の接続先画面で「接続テスト」を一度実行し、表示された指紋を確認してから再度お試しください。"
+		return "このホストの鍵はまだ記録されていません。ssh-gete の接続先画面で「接続テスト」を一度実行し、表示された指紋を確認してから再度お試しください。厳格モード（StrictHostKey）が有効な場合は接続テストでは記録されないため、~/.ssh/known_hosts にこのホストの鍵を登録してください。"
 	case "hostkey":
 		return fmt.Sprintf("ホスト鍵が記録済みのものと一致しません。中間者攻撃の可能性があります。接続先のホスト鍵が正当に変わった場合のみ、接続先画面でホスト鍵をリセットしてから接続テストをやり直してください。詳細: %v", err)
 	}
