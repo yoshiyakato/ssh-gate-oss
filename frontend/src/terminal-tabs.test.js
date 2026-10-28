@@ -312,6 +312,12 @@ describe('terminal-tabs', () => {
     root.innerHTML = mod.renderTerminalPage(ctx.state, ctx.t);
     expect([...root.querySelectorAll('[data-action="term-activate"]')].map((el) => el.dataset.termId)).toEqual([a.id, b.id]);
     expect(root.querySelector('.term-new')).not.toBeNull();
+    // N10: the tab role sits on the focusable button, one per tab, and only
+    // the active one is selected.
+    const tabs = [...root.querySelectorAll('[role="tab"]')];
+    expect(tabs.map((el) => el.tagName)).toEqual(['BUTTON', 'BUTTON']);
+    const { activeId } = mod.getTerminalState();
+    expect(tabs.map((el) => el.getAttribute('aria-selected'))).toEqual([String(activeId === a.id), String(activeId === b.id)]);
     mod.closeTabsForConnection('c1');
     root.innerHTML = mod.renderTerminalPage(ctx.state, ctx.t, { serverFilter: 'c1' });
     expect(root.querySelector('.term-empty').textContent).toContain('tabs.emptyFiltered:{"name":"web-01"}');

@@ -755,10 +755,11 @@ func (r *execReservation) release() {
 		if wasActive {
 			r.a.runningTotal.Add(-1)
 		}
-		r.a.execWG.Done()
+		// Notify before Done so nothing from this run outlives execWG.Wait.
 		if wasActive {
 			r.a.sessionsChanged()
 		}
+		r.a.execWG.Done()
 	})
 }
 

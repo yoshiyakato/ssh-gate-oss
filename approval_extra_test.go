@@ -329,4 +329,7 @@ func TestBypassReportsUnsavedResult(t *testing.T) {
 	if !strings.Contains(string(raw), `"isError":true`) || !strings.Contains(string(raw), `storage`) {
 		t.Fatalf("execute_command: %s, want isError storage", raw)
 	}
+	// The run is released after the response; let it finish so it does not
+	// touch globals the next test swaps.
+	app.execWG.Wait()
 }

@@ -775,8 +775,8 @@ function tabHtml(entry, t) {
   const statusText = entry.status === 'exited' ? t('tabs.exited') : entry.status === 'starting' ? t('tabs.starting') : '';
   const id = escapeHtml(entry.id);
   return `
-    <div class="term-tab${active ? ' is-active' : ''}${stateClass}" role="tab" aria-selected="${active ? 'true' : 'false'}">
-      <button type="button" data-action="term-activate" data-term-id="${id}" title="${escapeHtml(entry.label)}"><i class="bi ${icon} me-1" aria-hidden="true"></i>${escapeHtml(entry.label)}${statusText ? ` <span class="term-tab-status">(${escapeHtml(statusText)})</span>` : ''}</button>
+    <div class="term-tab${active ? ' is-active' : ''}${stateClass}" role="presentation">
+      <button type="button" role="tab" aria-selected="${active ? 'true' : 'false'}" data-action="term-activate" data-term-id="${id}" title="${escapeHtml(entry.label)}"><i class="bi ${icon} me-1" aria-hidden="true"></i>${escapeHtml(entry.label)}${statusText ? ` <span class="term-tab-status">(${escapeHtml(statusText)})</span>` : ''}</button>
       ${entry.status === 'exited' ? `<button type="button" class="term-tab-reconnect" data-action="term-reconnect" data-term-id="${id}">${escapeHtml(t('tabs.reconnect'))}</button>` : ''}
       <button type="button" class="term-tab-close" data-action="term-close" data-term-id="${id}" aria-label="${escapeHtml(t('tabs.closeTab', { label: entry.label }))}" title="${escapeHtml(t('tabs.close'))}"><i class="bi bi-x"></i></button>
     </div>
