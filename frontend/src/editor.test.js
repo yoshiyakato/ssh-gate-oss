@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 vi.mock('../wailsjs/go/main/App', () => ({
   SaveConnection: vi.fn(), TestConnectionConfig: vi.fn(), DisconnectConnection: vi.fn(),
   DeleteConnection: vi.fn(), ListSerialPorts: vi.fn(async () => []),
+  GetHostKeyInfo: vi.fn(async (id) => ({ connId: id, address: 'h:22', known: false, keys: [] })), ResetHostKey: vi.fn(),
+  TestConnectionWithPassphraseSave: vi.fn(),
 }));
 import * as App from '../wailsjs/go/main/App';
 import { mergeI18n, interpolate } from './model.js';
@@ -84,6 +86,47 @@ describe('editor', () => {
     expect(App.TestConnectionConfig.mock.calls[1][1]).toBe('secret');
     expect(document.querySelector('[role=status]').textContent).toContain('ok!');
   });
+  it('passphrase dialog offers 「キーチェーンに保存」 (off by default) and saves only when checked', async () => {
+    App.TestConnectionConfig.mockReset();
+    App.TestConnectionWithPassphraseSave.mockReset();
+    App.TestConnectionConfig.mockResolvedValueOnce({ ok: false, code: 'needs_passphrase', message: 'pp' }).mockResolvedValueOnce({ ok: true, message: 'ok!' });
+    let p = click('[data-action=edit-test]'); await tick(); await tick();
+    const box = document.querySelector('#editor-modal-save-passphrase');
+    expect(box).not.toBeNull();
+    expect(box.checked).toBe(false);
+    document.querySelector('#editor-modal-input').value = 'secret';
+    fire(document.querySelector('#editor-modal-root form'), 'submit'); await p;
+    expect(App.TestConnectionWithPassphraseSave).not.toHaveBeenCalled();
+
+    App.TestConnectionConfig.mockResolvedValueOnce({ ok: false, code: 'needs_passphrase', message: 'pp' }).mockResolvedValueOnce({ ok: true, message: 'ok!' });
+    App.TestConnectionWithPassphraseSave.mockResolvedValue({ ok: true, message: 'kept in keychain' });
+    p = click('[data-action=edit-test]'); await tick(); await tick();
+    document.querySelector('#editor-modal-save-passphrase').checked = true;
+    document.querySelector('#editor-modal-input').value = 'secret';
+    fire(document.querySelector('#editor-modal-root form'), 'submit'); await p;
+    expect(App.TestConnectionWithPassphraseSave).toHaveBeenCalledWith('A', 'secret', true);
+    expect(ctx.toast).toHaveBeenCalledWith('kept in keychain');
+  });
+  it('needs_password on test goes through ctx.recoverCredential and retries once', async () => {
+    App.TestConnectionConfig.mockReset();
+    await E.selectConnection('B', ctx);
+    App.TestConnectionConfig.mockResolvedValueOnce({ ok: false, code: 'needs_password', message: 'gone' }).mockResolvedValueOnce({ ok: true, message: 'ok!' });
+    ctx.recoverCredential = vi.fn(async () => true);
+    await click('[data-action=edit-test]');
+    expect(ctx.recoverCredential).toHaveBeenCalledTimes(1);
+    expect(ctx.recoverCredential.mock.calls[0][0].id).toBe('B');
+    expect(App.TestConnectionConfig).toHaveBeenCalledTimes(2);
+    expect(state.editor.test.ok).toBe(true);
+  });
+  it('a password the keychain refused is offered for this session', async () => {
+    await E.selectConnection('B', ctx);
+    type('credential', 'new-pw');
+    App.SaveConnection.mockResolvedValue({ ok: false, code: 'keyring_unavailable', message: 'no keychain' });
+    ctx.recoverCredential = vi.fn(async () => true);
+    await E.handleEditorSubmit({ target: document.querySelector('#connection-form'), preventDefault() {} }, ctx);
+    expect(ctx.recoverCredential).toHaveBeenCalledWith(expect.objectContaining({ id: 'B' }), expect.objectContaining({ code: 'keyring_unavailable' }), { password: 'new-pw' });
+    expect(state.editor.draft).not.toBe(null);
+  });
   it('password set badge and clear', async () => {
     await E.selectConnection('B', ctx);
     expect(document.querySelector('#connection-form').textContent).toContain('設定済み');
@@ -162,5 +205,172 @@ describe('editor', () => {
     p = click('[data-action=edit-delete][data-conn-id=B]'); await tick();
     document.querySelector('#editor-modal-root [data-modal-value=ok]').click(); await p;
     expect(ctx.closeTabsForConnection).toHaveBeenCalledWith('B');
+  });
+});
+
+describe('editor phase 3-4', () => {
+  const serial = () => ({ id: 'S', name: 'tty', type: 'Serial', host: '', port: 22, user: '', authMethod: 'SSH鍵認証', credential: '', tags: [], description: '', connectTimeout: 10, commandTimeout: 30, baudRate: 9600, serialPort: '/dev/ttyUSB0', dataBits: 8, parity: 'none', stopBits: '1' });
+  const form = () => document.querySelector('#connection-form');
+  const change = async (name, value) => { const el = form().querySelector(`[name="${name}"]`); el.value = value; await E.handleEditorChange({ target: el }, ctx); };
+  const submit = () => E.handleEditorSubmit({ target: form(), preventDefault() {} }, ctx);
+  const known = (id, address = 'h:22') => ({ connId: id, address, known: true, keys: [{ type: 'ssh-ed25519', fingerprint: 'SHA256:abc', recordedAt: '2026-10-01T09:00:00Z' }] });
+  beforeEach(() => { App.SaveConnection.mockReset(); App.ResetHostKey.mockReset(); App.GetHostKeyInfo.mockClear(); });
+
+  it('serial line selects feed the draft, the dirty state and the payload', async () => {
+    state.data.connections.push(serial()); E.reconcileEditor(state);
+    await E.selectConnection('S', ctx);
+    expect(form().querySelector('[name=dataBits]').value).toBe('8');
+    expect(form().querySelector('[name=parity]').value).toBe('none');
+    expect(form().textContent).toContain('RTS/CTS');
+    await change('parity', 'even');
+    expect(E.isEditorDirty(state)).toBe(true);
+    await change('stopBits', '2');
+    App.SaveConnection.mockResolvedValue({ ok: true, id: 'S', message: 'saved' });
+    await submit();
+    const sent = App.SaveConnection.mock.calls[0][0];
+    expect(sent).toMatchObject({ type: 'Serial', dataBits: 8, parity: 'even', stopBits: '2', host: '', user: '', credential: '', mcpFirstTrust: false });
+  });
+
+  it('an SSH payload carries no serial leftovers (backend sameTarget)', () => {
+    const p = E.connectionPayload({ ...saved()[0], baudRate: 115200, serialPort: '/dev/x', dataBits: 7, parity: 'odd', stopBits: '2' });
+    expect(p).toMatchObject({ type: 'SSH', host: 'h', serialPort: '', baudRate: 0, dataBits: 0, parity: '', stopBits: '' });
+  });
+
+  it('save-time check shows the field error and does not call SaveConnection', async () => {
+    ctx.platform = 'windows';
+    state.data.connections.push({ ...serial(), dataBits: 5, stopBits: '2' }); E.reconcileEditor(state);
+    await E.selectConnection('S', ctx);
+    await change('parity', 'odd');
+    await submit();
+    expect(App.SaveConnection).not.toHaveBeenCalled();
+    const sel = form().querySelector('[name=stopBits]');
+    expect(sel.classList.contains('is-invalid')).toBe(true);
+    expect(document.querySelector('[data-field-error=stopBits]').textContent).toContain('1.5');
+    expect(document.querySelector('.editor-alert')).toBeTruthy();
+    await change('stopBits', '1.5');
+    expect(document.querySelector('[data-field-error=stopBits]')).toBe(null);
+    expect(document.querySelector('.editor-alert')).toBe(null);
+  });
+
+  it('a backend field error is shown next to the field', async () => {
+    state.data.connections.push(serial()); E.reconcileEditor(state);
+    await E.selectConnection('S', ctx);
+    await change('parity', 'mark');
+    App.SaveConnection.mockResolvedValue({ ok: false, code: 'invalid_serial_mode', field: 'parity', message: 'この OS ではマーク/スペースパリティを使えません' });
+    await submit();
+    expect(document.querySelector('[data-field-error=parity]').textContent).toContain('マーク');
+    expect(state.editor.draft.parity).toBe('mark');
+  });
+
+  it('a backend serial error without a field shows only the top alert and keeps the draft', async () => {
+    state.data.connections.push(serial()); E.reconcileEditor(state);
+    await E.selectConnection('S', ctx);
+    await change('parity', 'even');
+    App.SaveConnection.mockResolvedValue({ ok: false, code: 'invalid_serial_mode', message: 'この組み合わせは使えません' });
+    await submit();
+    expect(document.querySelector('[data-field-error]')).toBe(null);
+    expect(document.querySelector('.editor-alert').textContent).toContain('この組み合わせは使えません');
+    expect(state.editor.draft.parity).toBe('even');
+  });
+
+  it('macOS disables mark / space parity and 1.5 stop bits', async () => {
+    ctx.platform = () => 'darwin';
+    state.data.connections.push(serial()); E.reconcileEditor(state);
+    await E.selectConnection('S', ctx);
+    expect(form().querySelector('[name=parity] option[value=mark]').disabled).toBe(true);
+    expect(form().querySelector('[name=parity] option[value=odd]').disabled).toBe(false);
+    expect(form().querySelector('[name=stopBits] option[value="1.5"]').disabled).toBe(true);
+    expect(E.serialLineIssue({ dataBits: 8, parity: 'space', stopBits: '1' }, 'darwin').field).toBe('parity');
+    expect(E.serialLineIssue({ dataBits: 8, parity: 'space', stopBits: '1' }, 'linux')).toBe(null);
+    expect(E.serialLineIssue({ dataBits: 5, parity: 'none', stopBits: '1.5' }, 'windows')).toBe(null);
+    expect(E.serialLineIssue({ dataBits: 9 }, '').field).toBe('dataBits');
+  });
+
+  it('switching an SSH connection to Serial warns that SSH credentials go away', async () => {
+    expect(document.querySelector('.editor-serial-drops-ssh')).toBe(null);
+    await change('type', 'Serial');
+    expect(document.querySelector('.editor-serial-drops-ssh').textContent).toContain('削除されます');
+    await change('type', 'SSH');
+    expect(form().querySelector('[name=host]').value).toBe('h');
+  });
+
+  it('host key block shows fingerprint, date, scope and other connections with textContent', async () => {
+    state.data.connections.push({ ...saved()[0], id: 'C', name: '<img src=x onerror=alert(1)>', host: 'H' });
+    App.GetHostKeyInfo.mockResolvedValue(known('A'));
+    state.editor.hostKey = E.createEditorState().hostKey; render(); await tick(); await tick();
+    const block = document.querySelector('#editor-hostkey');
+    expect(block.textContent).toContain('SHA256:abc');
+    expect(block.textContent).toContain('記録');
+    expect(block.textContent).toContain('h:22');
+    expect(block.textContent).toContain('<img src=x onerror=alert(1)>');
+    expect(block.querySelector('img')).toBe(null);
+    expect(block.querySelector('[data-action=edit-reset-hostkey]').disabled).toBe(false);
+    expect(App.GetHostKeyInfo).toHaveBeenCalledWith('A');
+    // Cached: a rerender does not ask again.
+    App.GetHostKeyInfo.mockClear(); render(); await tick();
+    expect(App.GetHostKeyInfo).not.toHaveBeenCalled();
+    expect(document.querySelector('#editor-hostkey').textContent).toContain('SHA256:abc');
+  });
+
+  it('reset host key confirms with every affected connection, then reloads', async () => {
+    state.data.connections.push({ ...saved()[0], id: 'C', name: 'web-01-alias', host: 'H' });
+    App.GetHostKeyInfo.mockResolvedValue(known('A'));
+    render(); await tick(); await tick();
+    // Cancel: nothing happens.
+    let p = click('[data-action=edit-reset-hostkey]'); await tick();
+    const modal = document.querySelector('#editor-modal-root');
+    expect(modal.textContent).toContain('同じホストとポートを使う接続先すべて');
+    expect([...modal.querySelectorAll('.editor-hostkey-affected li')].map((li) => li.textContent)).toEqual(['web-01', 'web-01-alias']);
+    modal.querySelector('[data-modal-dismiss=button]').click(); await p;
+    expect(App.ResetHostKey).not.toHaveBeenCalled();
+    // OK: resets and reloads.
+    App.ResetHostKey.mockResolvedValue({ ok: true, id: 'A', message: 'removed' });
+    App.GetHostKeyInfo.mockResolvedValue({ connId: 'A', address: 'h:22', known: false, keys: [] });
+    p = click('[data-action=edit-reset-hostkey]'); await tick();
+    document.querySelector('#editor-modal-root [data-modal-value=ok]').click(); await p; await tick(); await tick();
+    expect(App.ResetHostKey).toHaveBeenCalledWith('A');
+    expect(ctx.toast).toHaveBeenCalledWith('removed');
+    expect(document.querySelector('#editor-hostkey').textContent).toContain('未記録');
+    expect(document.querySelector('[data-action=edit-reset-hostkey]').disabled).toBe(true);
+  });
+
+  it('a connection test reloads the host key (TOFU records it)', async () => {
+    render(); await tick(); await tick();
+    App.GetHostKeyInfo.mockClear();
+    App.GetHostKeyInfo.mockResolvedValue(known('A'));
+    App.TestConnectionConfig.mockResolvedValueOnce({ ok: true, message: 'fine' });
+    await click('[data-action=edit-test]'); await tick(); await tick();
+    expect(App.GetHostKeyInfo).toHaveBeenCalledWith('A');
+    expect(document.querySelector('#editor-hostkey').textContent).toContain('SHA256:abc');
+  });
+
+  it('new drafts and serial rows have no host key lookup', async () => {
+    App.GetHostKeyInfo.mockClear();
+    await click('[data-action=edit-new]'); await tick();
+    expect(document.querySelector('#editor-hostkey')).toBe(null);
+    expect(form().textContent).toContain('保存して接続テストすると記録します');
+    expect(App.GetHostKeyInfo).not.toHaveBeenCalled();
+  });
+
+  it('onSelectionChange follows user selection only', async () => {
+    ctx.onSelectionChange = vi.fn();
+    await click('[data-action="edit-select"][data-conn-id="B"]');
+    expect(ctx.onSelectionChange).toHaveBeenCalledWith('B', { previousId: 'A', reason: 'select' });
+    ctx.onSelectionChange.mockClear();
+    await E.selectConnection('A', ctx, { notify: false });
+    expect(state.editor.selectedId).toBe('A');
+    expect(ctx.onSelectionChange).not.toHaveBeenCalled();
+    await click('[data-action=edit-new]');
+    expect(ctx.onSelectionChange).toHaveBeenCalledWith('', { previousId: 'A', reason: 'new' });
+    ctx.onSelectionChange.mockClear();
+    App.SaveConnection.mockResolvedValue({ ok: true, id: 'N', message: 'ok' });
+    ctx.refresh = vi.fn(async () => { state.data.connections.push({ ...saved()[0], id: 'N', name: 'new' }); E.reconcileEditor(state); });
+    type('user', 'me');
+    await submit();
+    expect(ctx.onSelectionChange).toHaveBeenCalledWith('N', { previousId: '', reason: 'save' });
+    ctx.onSelectionChange.mockClear();
+    state.data.connections = state.data.connections.filter((c) => c.id !== 'N');
+    E.reconcileEditor(state);
+    expect(ctx.onSelectionChange).not.toHaveBeenCalled();
   });
 });

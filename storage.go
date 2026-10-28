@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -8,10 +9,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -20,8 +23,12 @@ import (
 // schemaVersion is stored in PRAGMA user_version. v2 introduced immutable
 // connection IDs, request state codes and approval/audit columns. v3 added
 // agent_tokens, bypass expiry/scope on agent_policies and serial line
-// parameters on connections.
-const schemaVersion = 3
+// parameters on connections. v4 added connections.credential_store /
+// passphrase_saved and the secret_gc queue for the OS keychain
+// (phase5-keychain.md); the passwords themselves move out of the credential
+// column in migrateCredentialsToKeyring, which needs a SecretStore and so
+// runs after openStore.
+const schemaVersion = 4
 
 var errStoreUnavailable = errors.New("SQLiteストアが初期化されていないため保存できません")
 
@@ -36,7 +43,21 @@ type Store struct {
 	fresh bool
 	// prevVersion is the user_version found on open (before migration).
 	prevVersion int
+	// denyPlaintextPasswords makes insert/updateConnection refuse to write a
+	// new password into the credential column (keychain-only mode). The App
+	// turns it on after migrateCredentialsToKeyring.
+	denyPlaintextPasswords atomic.Bool
 }
+
+// errPlaintextPassword is returned when a password would be written to
+// SQLite while denyPlaintextPasswords is on.
+var errPlaintextPassword = errors.New("パスワードを平文でデータベースに保存することはできません（キーチェーンに保存してください）")
+
+// Values of connections.credential_store.
+const (
+	credentialStoreDB      = "db"      // credential column holds the value (legacy, key paths)
+	credentialStoreKeyring = "keyring" // credential column is empty; value is in the SecretStore
+)
 
 func newID() string {
 	var b [16]byte
@@ -59,7 +80,9 @@ func openStore(path string) (*Store, error) {
 		}
 		_ = f.Close()
 	}
-	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(on)")
+	// secure_delete zero-fills freed content, so a password removed from the
+	// credential column does not linger in free pages.
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(on)&_pragma=secure_delete(on)")
 	if err != nil {
 		return nil, err
 	}
@@ -183,6 +206,12 @@ func (s *Store) migrate() error {
 			preview TEXT NOT NULL DEFAULT '',
 			created_at INTEGER NOT NULL
 		)`,
+		// secret_gc lists keychain items that are no longer referenced and
+		// still have to be deleted (a Delete failed, or has not run yet).
+		`CREATE TABLE IF NOT EXISTS secret_gc (
+			account TEXT PRIMARY KEY,
+			created_at INTEGER NOT NULL
+		)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.Exec(statement); err != nil {
@@ -224,6 +253,8 @@ func (s *Store) migrate() error {
 		{"agent_policies", "granted_at", `ALTER TABLE agent_policies ADD COLUMN granted_at INTEGER NOT NULL DEFAULT 0`},
 		{"agent_policies", "granted_by", `ALTER TABLE agent_policies ADD COLUMN granted_by TEXT NOT NULL DEFAULT ''`},
 		{"agent_policies", "expires_at", `ALTER TABLE agent_policies ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0`},
+		{"connections", "credential_store", `ALTER TABLE connections ADD COLUMN credential_store TEXT NOT NULL DEFAULT 'db'`},
+		{"connections", "passphrase_saved", `ALTER TABLE connections ADD COLUMN passphrase_saved INTEGER NOT NULL DEFAULT 0`},
 	}
 	for _, col := range columns {
 		if err := addColumnIfMissing(tx, col.table, col.name, col.ddl); err != nil {
@@ -415,7 +446,32 @@ func (s *Store) recoverInterruptedRequests() error {
 }
 
 const connectionColumns = `id, name, type, host, port, user, auth_method, credential, serial_port, baud_rate,
-	data_bits, parity, stop_bits, connect_timeout, command_timeout, tags_json, description, last_test_result, last_test_at, last_test_message, mcp_first_trust`
+	data_bits, parity, stop_bits, connect_timeout, command_timeout, tags_json, description, last_test_result, last_test_at, last_test_message, mcp_first_trust,
+	credential_store`
+
+// credentialInKeyring reports whether conn's password lives in the
+// SecretStore. In memory this is encoded without a new Connection field: a
+// password connection with an empty Credential and CredentialSet = true
+// (normalizeConnection clears CredentialSet, so the UI cannot set it).
+func credentialInKeyring(conn Connection) bool {
+	return conn.connectionType() != "Serial" && conn.usesPassword() && conn.Credential == "" && conn.CredentialSet
+}
+
+func credentialStoreOf(conn Connection) string {
+	if credentialInKeyring(conn) {
+		return credentialStoreKeyring
+	}
+	return credentialStoreDB
+}
+
+// keyPathOf is the key path whose passphrase may be saved, or "" when conn
+// does not use key auth.
+func keyPathOf(conn Connection) string {
+	if conn.connectionType() == "Serial" || conn.usesPassword() {
+		return ""
+	}
+	return conn.Credential
+}
 
 func (s *Store) loadConnections() ([]Connection, error) {
 	rows, err := s.db.Query(`SELECT ` + connectionColumns + ` FROM connections ORDER BY name`)
@@ -429,13 +485,18 @@ func (s *Store) loadConnections() ([]Connection, error) {
 		var conn Connection
 		var tagsJSON string
 		var firstTrust int
+		var credStore string
 		if err := rows.Scan(&conn.ID, &conn.Name, &conn.Type, &conn.Host, &conn.Port, &conn.User, &conn.AuthMethod,
 			&conn.Credential, &conn.SerialPort, &conn.BaudRate, &conn.DataBits, &conn.Parity, &conn.StopBits, &conn.ConnectTimeout, &conn.CommandTimeout, &tagsJSON,
-			&conn.Description, &conn.LastTestResult, &conn.LastTestAt, &conn.LastTestMessage, &firstTrust); err != nil {
+			&conn.Description, &conn.LastTestResult, &conn.LastTestAt, &conn.LastTestMessage, &firstTrust, &credStore); err != nil {
 			return nil, err
 		}
 		conn.Type = conn.connectionType()
 		conn.MCPFirstTrust = firstTrust != 0
+		if credStore == credentialStoreKeyring && conn.usesPassword() && conn.Type != "Serial" {
+			conn.Credential = ""
+			conn.CredentialSet = true
+		}
 		if err := json.Unmarshal([]byte(tagsJSON), &conn.Tags); err != nil {
 			return nil, err
 		}
@@ -445,47 +506,158 @@ func (s *Store) loadConnections() ([]Connection, error) {
 }
 
 // insertConnection adds a new connection. The caller must have assigned ID.
+// A keychain-backed password (credentialInKeyring) is recorded as
+// credential_store='keyring' with an empty credential column; the caller
+// writes the SecretStore item first.
 func (s *Store) insertConnection(conn Connection) error {
 	tagsJSON, err := json.Marshal(conn.Tags)
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`
+	credStore := credentialStoreOf(conn)
+	if s.denyPlaintextPasswords.Load() && conn.usesPassword() && conn.connectionType() != "Serial" && conn.Credential != "" {
+		return errPlaintextPassword
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
 		INSERT INTO connections (
 			id, name, type, host, port, user, auth_method, credential, serial_port, baud_rate,
 			data_bits, parity, stop_bits, connect_timeout, command_timeout, tags_json, description, mcp_first_trust,
-			status, last_checked, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?)`,
+			credential_store, status, last_checked, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?)`,
 		conn.ID, conn.Name, conn.connectionType(), conn.Host, conn.Port, conn.User, conn.AuthMethod, conn.Credential,
 		conn.SerialPort, conn.BaudRate, conn.DataBits, conn.Parity, conn.StopBits, conn.ConnectTimeout, conn.CommandTimeout, string(tagsJSON), conn.Description,
-		boolInt(conn.MCPFirstTrust), nowRFC3339(),
-	)
-	return err
+		boolInt(conn.MCPFirstTrust), credStore, nowRFC3339(),
+	); err != nil {
+		return err
+	}
+	if credStore == credentialStoreKeyring {
+		if _, err := tx.Exec(`DELETE FROM secret_gc WHERE account = ?`, passwordAccount(conn.ID)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// storedSecretState is what a connections row says about its secrets.
+type storedSecretState struct {
+	authMethod      string
+	connType        string
+	credential      string
+	credentialStore string
+	passphraseSaved bool
+}
+
+func loadSecretState(tx *sql.Tx, id string) (storedSecretState, bool, error) {
+	var st storedSecretState
+	var saved int
+	err := tx.QueryRow(`SELECT auth_method, type, credential, credential_store, passphrase_saved FROM connections WHERE id = ?`, id).
+		Scan(&st.authMethod, &st.connType, &st.credential, &st.credentialStore, &saved)
+	if errors.Is(err, sql.ErrNoRows) {
+		return st, false, nil
+	}
+	st.passphraseSaved = saved != 0
+	return st, err == nil, err
+}
+
+// obsoleteAccounts lists the SecretStore items of row id that are no longer
+// referenced once the row becomes next (nil next: the row is deleted).
+func (st storedSecretState) obsoleteAccounts(id string, next *Connection) []string {
+	var out []string
+	if st.credentialStore == credentialStoreKeyring && (next == nil || !credentialInKeyring(*next)) {
+		out = append(out, passwordAccount(id))
+	}
+	if st.passphraseSaved {
+		prevPath := ""
+		if st.connType != "Serial" && !strings.Contains(st.authMethod, "パスワード") {
+			prevPath = st.credential
+		}
+		if next == nil || prevPath == "" || keyPathOf(*next) != prevPath {
+			out = append(out, passphraseAccount(id, prevPath))
+		}
+	}
+	return out
+}
+
+func enqueueSecretGCTx(tx *sql.Tx, accounts []string) error {
+	now := time.Now().UnixMilli()
+	for _, account := range accounts {
+		if _, err := tx.Exec(`INSERT INTO secret_gc (account, created_at) VALUES (?, ?) ON CONFLICT(account) DO NOTHING`, account, now); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // updateConnection updates the editable settings of an existing connection
 // (including renames) without touching runtime/test columns. It reports
 // whether a row was updated, so a concurrently deleted row is not resurrected.
+//
+// Secrets: credential_store follows credentialInKeyring(conn). Keychain items
+// the new settings no longer use (password after switching to key/serial, the
+// passphrase of a previous key path) are queued in secret_gc in the same
+// transaction; the caller then runs runSecretGC outside a.mu. A saved
+// passphrase stops being "saved" when the key path or auth method changes.
 func (s *Store) updateConnection(conn Connection) (bool, error) {
 	tagsJSON, err := json.Marshal(conn.Tags)
 	if err != nil {
 		return false, err
 	}
-	res, err := s.db.Exec(`
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	prev, ok, err := loadSecretState(tx, conn.ID)
+	if err != nil || !ok {
+		return false, err
+	}
+	credStore := credentialStoreOf(conn)
+	if s.denyPlaintextPasswords.Load() && conn.usesPassword() && conn.connectionType() != "Serial" && conn.Credential != "" &&
+		!(prev.credentialStore == credentialStoreDB && prev.credential == conn.Credential) {
+		// Only an unchanged legacy value (not yet migrated) may stay.
+		return false, errPlaintextPassword
+	}
+	obsolete := prev.obsoleteAccounts(conn.ID, &conn)
+	keepPassphrase := prev.passphraseSaved
+	for _, account := range obsolete {
+		if strings.Contains(account, "/passphrase/") {
+			keepPassphrase = false
+		}
+	}
+	res, err := tx.Exec(`
 		UPDATE connections SET
 			name = ?, type = ?, host = ?, port = ?, user = ?, auth_method = ?, credential = ?,
 			serial_port = ?, baud_rate = ?, data_bits = ?, parity = ?, stop_bits = ?, connect_timeout = ?, command_timeout = ?, tags_json = ?,
-			description = ?, mcp_first_trust = ?, updated_at = ?
+			description = ?, mcp_first_trust = ?, credential_store = ?, passphrase_saved = ?, updated_at = ?
 		WHERE id = ?`,
 		conn.Name, conn.connectionType(), conn.Host, conn.Port, conn.User, conn.AuthMethod, conn.Credential,
 		conn.SerialPort, conn.BaudRate, conn.DataBits, conn.Parity, conn.StopBits, conn.ConnectTimeout,
-		conn.CommandTimeout, string(tagsJSON), conn.Description, boolInt(conn.MCPFirstTrust), nowRFC3339(), conn.ID,
+		conn.CommandTimeout, string(tagsJSON), conn.Description, boolInt(conn.MCPFirstTrust), credStore, boolInt(keepPassphrase),
+		nowRFC3339(), conn.ID,
 	)
 	if err != nil {
 		return false, err
 	}
 	n, err := res.RowsAffected()
-	return n == 1, err
+	if err != nil || n != 1 {
+		return false, err
+	}
+	if err := enqueueSecretGCTx(tx, obsolete); err != nil {
+		return false, err
+	}
+	if credStore == credentialStoreKeyring {
+		// The account is live again (e.g. key -> password -> key -> password
+		// before the queue ran): it must not be collected.
+		if _, err := tx.Exec(`DELETE FROM secret_gc WHERE account = ?`, passwordAccount(conn.ID)); err != nil {
+			return false, err
+		}
+	}
+	return true, tx.Commit()
 }
 
 func (s *Store) updateConnectionTest(id string, result string, at string, message string) error {
@@ -494,9 +666,28 @@ func (s *Store) updateConnectionTest(id string, result string, at string, messag
 	return err
 }
 
+// deleteConnection removes the row and, in the same transaction, queues its
+// keychain items in secret_gc (run runSecretGC afterwards, outside a.mu), so
+// a crash between the two never leaves an unreferenced item behind.
 func (s *Store) deleteConnection(id string) error {
-	_, err := s.db.Exec(`DELETE FROM connections WHERE id = ?`, id)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	prev, ok, err := loadSecretState(tx, id)
+	if err != nil {
+		return err
+	}
+	if ok {
+		if err := enqueueSecretGCTx(tx, prev.obsoleteAccounts(id, nil)); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM connections WHERE id = ?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) loadMCPSettings(path string) (MCPSettings, string, bool, error) {
@@ -1142,4 +1333,411 @@ func nullableInt(v *int) any {
 
 func nowRFC3339() string {
 	return time.Now().Format(time.RFC3339)
+}
+
+// --- OS keychain (phase5-keychain.md) -------------------------------------
+
+// setPassphraseSaved records whether the passphrase of key keyPath is kept in
+// the SecretStore (opt-in, default off). It only applies while the row still
+// uses that key path, and reports whether it did. Turning it off queues the
+// item in secret_gc; turning it on takes it out of the queue. The caller
+// writes the item (storeSecretVerified) before turning it on.
+func (s *Store) setPassphraseSaved(id string, keyPath string, saved bool) (bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	st, ok, err := loadSecretState(tx, id)
+	if err != nil || !ok {
+		return false, err
+	}
+	if st.connType == "Serial" || strings.Contains(st.authMethod, "パスワード") || st.credential != keyPath || keyPath == "" {
+		return false, nil
+	}
+	if _, err := tx.Exec(`UPDATE connections SET passphrase_saved = ? WHERE id = ?`, boolInt(saved), id); err != nil {
+		return false, err
+	}
+	account := passphraseAccount(id, keyPath)
+	if saved {
+		_, err = tx.Exec(`DELETE FROM secret_gc WHERE account = ?`, account)
+	} else {
+		err = enqueueSecretGCTx(tx, []string{account})
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+// passphraseSavedIDs returns the IDs of connections whose key passphrase is
+// saved in the SecretStore.
+func (s *Store) passphraseSavedIDs() (map[string]bool, error) {
+	rows, err := s.db.Query(`SELECT id FROM connections WHERE passphrase_saved = 1`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
+}
+
+// enqueueSecretGC queues accounts for deletion from the SecretStore, e.g.
+// the item written for a new connection whose INSERT then failed.
+func (s *Store) enqueueSecretGC(accounts ...string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := enqueueSecretGCTx(tx, accounts); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) loadSecretGC() ([]string, error) {
+	rows, err := s.db.Query(`SELECT account FROM secret_gc ORDER BY created_at, account`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var account string
+		if err := rows.Scan(&account); err != nil {
+			return nil, err
+		}
+		out = append(out, account)
+	}
+	return out, rows.Err()
+}
+
+// secretAccountReferenced reports whether a connections row currently uses
+// account, so a queued item that became live again is never deleted.
+func (s *Store) secretAccountReferenced(account string) (bool, error) {
+	rest, ok := strings.CutPrefix(account, "conn/")
+	if !ok {
+		return false, nil
+	}
+	id, _, ok := strings.Cut(rest, "/")
+	if !ok || id == "" {
+		return false, nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	st, found, err := loadSecretState(tx, id)
+	if err != nil || !found {
+		return false, err
+	}
+	if st.credentialStore == credentialStoreKeyring && account == passwordAccount(id) {
+		return true, nil
+	}
+	if st.passphraseSaved && st.connType != "Serial" && !strings.Contains(st.authMethod, "パスワード") &&
+		account == passphraseAccount(id, st.credential) {
+		return true, nil
+	}
+	return false, nil
+}
+
+// runSecretGC deletes the queued SecretStore items. Call it without holding
+// a.mu (at startup, after DeleteConnection / SaveConnection, and hourly).
+// Items still referenced by a row are dropped from the queue without being
+// deleted. A failed Delete stays queued; the first error is returned.
+func (s *Store) runSecretGC(ctx context.Context, secrets SecretStore) (int, error) {
+	if secrets == nil {
+		return 0, ErrSecretUnavailable
+	}
+	accounts, err := s.loadSecretGC()
+	if err != nil {
+		return 0, err
+	}
+	deleted := 0
+	var firstErr error
+	for _, account := range accounts {
+		live, err := s.secretAccountReferenced(account)
+		if err != nil {
+			return deleted, err
+		}
+		if !live {
+			if err := secrets.Delete(ctx, account); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				if errors.Is(err, ErrSecretUnavailable) {
+					break // the store is down; the rest would fail the same way
+				}
+				continue
+			}
+			deleted++
+		}
+		if _, err := s.db.Exec(`DELETE FROM secret_gc WHERE account = ?`, account); err != nil {
+			return deleted, err
+		}
+	}
+	return deleted, firstErr
+}
+
+// CredentialMigration is the outcome of migrateCredentialsToKeyring.
+type CredentialMigration struct {
+	Moved int
+	// Remaining counts password rows still stored in the credential column
+	// (failed now, or not attempted because the store was unavailable).
+	Remaining int
+	// Err is the first SecretStore error (nil when Remaining is 0).
+	Err error
+}
+
+// migrateCredentialsToKeyring moves plaintext passwords from the credential
+// column into secrets (phase5-keychain.md §7). Run it at startup after
+// openStore / migrateLegacyData and before loadConnections and the MCP
+// server, without holding a.mu. For each row: Set, read back and compare,
+// then clear the column only if it still holds the same value. A row is
+// cleared only after its item is verified, so a crash or failure at any point
+// leaves the plaintext in place and the next start retries. perItem bounds
+// each keychain round trip; the first ErrSecretUnavailable stops the run.
+// Passwords left on Serial rows are cleared, not moved. When anything moved
+// or was cleared, and on the first start after the upgrade to v4, freed pages
+// and the WAL are scrubbed (secure_delete, checkpoint, VACUUM). The returned
+// error is for database failures only.
+func (s *Store) migrateCredentialsToKeyring(ctx context.Context, secrets SecretStore, perItem time.Duration) (CredentialMigration, error) {
+	var result CredentialMigration
+	// Serial rows never use the credential column (saveConnection clears it),
+	// but a v0.1.0 row switched from password SSH to Serial kept the old
+	// password there. Drop it instead of moving it.
+	res, err := s.db.Exec(`UPDATE connections SET credential = '' WHERE type = 'Serial' AND credential != ''`)
+	if err != nil {
+		return result, err
+	}
+	serialCleared, _ := res.RowsAffected()
+	type row struct{ id, credential string }
+	rows, err := s.db.Query(`SELECT id, credential FROM connections
+		WHERE credential_store = 'db' AND credential != '' AND type != 'Serial' AND auth_method LIKE '%パスワード%'
+		ORDER BY name`)
+	if err != nil {
+		return result, err
+	}
+	var pending []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.credential); err != nil {
+			rows.Close()
+			return result, err
+		}
+		pending = append(pending, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return result, err
+	}
+	if perItem <= 0 {
+		perItem = 10 * time.Second
+	}
+	for i, r := range pending {
+		if secrets == nil {
+			result.Err = ErrSecretUnavailable
+			result.Remaining = len(pending) - i
+			break
+		}
+		itemCtx, cancel := context.WithTimeout(ctx, perItem)
+		err := storeSecretVerified(itemCtx, secrets, passwordAccount(r.id), r.credential)
+		cancel()
+		if err != nil {
+			if result.Err == nil {
+				result.Err = err
+			}
+			if errors.Is(err, ErrSecretUnavailable) {
+				result.Remaining += len(pending) - i
+				break
+			}
+			result.Remaining++
+			continue
+		}
+		tx, err := s.db.Begin()
+		if err != nil {
+			return result, err
+		}
+		res, err := tx.Exec(`UPDATE connections SET credential = '', credential_store = 'keyring'
+			WHERE id = ? AND credential = ? AND credential_store = 'db'`, r.id, r.credential)
+		if err != nil {
+			tx.Rollback()
+			return result, err
+		}
+		n, _ := res.RowsAffected()
+		if n == 1 {
+			if _, err := tx.Exec(`DELETE FROM secret_gc WHERE account = ?`, passwordAccount(r.id)); err != nil {
+				tx.Rollback()
+				return result, err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return result, err
+		}
+		if n == 1 {
+			result.Moved++
+		}
+		// n == 0: the row changed meanwhile (edited or deleted). Leave it;
+		// a still-plaintext row is picked up next time.
+	}
+	// The first start after the upgrade also scrubs when nothing moved: before
+	// v4 secure_delete was off, so values deleted or overwritten then (a
+	// removed password connection, one switched to key auth) can still sit in
+	// free pages.
+	if result.Moved > 0 || serialCleared > 0 || (s.prevVersion < 4 && !s.fresh) {
+		if err := s.scrubFreedPages(); err != nil {
+			return result, err
+		}
+	}
+	return result, nil
+}
+
+// scrubFreedPages removes old copies of overwritten values: secure_delete
+// (set on every connection in openStore) zero-fills cells freed from now on,
+// the checkpoint folds and truncates the WAL, and VACUUM rewrites the file
+// without free pages.
+func (s *Store) scrubFreedPages() error {
+	for _, stmt := range []string{
+		`PRAGMA secure_delete = ON`,
+		`PRAGMA wal_checkpoint(TRUNCATE)`,
+		`VACUUM`,
+		`PRAGMA wal_checkpoint(TRUNCATE)`,
+	} {
+		if _, err := s.db.Exec(stmt); err != nil {
+			return fmt.Errorf("%s: %w", stmt, err)
+		}
+	}
+	restrictDBFilePermissions(s.path)
+	return nil
+}
+
+// PlaintextBackup is a file next to the database that still holds
+// plaintext passwords: a pre-migration backup (<db>.bak-v<N>[-<ns>]) or the
+// renamed pre-SQLite connections.json.migrated.
+type PlaintextBackup struct {
+	Path      string `json:"path"`
+	Passwords int    `json:"passwords"`
+	// Unreadable: the file could not be inspected (partial copy, other
+	// format); it may contain passwords.
+	Unreadable bool `json:"unreadable"`
+}
+
+// findPlaintextBackups lists the backups of dbPath, and the given legacy JSON
+// files, that still contain passwords. They are never deleted automatically
+// (they are the rollback path); the UI offers removePlaintextBackups.
+func findPlaintextBackups(dbPath string, legacyJSON ...string) ([]PlaintextBackup, error) {
+	matches, err := filepath.Glob(globEscape(dbPath) + ".bak-v*")
+	if err != nil {
+		return nil, err
+	}
+	var out []PlaintextBackup
+	for _, path := range matches {
+		if strings.HasSuffix(path, "-wal") || strings.HasSuffix(path, "-shm") || strings.HasSuffix(path, "-journal") {
+			continue
+		}
+		if strings.Contains(filepath.Base(path), ".tmp-") {
+			// Backups are written only inside openStore, so a .tmp- file seen
+			// while the app runs is a VACUUM INTO cut off by a crash or power
+			// loss. It may hold the plaintext passwords: report it so the
+			// user can delete it.
+			out = append(out, PlaintextBackup{Path: path, Unreadable: true})
+			continue
+		}
+		n, err := countBackupPasswords(path)
+		switch {
+		case err != nil:
+			out = append(out, PlaintextBackup{Path: path, Unreadable: true})
+		case n > 0:
+			out = append(out, PlaintextBackup{Path: path, Passwords: n})
+		}
+	}
+	for _, path := range legacyJSON {
+		if !fileExists(path) {
+			continue
+		}
+		conns, err := loadConnections(path)
+		if err != nil {
+			out = append(out, PlaintextBackup{Path: path, Unreadable: true})
+			continue
+		}
+		n := 0
+		for _, c := range conns {
+			if c.usesPassword() && c.Credential != "" {
+				n++
+			}
+		}
+		if n > 0 {
+			out = append(out, PlaintextBackup{Path: path, Passwords: n})
+		}
+	}
+	return out, nil
+}
+
+func globEscape(path string) string {
+	r := strings.NewReplacer(`*`, `\*`, `?`, `\?`, `[`, `\[`)
+	if filepath.Separator == '\\' {
+		return path // '\' is the separator on Windows and cannot escape
+	}
+	return r.Replace(path)
+}
+
+func countBackupPasswords(path string) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	header := make([]byte, 16)
+	_, err = io.ReadFull(f, header)
+	f.Close()
+	if err != nil || string(header) != "SQLite format 3\x00" {
+		return 0, fmt.Errorf("not a SQLite database: %s", path)
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=ro&_pragma=query_only(1)")
+	if err != nil {
+		return 0, err
+	}
+	defer db.Close()
+	var n int
+	err = db.QueryRow(`SELECT COUNT(*) FROM connections WHERE credential != '' AND auth_method LIKE '%パスワード%'`).Scan(&n)
+	return n, err
+}
+
+// removePlaintextBackups deletes the given files, but only those that
+// findPlaintextBackups reports right now for the same dbPath / legacy
+// files, so the UI cannot be used to delete arbitrary paths. It returns the
+// paths it removed. The removal is a plain unlink: copies in Time Machine,
+// cloud sync or SSD spare blocks are out of reach.
+func removePlaintextBackups(dbPath string, paths []string, legacyJSON ...string) ([]string, error) {
+	found, err := findPlaintextBackups(dbPath, legacyJSON...)
+	if err != nil {
+		return nil, err
+	}
+	allowed := map[string]bool{}
+	for _, b := range found {
+		allowed[b.Path] = true
+	}
+	var removed []string
+	var firstErr error
+	for _, path := range paths {
+		if !allowed[path] {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		removed = append(removed, path)
+	}
+	return removed, firstErr
 }

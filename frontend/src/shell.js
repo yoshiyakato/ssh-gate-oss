@@ -1,7 +1,9 @@
 // App skeleton (phase2-contract §2.2). renderSkeleton() is written into #app
 // exactly once at startup; afterwards main.js only rewrites the parts it owns
 // (#header-title, #page-title, #breadcrumb-*, #sidebar-nav, #sidebar-status,
-// #page-root, #modal-root). #terminal-dock is never rewritten, so the xterm
+// #server-tabs, #shell-subtabs, #page-root, #modal-root). #server-tabs and
+// #shell-subtabs sit outside #page-root so the 5s redraw keeps their nodes
+// and focus (phase4-ui-integration §0, §4.2). #terminal-dock is never rewritten, so the xterm
 // panes F1 mounts there survive every render and page switch.
 
 import { escapeHtml } from './model.js';
@@ -98,6 +100,8 @@ export function renderSkeleton({ t, logoUrl = '' }) {
         </div>
         <div class="app-content">
           <div class="container-fluid">
+            <div id="server-tabs" class="server-tabs-bar"></div>
+            <div id="shell-subtabs" class="shell-subtabs-bar" hidden></div>
             <div id="page-root"></div>
             <div id="terminal-dock"></div>
           </div>

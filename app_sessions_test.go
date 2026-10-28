@@ -130,8 +130,14 @@ func TestDashboardSessionsShape(t *testing.T) {
 		if s.ConnID != want.ID || s.ConnName != want.Name {
 			t.Fatalf("sessions[%d]=%+v, want %s in a.conns order", i, s, want.Name)
 		}
-		if s.ConnState != connStateDisconnected || s.Shells != 0 || s.Running != 0 {
-			t.Fatalf("sessions[%d]=%+v, want idle disconnected", i, s)
+		// A serial row without a tab reports whether its device is there
+		// (phase4-serial-patch §7.4); /dev/ttyFAKE0 does not exist.
+		wantState := connStateDisconnected
+		if want.Type == "Serial" {
+			wantState = connStateMissing
+		}
+		if s.ConnState != wantState || s.Shells != 0 || s.Running != 0 {
+			t.Fatalf("sessions[%d]=%+v, want idle %s", i, s, wantState)
 		}
 	}
 	if data.Sessions[0].Kind != "ssh" || data.Sessions[2].Kind != "serial" {

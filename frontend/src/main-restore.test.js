@@ -15,6 +15,8 @@ vi.mock('@xterm/xterm', () => ({
     onData() { return { dispose() {} }; }
     write(data) { this.written.push(typeof data === 'string' ? data : new TextDecoder().decode(data)); }
     focus() {}
+    blur() {}
+    attachCustomKeyEventHandler(fn) { this.keyHandler = fn; }
     dispose() {}
   },
 }));
@@ -54,6 +56,8 @@ vi.mock('../wailsjs/go/main/App', () => {
     ApproveCommand: ok, ApproveCommandAndBypassAgent: ok, ApproveCommandConfirmed: ok,
     DeleteCommandRequest: ok, DeleteMCPSettings: ok, GenerateMCPToken: ok, RejectCommand: ok,
     RevokeAgentApprovalBypass: ok, SaveMCPSettings: ok,
+    GetApprovalTarget: async (id) => ({ requestId: id, found: true, executable: true, fpChanged: false }),
+    PlaintextBackups: async () => [],
   };
 });
 

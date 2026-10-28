@@ -388,9 +388,21 @@ type terminalSession struct {
   | F2 | `SIDEBAR_I18N` | `side.` |
   | F3 | `EDITOR_I18N` | `edit.` |
   | F4 | `MODEL_I18N` | `state.` |
+  | approvals.js（フェーズ3） | `APPROVALS_I18N` | `appr.` |
+  | agents.js（フェーズ3） | `AGENTS_I18N` | `agents.` |
+  | servertabs.js（フェーズ4） | `SERVERTABS_I18N` | `srvtab.` |
+  | shortcuts.js（フェーズ4） | `SHORTCUTS_I18N` | `keys.` |
+  | credentials.js（フェーズ5） | `CREDENTIALS_I18N` | `cred.` |
+  | main.js（i18n.js の BASE_I18N）の追加分 | — | `srvfilter.`、`term.code.*`、`term.save.*`、`term.settingsChanged`（既存の `cmd.` に `cmd.discardEditOnFilter`） |
 
 - **t()**: 各モジュールは `ctx.t` か引数の `t` を使う。シグネチャは `t(key: string, vars?: Record<string, string|number>) => string` で、テンプレート中の `{name}` を vars で置き換える（Integrator が main.js の `t` を拡張する。置き換え関数 `interpolate` は F4 が作る）。モジュールは `state.lang` を直接読まず、言語が必要なら `ctx.lang()` を使う。
-- **data-action の名前空間**: F1 は `term-*`、F2 は `side-*`、F3 は `edit-*`。既存の main.js の action 名と重ならない。
+- **data-action の名前空間**: F1 は `term-*`、F2 は `side-*`、F3 は `edit-*`。既存の main.js の action 名と重ならない。統合で増えたもの（§5 も参照）:
+  - approvals.js: `approve-command`、`approve-bypass-agent`、`reject-command`、`revoke-bypass`、`copy-command`、`[data-select-request]`（フェーズ2の main.js の名前を引き継いだ）
+  - agents.js: `agents-*`（copy-token / hide-token / copy-config / reload / reissue / revoke-token / revoke-bypass / revoke-all）と `[data-agents-form="issue"]`
+  - servertabs.js: `srvtab-select`、`srvtab-sub-activate`、`srvtab-new-shell`（servertabs.js が自前のリスナで処理。main.js の click 振り分けは `[data-action^="srvtab-"]` を見たら何もせず return）
+  - main.js: `srvfilter-show-all`、`restart-terminal`（設定変更後の開いているタブを閉じて開き直す）、既存の `delete-command-request` / `close-delete-command` / `confirm-delete-command` と設定画面の action
+  - credentials.js: `cred-delete-backups`。ダイアログ内は `data-cred-action` / `data-cred-dismiss`
+  - F3 の追加: `edit-reset-hostkey`、`edit-serial-line`（change だけ）
 - **HTML のエスケープ**は `model.js` の `escapeHtml` を使う。
 - 各モジュールは、自分のハンドラが処理したイベントなら `true` を返す（Integrator はそこで処理を止める）。
 
@@ -431,12 +443,35 @@ const ctx = {
 };
 ```
 
+**統合後（フェーズ3〜5）に増えた state と ctx**（ここが現行の正。詳細は §5）:
+
+```js
+state.data.agentTokens = [];      // AgentToken[]（秘密は含まない）。approvals.js が承認省略の可否に使う
+state.data.keychainPending = 0;   // 起動時にキーチェーンへ移せなかったパスワードの件数
+state.approvals = createApprovalsState(); // approvals.js が所有（実行先の照会キャッシュ）
+state.serverFilter = '';          // '' = すべて、他は Connection.id。setServerFilter / reconcileServerFilter だけが書く
+state.serverFilterReady = false;  // 最初の refresh 成功までは false（保存値を検証しない）
+state.reconnectNeeded = new Set();// 設定変更（reconnect_required / serial_mode_not_applied）で再接続が要る connId
+
+ctx.copyText(text);               // クリップボード（textarea の代替つき）
+ctx.serverFilter();               // 読み取り専用
+ctx.setServerFilter(connId, { source, render });
+ctx.onSelectionChange(id, { previousId, reason }); // F3 → main.js（一覧 → タブ）。reason 'delete' は無視
+ctx.onConnectionSaved(result);    // F3 → main.js（シリアルの適用結果のトースト）
+ctx.platform();                   // 'darwin' | 'windows' | 'linux' | ''（Wails の Environment）
+ctx.recoverCredential(conn, result, { password }); // needs_password / keyring_unavailable の共通ダイアログ。true なら再試行してよい
+ctx.startErrorMessage(result);    // StartTerminal の失敗コードの表示文言（EN は固定文言）
+ctx.terminalKeyHandler;           // shortcuts.js のハンドラ。F1 が全 xterm に attachCustomKeyEventHandler する
+```
+
 画面の骨格（Integrator の `shell.js`）は起動時に1回だけ `#app` に描き、以後は部分ごとに描き直す。骨格に必ず次の要素を置く。
 
 ```html
 <aside class="app-sidebar …">… <nav id="sidebar-nav"></nav> <div class="sidebar-status" id="sidebar-status"></div></aside>
-<main class="app-main">… <div id="page-root"></div> <div id="terminal-dock"></div> …</main>
+<main class="app-main">… <div id="server-tabs" class="server-tabs-bar"></div> <div id="shell-subtabs" class="shell-subtabs-bar" hidden></div> <div id="page-root"></div> <div id="terminal-dock"></div> …</main>
 ```
+
+`#server-tabs` / `#shell-subtabs`（フェーズ4）は `#page-root` の外にあり、servertabs.js が data-key で差分描画する（5秒ごとの再描画でノードとフォーカスを保つ）。
 
 `#terminal-dock` は描き直さない。F1 はここに `#terminal-stack` を1回だけ置く。
 
@@ -751,3 +786,21 @@ export function lastTestLabel(conn, t): string;                         // 最�
 | ターミナル画面でもサイドバーが更新され、xterm の DOM が同じ | Integrator: refreshData がサイドバーを常に描くこと、`#terminal-dock` を描き直さないこと（`terminal-tabs.test.js` で pane の要素が同一であることも確認する） |
 | 入力中の値がトーストや言語切替で消えない | `editor.test.js` |
 | リネームしても行が増えず、選択が追従する | `editor.test.js`、`TestSaveConnectionKeepsTabs` |
+
+---
+
+## 5. 統合時の追記（フェーズ3〜5、Integrator）
+
+フェーズ3（approvals.js / agents.js）、フェーズ4（servertabs.js / shortcuts.js / serverview.js / serverfilter.js、シリアル）、フェーズ5のキーチェーン（credentials.js）を main.js に結線したときに、本書の名前に足したものです。§2.1・§2.2 の表にも反映済み。
+
+| 項目 | 追加・変更 | 根拠 |
+|---|---|---|
+| モジュールの import | main.js 側の補助モジュール `serverview.js`（純関数）と `credentials.js`（共通ダイアログと設定画面の通知）は main.js だけが import する。F1〜F3 と approvals.js / agents.js は互いに import しない（`model.js` は例外のまま） | phase4-ui-integration §4.1 |
+| 承認キュー | main.js から approvals.js に移した（`renderCommandsPage(root, ctx, view)`、`handleApprovalsClick(event, ctx, view)`、`handleApprovalsInput`）。`view` は `deriveServerView(state, getTerminalState())`。削除モーダルと `srvfilter-show-all` は main.js に残る | approvals.js の報告 |
+| 設定画面 | `<form id="mcp-form">` の後ろに `#agents-root`（agents.js の `mountAgentsSection`）、先頭に `#keychain-notices`（credentials.js の `mountKeychainNotices`）。`pageIsBusy()` の settings は `dirty.settings || agentsSectionBusy()`。設定画面を離れるときに `forgetIssuedAgentToken()` | agents.js の報告 |
+| ターミナル画面 | `#page-root` には active なタブの操作（再接続・閉じる・終了理由）と、「すべて」のときだけ `renderTerminalNewShell`。タブ列は `#shell-subtabs`。フェーズ2の `renderTerminalPage` は main.js から呼ばない。`#terminal-stack` は絞り込み先にタブが無ければ隠す（`view.stackVisible`） | phase4 §2.4 |
+| F1 の追加 | `ctx.terminalKeyHandler` の取り付け、`setTerminalServerFilter` / `renderTerminalNewShell` / `renderTerminalEmpty`、タブの `exitReason`（device_removed の表示用）、`needs_password` / `keyring_unavailable` で `ctx.recoverCredential` を1回だけ呼んで再試行 | phase4 §6 C3、phase5 §8 |
+| F3 の追加 | `selectConnection(id, ctx, { notify })`、`ctx.onSelectionChange`、`ctx.platform`、パスフレーズのモーダルに「キーチェーンに保存」（既定 OFF。チェック時は `TestConnectionWithPassphraseSave(id, pass, true)`）、接続テストの `needs_password` / `keyring_unavailable` で `ctx.recoverCredential`、保存の `keyring_unavailable` で入力済みのパスワードを「このセッションだけ使う」に回す | phase4 §2.3、phase5 §5.4 / §8 |
+| 起動 | `renderSkeleton()` → `initTerminalTabs(ctx)`（`ctx.terminalKeyHandler` は設定済み）→ `renderAll()` → `setInterval(pollData, 5000)` → `await refreshData()`（最初の成功で `reconcileServerFilter({reason:'init'})` とタブの復元）→ `renderAll()`。main.js は import 時に起動する形のままにした（テストは `vi.resetModules()` で読み直す） | phase4 §6 C1 からの変更 |
+| Wails の追加 API | `GetApprovalTarget`、`GetHostKeyInfo` / `ResetHostKey`、`ListAgentTokens` ほか（フェーズ3）、`UseCredentialForSession(id, secret)`、`TestConnectionWithPassphraseSave(id, passphrase, save)`、`PlaintextBackups()`、`DeletePlaintextBackups(paths)`（フェーズ5）。`DashboardData.keychainPending`、`TerminalInfo.serialMode` | `wails generate module` で再生成済み |
+

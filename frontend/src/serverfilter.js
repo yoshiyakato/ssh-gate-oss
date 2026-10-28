@@ -1,6 +1,13 @@
 // Pure helpers for the global server tabs (design §6.4, §7 phase 4). Nothing
 // here touches the DOM, Wails, or module state; callers pass
 // state.data.connections / requests / sessions and state.serverFilter.
+//
+// The connState symbol comes from model.js (one mapping for the sidebar, the
+// editor badge and the server tabs). model.js re-exports filterByServer and
+// friends, so callers that may only import model.js (contract §2.1) reach them
+// there; the cycle is safe because neither module calls the other at load time.
+
+import { connStateSymbol } from './model.js';
 
 // ALL_SERVERS is the serverFilter value of the 「すべて」 tab.
 export const ALL_SERVERS = '';
@@ -81,14 +88,6 @@ export function isUnknownConnection(record, connections) {
   return recordConnId(record, connections) === null;
 }
 
-function serverSymbol(code) {
-  // Same mapping as connStateSymbol in model.js (design §6.1).
-  if (code === 'connected' || code === 'idle') return '●';
-  if (code === 'error' || code === 'missing') return '▲';
-  if (code === 'in_use') return '◆';
-  return '○';
-}
-
 // serverTabs builds the top tab strip: the 「すべて」 tab first, then one tab
 // per saved connection in the given order. Badges are connState (symbol),
 // open shells (⧉) and pending approvals (⏳). Pending is counted from
@@ -130,7 +129,7 @@ export function serverTabs(connections, sessions, requests, serverFilter = ALL_S
       name: text(conn?.name) || text(session?.connName),
       kind: conn?.type === 'Serial' ? 'serial' : 'ssh',
       connState,
-      symbol: serverSymbol(connState),
+      symbol: connStateSymbol(connState),
       shells,
       connecting: session?.connecting ?? 0,
       pending: pendingById.get(connId) ?? 0,

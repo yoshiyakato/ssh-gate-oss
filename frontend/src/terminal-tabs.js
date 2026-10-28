@@ -5,6 +5,11 @@
 // renderPage() and page navigation never destroy an xterm: only closing a tab
 // (or exit with reason "user") disposes it. #page-root only gets the tab strip
 // from renderTerminalPage().
+//
+// Phase 4 (phase4-ui-integration.md §2.4, §4.4): the server filter is pushed in
+// with setTerminalServerFilter(); panes of other connections are hidden (and
+// never focused) so a keystroke cannot reach a shell the user is not looking
+// at. ctx.terminalKeyHandler, when set, is attached to every xterm.
 
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
@@ -27,6 +32,7 @@ export const TERMINAL_I18N = {
     'tabs.reconnect': '再接続',
     'tabs.reconnecting': '再接続しています',
     'tabs.empty': '開いているターミナルはありません',
+    'tabs.emptyFiltered': '{name} のシェルはありません',
     'tabs.emptyHint': '接続先を選んで「新しいシェル」を押してください',
     'tabs.restored': '以前の出力は表示できません',
     'tabs.dropped': '出力が多すぎるため {n} バイトを省略しました',
@@ -50,6 +56,7 @@ export const TERMINAL_I18N = {
     'tabs.reconnect': 'Reconnect',
     'tabs.reconnecting': 'Reconnecting',
     'tabs.empty': 'No open terminals',
+    'tabs.emptyFiltered': 'No shells on {name}',
     'tabs.emptyHint': 'Pick a connection and press "New shell"',
     'tabs.restored': 'Earlier output is not available',
     'tabs.dropped': 'Skipped {n} bytes of output',
@@ -91,6 +98,7 @@ let resizeWired = false;
 let fitFrame = 0;
 let useCounter = 0;
 let newTarget = ''; // 「新しいシェル」の select で選ばれている connId
+let paneFilter = ''; // state.serverFilter の写し（'' = すべて）。setTerminalServerFilter だけが書く
 const labelCounters = new Map(); // connId -> 最後に使った #n（減らさない）
 
 function tr(key, vars) {
@@ -133,6 +141,32 @@ function renderTabsIfVisible() {
 
 function stackVisible() {
   return Boolean(stack) && !stack.hidden;
+}
+
+function inFilter(entry) {
+  return !paneFilter || entry.connId === paneFilter;
+}
+
+// A pane can be measured and focused only when the stack is shown and the
+// server filter does not hide it.
+function paneVisible(entry) {
+  return stackVisible() && !entry.pane.hidden;
+}
+
+function applyPaneFilter(entry) {
+  const hide = !inFilter(entry);
+  if (entry.pane.hidden === hide) return;
+  entry.pane.hidden = hide;
+  if (hide) {
+    // A hidden xterm can keep DOM focus; drop it so typing goes nowhere.
+    try {
+      entry.xterm.blur?.();
+    } catch (error) {
+      // already disposed; ignored.
+    }
+  } else {
+    entry.needsFit = true;
+  }
 }
 
 export function newTerminalId() {
@@ -200,7 +234,7 @@ function fitActive() {
 // the active tab is visible, so only it can be measured; the rest stay
 // needsFit until activated.
 function fitTab(entry) {
-  if (!stackVisible() || entry.id !== terminal.activeId) {
+  if (!paneVisible(entry) || entry.id !== terminal.activeId) {
     entry.needsFit = true;
     return;
   }
@@ -242,6 +276,9 @@ function createTab(id, connId, kind, baseName, n) {
   const fit = new FitAddon();
   xterm.loadAddon(fit);
   xterm.open(pane);
+  // Shortcuts (shortcuts.js) must see keys before the shell does. main.js puts
+  // the same handler instance on document, which dedupes per event.
+  if (typeof ctx?.terminalKeyHandler === 'function') xterm.attachCustomKeyEventHandler(ctx.terminalKeyHandler);
 
   const entry = {
     id,
@@ -261,6 +298,7 @@ function createTab(id, connId, kind, baseName, n) {
     needsFit: true,
     pane,
     usedSeq: 0,
+    exitReason: '',
     restored: false,
     misses: 0,
   };
@@ -272,6 +310,7 @@ function createTab(id, connId, kind, baseName, n) {
 
   terminal.tabs.set(id, entry);
   terminal.order.push(id);
+  applyPaneFilter(entry);
   return entry;
 }
 
@@ -279,7 +318,12 @@ function removeTab(id) {
   const entry = terminal.tabs.get(id);
   if (!entry) return false;
   const index = terminal.order.indexOf(id);
+  // Under a server filter the replacement active tab comes from the same
+  // connection's tabs, so closing one does not jump to another server.
+  const filtered = paneFilter ? terminal.order.filter((x) => terminal.tabs.get(x)?.connId === paneFilter) : null;
+  const filteredIndex = filtered ? filtered.indexOf(id) : -1;
   if (index >= 0) terminal.order.splice(index, 1);
+  if (filteredIndex >= 0) filtered.splice(filteredIndex, 1);
   terminal.tabs.delete(id);
   entry.status = 'exited';
   entry.pendingInput = '';
@@ -292,7 +336,9 @@ function removeTab(id) {
   entry.pane.remove();
   if (terminal.activeId === id) {
     terminal.activeId = '';
-    const next = terminal.order[Math.min(index, terminal.order.length - 1)];
+    const next = filteredIndex >= 0
+      ? filtered[Math.min(filteredIndex, filtered.length - 1)]
+      : terminal.order[Math.min(index, terminal.order.length - 1)];
     if (next) activateTerminalTab(next);
   }
   return true;
@@ -306,10 +352,10 @@ function setPaneActive() {
 
 function focusActive() {
   const entry = terminal.tabs.get(terminal.activeId);
-  if (!entry || !stackVisible() || entry.status === 'exited') return;
+  if (!entry || !paneVisible(entry) || entry.status === 'exited') return;
   // DOM may still be settling right after a render; focus on the next tick.
   setTimeout(() => {
-    if (terminal.tabs.get(terminal.activeId) === entry && stackVisible()) entry.xterm.focus();
+    if (terminal.tabs.get(terminal.activeId) === entry && paneVisible(entry)) entry.xterm.focus();
   }, 0);
 }
 
@@ -347,6 +393,27 @@ export function terminalTabCount(connId) {
 
 export function getTerminalState() {
   return terminal;
+}
+
+// setTerminalServerFilter mirrors state.serverFilter ('' = all) into the
+// panes: tabs of other connections get `pane.hidden` and lose focus. It does
+// not change the active tab; main.js picks that from deriveServerView
+// (serverview.js) and calls activateTerminalTab. Returns true when changed.
+export function setTerminalServerFilter(connId) {
+  const next = connId ? String(connId) : '';
+  if (next === paneFilter) return false;
+  paneFilter = next;
+  for (const entry of terminal.tabs.values()) applyPaneFilter(entry);
+  const active = terminal.tabs.get(terminal.activeId);
+  if (active && !active.pane.hidden) {
+    if (active.needsFit) fitTab(active);
+    focusActive();
+  }
+  return true;
+}
+
+export function getTerminalServerFilter() {
+  return paneFilter;
 }
 
 // ---- input ---------------------------------------------------------------
@@ -423,6 +490,8 @@ function onTerminalExit(payload) {
   if (payload.reason === 'user') {
     removeTab(payload.id);
   } else {
+    // Kept for the toolbar: device_removed shows 「デバイスが外れました［再接続］」.
+    entry.exitReason = EXIT_REASONS.includes(payload.reason) ? payload.reason : 'conn_lost';
     markExited(entry, exitLine(payload.reason, payload.message, payload.exitCode));
   }
   renderTabsIfVisible();
@@ -558,13 +627,20 @@ async function startSession(entry, { fresh }) {
         result = { ok: false, code: 'canceled', message: '' };
       }
     }
+    if (['needs_password', 'keyring_unavailable'].includes(result.code) && !retried && conn && ctx?.recoverCredential) {
+      retried = true;
+      const recovered = await ctx.recoverCredential(conn, result);
+      if (terminal.tabs.get(id) !== entry) return { ok: false, id, code: 'canceled', message: '' };
+      if (recovered) continue;
+      result = { ok: false, code: 'canceled', message: '' };
+    }
     if (fresh) {
       removeTab(id);
     } else {
       // A reconnect keeps the scrollback; the tab goes back to exited.
       markExited(entry, `\r\n\x1b[31m[${tr('tabs.startFailed')}${result.message ? `: ${result.message}` : ''}]\x1b[0m\r\n`);
     }
-    if (result.code !== 'canceled' && result.message) ctx?.toast?.(result.message);
+    if (result.code !== 'canceled' && result.message) ctx?.toast?.(ctx.startErrorMessage?.(result) ?? result.message);
     renderTabsIfVisible();
     return { ok: false, id, code: result.code || 'connect_failed', message: result.message || '' };
   }
@@ -617,6 +693,7 @@ export async function reconnectTerminalTab(id) {
   entry.id = newId;
   entry.pane.dataset.termId = newId;
   entry.status = 'starting';
+  entry.exitReason = '';
   entry.restored = false;
   entry.misses = 0;
   entry.pendingInput = '';
@@ -645,18 +722,20 @@ function tabHtml(entry, t) {
   `;
 }
 
-export function renderTerminalPage(state, t) {
+function syncNewTarget(connections) {
+  if (connections.some((conn) => conn.id === newTarget)) return;
+  const active = terminal.tabs.get(terminal.activeId);
+  newTarget = connections.some((conn) => conn.id === active?.connId) ? active.connId : (connections[0]?.id ?? '');
+}
+
+// renderTerminalNewShell is the connection select plus 「新しいシェル」 button
+// (.term-new). Phase 4 draws it in the toolbar only under 「すべて」; with a
+// server filter the sub-tab row's 「＋新しいシェル」 opens shells instead.
+// term-new / term-new-select are still handled by handleTerminalClick/Change.
+export function renderTerminalNewShell(state, t) {
   const connections = state?.data?.connections ?? [];
-  if (!connections.some((conn) => conn.id === newTarget)) {
-    const active = terminal.tabs.get(terminal.activeId);
-    newTarget = connections.some((conn) => conn.id === active?.connId) ? active.connId : (connections[0]?.id ?? '');
-  }
-  const tabs = terminal.order.map((id) => terminal.tabs.get(id)).filter(Boolean);
+  syncNewTarget(connections);
   return `
-    <div class="term-toolbar">
-      <div class="term-tabs" role="tablist">
-        ${tabs.map((entry) => tabHtml(entry, t)).join('')}
-      </div>
       <div class="term-new">
         <select class="form-select form-select-sm" data-action="term-new-select" aria-label="${escapeHtml(t('tabs.selectTarget'))}" ${connections.length ? '' : 'disabled'}>
           ${connections.length
@@ -667,8 +746,36 @@ export function renderTerminalPage(state, t) {
         </select>
         <button class="btn btn-sm btn-primary" type="button" data-action="term-new" ${connections.length ? '' : 'disabled'}><i class="bi bi-plus-lg me-1"></i>${escapeHtml(t('tabs.newShell'))}</button>
       </div>
+  `;
+}
+
+// renderTerminalEmpty is the placeholder shown when no tab is listed. With a
+// server filter it names the connection (current name from connections).
+export function renderTerminalEmpty(state, t, { serverFilter = '' } = {}) {
+  if (serverFilter) {
+    const conn = (state?.data?.connections ?? []).find((c) => c.id === serverFilter);
+    const name = conn?.name || t('tabs.unnamed');
+    return `<div class="term-empty"><div class="fw-bold">${escapeHtml(t('tabs.emptyFiltered', { name }))}</div></div>`;
+  }
+  return `<div class="term-empty"><div class="fw-bold">${escapeHtml(t('tabs.empty'))}</div><div class="text-secondary small">${escapeHtml(t('tabs.emptyHint'))}</div></div>`;
+}
+
+// renderTerminalPage is the phase 2 page (tab strip + new shell). With
+// `serverFilter` only that connection's tabs are listed and .term-new is
+// left out, matching renderShellSubtabs in servertabs.js. Phase 4 main.js
+// draws #shell-subtabs instead and uses renderTerminalNewShell directly.
+export function renderTerminalPage(state, t, { serverFilter = '' } = {}) {
+  const tabs = terminal.order
+    .map((id) => terminal.tabs.get(id))
+    .filter((entry) => entry && (!serverFilter || entry.connId === serverFilter));
+  return `
+    <div class="term-toolbar">
+      <div class="term-tabs" role="tablist">
+        ${tabs.map((entry) => tabHtml(entry, t)).join('')}
+      </div>
+      ${serverFilter ? '' : renderTerminalNewShell(state, t)}
     </div>
-    ${tabs.length ? '' : `<div class="term-empty"><div class="fw-bold">${escapeHtml(t('tabs.empty'))}</div><div class="text-secondary small">${escapeHtml(t('tabs.emptyHint'))}</div></div>`}
+    ${tabs.length ? '' : renderTerminalEmpty(state, t, { serverFilter })}
   `;
 }
 

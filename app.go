@@ -72,6 +72,20 @@ type App struct {
 	// (never while holding a.mu) and nothing blocks on it while holding a.mu.
 	policyMu       sync.Mutex
 	sshPassphrases map[string]string
+	// secrets is the OS keychain (phase5-keychain.md); sessionSecrets holds
+	// passwords given "for this session only". secretCache (guarded by
+	// a.mu) keeps what was read so a dial does not hit the keychain every
+	// time; it is dropped on save, delete and auth failure.
+	secrets        SecretStore
+	sessionSecrets *memorySecretStore
+	secretCache    map[string]string
+	// secretMu serializes SaveConnection / DeleteConnection with the
+	// secret_gc runs, so an item is never collected while a save is about
+	// to reference it again. Taken before a.mu, never while holding it.
+	secretMu sync.Mutex
+	// keychainPending counts passwords still in the credential column
+	// because the startup migration could not move them (§7 step 5).
+	keychainPending int
 	// reqCond (L = &a.mu) is broadcast whenever a request is added, changes
 	// state or is deleted, waking get_request_status long-polls.
 	reqCond *sync.Cond
@@ -302,10 +316,13 @@ type DashboardData struct {
 	AgentTokens   []AgentToken     `json:"agentTokens"`
 	MCP           MCPSettings      `json:"mcp"`
 	StorageError  string           `json:"storageError"`
-	Sessions      []SessionSummary `json:"sessions"` // every saved connection, in a.conns order
-	Terminals     []TerminalInfo   `json:"terminals"`
-	RunningTotal  int              `json:"runningTotal"`
-	SessionsSeq   uint64           `json:"sessionsSeq"`
+	// KeychainPending is how many passwords are still stored in SQLite
+	// because the keychain was unavailable at startup (retried next start).
+	KeychainPending int              `json:"keychainPending"`
+	Sessions        []SessionSummary `json:"sessions"` // every saved connection, in a.conns order
+	Terminals       []TerminalInfo   `json:"terminals"`
+	RunningTotal    int              `json:"runningTotal"`
+	SessionsSeq     uint64           `json:"sessionsSeq"`
 }
 
 // SessionSummary is the live runtime state of one saved connection (§5.4
@@ -373,6 +390,9 @@ type ActionResult struct {
 	Token string `json:"token,omitempty"`
 	// SessionID is the terminal tab a terminal API call acted on.
 	SessionID string `json:"sessionId,omitempty"`
+	// Field names the form field a validation failure is about
+	// (invalid_serial_mode: baudRate, dataBits, parity, stopBits).
+	Field string `json:"field,omitempty"`
 }
 
 type commandResult struct {
@@ -400,6 +420,9 @@ func NewApp() *App {
 		agentPolicies:     map[string]AgentPolicy{},
 		agentTokens:       map[string]AgentToken{},
 		sshPassphrases:    map[string]string{},
+		secrets:           defaultSecretStore(),
+		sessionSecrets:    newMemorySecretStore(),
+		secretCache:       map[string]string{},
 		execs:             map[uint64]runningExec{},
 		now:               time.Now,
 	}
@@ -421,6 +444,9 @@ func NewApp() *App {
 		if err := migrateLegacyData(store, dbPath, legacyConnections, legacyMCPSettings); err != nil {
 			log.Printf("migrate legacy data: %v", err)
 		}
+		// Before the connections are loaded and before MCP can start, so
+		// nothing reads a row mid-move (phase5-keychain.md §7).
+		app.keychainPending = migrateKeychain(store, app.secrets)
 		if err := store.recoverInterruptedRequests(); err != nil {
 			log.Printf("recover interrupted requests: %v", err)
 		}
@@ -497,11 +523,22 @@ func NewApp() *App {
 	app.expireOverdue()
 	app.wg.Add(1)
 	go app.runExpirySweeper(app.appCtx)
+	if store != nil {
+		app.wg.Add(1)
+		go app.runSecretGCLoop(app.appCtx)
+	}
 	return app
 }
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	// Plug / unplug of serial devices shows in the sidebar and tabs
+	// (phase4-serial-patch §7.4).
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		a.watchSerialPresence(a.appCtx)
+	}()
 	a.mu.RLock()
 	enabled := a.mcp.Enabled
 	a.mu.RUnlock()
@@ -589,12 +626,13 @@ func (a *App) effectiveTokenLocked() string {
 func (a *App) GetInitialData() DashboardData {
 	a.mu.RLock()
 	data := DashboardData{
-		Connections:   publicConnections(a.conns),
-		Requests:      cloneRequests(a.requests),
-		AgentPolicies: a.agentPoliciesViewLocked(),
-		AgentTokens:   a.agentTokensViewLocked(),
-		MCP:           a.mcpSnapshotLocked(),
-		StorageError:  a.storageError,
+		Connections:     publicConnections(a.conns),
+		Requests:        cloneRequests(a.requests),
+		AgentPolicies:   a.agentPoliciesViewLocked(),
+		AgentTokens:     a.agentTokensViewLocked(),
+		MCP:             a.mcpSnapshotLocked(),
+		StorageError:    a.storageError,
+		KeychainPending: a.keychainPending,
 	}
 	a.mu.RUnlock()
 	snapshot := a.sessionsSnapshot()
@@ -653,6 +691,8 @@ func (a *App) sessionSummaries() []SessionSummary {
 
 	terminals := a.terminalRuntime()
 	running := a.runningCounts()
+	// One presence round for every serial connection, without a.mu.
+	serialStates := a.serialConnStates(serialGOOS, conns)
 	out := make([]SessionSummary, 0, len(conns))
 	for _, conn := range conns {
 		rt := terminals[conn.ID]
@@ -689,6 +729,8 @@ func (a *App) sessionSummaries() []SessionSummary {
 			s.ConnState = connStateConnecting
 		case s.LastError != "":
 			s.ConnState = connStateError
+		case serial && serialStates[conn.ID] != "":
+			s.ConnState = serialStates[conn.ID]
 		default:
 			s.ConnState = connStateDisconnected
 		}
@@ -812,7 +854,9 @@ func publicConnections(in []Connection) []Connection {
 	out := cloneConnections(in)
 	for i := range out {
 		out[i].KeyPassphrase = ""
-		out[i].CredentialSet = out[i].Credential != ""
+		// A keychain-backed password has an empty Credential and
+		// CredentialSet already true (credentialInKeyring).
+		out[i].CredentialSet = out[i].CredentialSet || out[i].Credential != ""
 		if out[i].usesPassword() {
 			out[i].Credential = ""
 		}
@@ -842,7 +886,10 @@ func (a *App) TestConnectionConfig(conn Connection, passphrase string) ActionRes
 	conn = normalizeConnection(conn)
 	if conn.ID != "" && conn.usesPassword() && conn.Credential == "" {
 		if saved, ok := a.connectionByID(conn.ID); ok && saved.usesPassword() {
+			// A keychain password stays a reference (Credential "",
+			// CredentialSet) until resolveCredential reads it.
 			conn.Credential = saved.Credential
+			conn.CredentialSet = saved.CredentialSet
 		}
 	}
 	if conn.Type == "Serial" {
@@ -870,18 +917,35 @@ func (a *App) testConnectionConfig(conn Connection, passphrase string) ActionRes
 		a.mu.RUnlock()
 	}
 
+	// conn stays as submitted (a keychain password is still a reference),
+	// so recordConnectionTest compares it with the saved row; dial carries
+	// the secrets.
+	credCtx, credCancel := context.WithTimeout(context.Background(), guiCredentialTimeout)
+	dial, err := a.resolveCredential(credCtx, conn)
+	credCancel()
+	var credErr *credentialError
+	if errors.As(err, &credErr) {
+		message := fmt.Sprintf("%s へのSSH疎通を確認できません: %s", displayName, credentialMessage(credErr))
+		return ActionResult{OK: false, Code: credErr.code, Message: message, ID: conn.ID}
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), timeoutSeconds(conn.ConnectTimeout, 10))
 	defer cancel()
 	a.mu.RLock()
 	strictHostKey := a.mcp.StrictHostKey
 	a.mu.RUnlock()
-	if err := testSSHConnection(ctx, conn, strictHostKey); err != nil {
+	if err := testSSHConnection(ctx, dial, strictHostKey); err != nil {
 		message := fmt.Sprintf("%s へのSSH疎通に失敗しました: %s", displayName, explainSSHError(conn, err))
 		a.recordConnectionTest(conn, "failed", message)
 		result := ActionResult{OK: false, Message: message, ID: conn.ID}
 		var missing *passphraseMissingError
 		if errors.As(err, &missing) {
 			result.Code = "needs_passphrase"
+		}
+		if conn.ID != "" && strings.Contains(strings.ToLower(err.Error()), "unable to authenticate") {
+			// The saved password may be stale: read it again next time
+			// (the keychain item itself is kept, §8).
+			a.forgetSecrets(conn.ID)
 		}
 		return result
 	}
@@ -960,25 +1024,43 @@ func (a *App) DisconnectConnection(id string) ActionResult {
 // SaveConnection creates (empty ID) or updates (ID set, rename allowed) a
 // connection. The database is written first; memory only changes on success.
 // Open tabs are kept: saving must not drop the user's shells.
+//
+// A new password goes to the keychain first (read back and verified), and
+// only then is the row written with an empty credential column
+// (phase5-keychain.md §5.2). If the keychain is unavailable the save fails
+// with keyring_unavailable; it never falls back to plaintext in SQLite.
+// Line settings of an open serial tab are applied after a.mu is released
+// (phase4-serial-patch §7.3).
 func (a *App) SaveConnection(connection Connection) ActionResult {
-	result := a.saveConnection(connection)
+	a.secretMu.Lock()
+	result, post := a.saveConnection(connection)
+	a.collectSecretGC()
+	a.secretMu.Unlock()
+	if post != nil {
+		result = post(result)
+	}
 	if result.OK {
 		a.sessionsChanged() // the sessions list (names, new rows) follows a.conns
 	}
 	return result
 }
 
-func (a *App) saveConnection(connection Connection) ActionResult {
+// saveConnection is SaveConnection's body. It takes and releases a.mu
+// itself; post (nil when there is nothing to do) runs after that. Callers
+// hold a.secretMu.
+func (a *App) saveConnection(connection Connection) (ActionResult, func(ActionResult) ActionResult) {
 	connection = normalizeConnection(connection)
 	if connection.Name == "" {
-		return ActionResult{OK: false, Message: "接続先名は必須です"}
+		return ActionResult{OK: false, Message: "接続先名は必須です"}, nil
 	}
 	if connection.Type == "Serial" {
-		if connection.SerialPort == "" {
-			return ActionResult{OK: false, Message: "シリアルポートを選択してください"}
-		}
-		if message := validateSerialParams(connection); message != "" {
-			return ActionResult{OK: false, Message: message}
+		if err := validateSerialSettings(serialGOOS, serialSettingsOf(connection)); err != nil {
+			result := ActionResult{OK: false, Code: "invalid_serial_mode", Message: err.Error(), ID: connection.ID}
+			var modeErr *serialModeError
+			if errors.As(err, &modeErr) {
+				result.Field = modeErr.Field
+			}
+			return result, nil
 		}
 		// A serial row must not keep SSH leftovers: the password would stay
 		// in SQLite, and the host would still match MCP host lookups.
@@ -986,13 +1068,44 @@ func (a *App) saveConnection(connection Connection) ActionResult {
 		connection.MCPFirstTrust = false
 	} else {
 		if connection.Host == "" || connection.User == "" {
-			return ActionResult{OK: false, Message: "ホスト、ユーザー名は必須です"}
+			return ActionResult{OK: false, Message: "ホスト、ユーザー名は必須です"}, nil
 		}
 		connection.SerialPort, connection.BaudRate = "", 0
 		connection.DataBits, connection.Parity, connection.StopBits = 0, "", ""
 	}
 	if a.store == nil {
-		return ActionResult{OK: false, Message: errStoreUnavailable.Error()}
+		return ActionResult{OK: false, Message: errStoreUnavailable.Error()}, nil
+	}
+
+	// A typed password is written to the keychain before the row, without
+	// a.mu. A new connection gets its ID first so the item has a name.
+	isNew := connection.ID == ""
+	newPassword := connection.Type != "Serial" && connection.usesPassword() && connection.Credential != ""
+	if newPassword {
+		if message := a.saveConflict(connection); message != "" {
+			return ActionResult{OK: false, Message: message}, nil
+		}
+		if isNew {
+			connection.ID = newID()
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), secretWriteTimeout)
+		err := storeSecretVerified(ctx, a.secrets, passwordAccount(connection.ID), connection.Credential)
+		cancel()
+		if err != nil {
+			id := connection.ID
+			if isNew {
+				id = ""
+				// Set may have written before the read-back failed.
+				if err := a.store.enqueueSecretGC(passwordAccount(connection.ID)); err != nil {
+					log.Printf("queue password for gc: %v", err)
+				}
+			}
+			log.Printf("store password in keychain: %v", err)
+			return ActionResult{OK: false, Code: "keyring_unavailable", ID: id,
+				Message: "キーチェーンにパスワードを保存できないため、保存しませんでした。「このセッションだけ使う」を選ぶか、キーチェーンを使える状態にしてから保存し直してください"}, nil
+		}
+		connection.Credential = ""
+		connection.CredentialSet = true
 	}
 
 	a.mu.Lock()
@@ -1005,35 +1118,43 @@ func (a *App) saveConnection(connection Connection) ActionResult {
 			continue
 		}
 		if a.conns[i].Name == connection.Name {
-			return ActionResult{OK: false, Message: fmt.Sprintf("「%s」という名前の接続先は既にあります。別の名前にしてください", connection.Name)}
+			return a.abandonNewSecret(isNew, newPassword, connection,
+				ActionResult{OK: false, Message: fmt.Sprintf("「%s」という名前の接続先は既にあります。別の名前にしてください", connection.Name)}), nil
 		}
 	}
-	if connection.ID != "" && index < 0 {
-		return ActionResult{OK: false, Message: "編集中の接続先は削除されています。新規として保存し直してください"}
+	if !isNew && index < 0 {
+		return ActionResult{OK: false, Message: "編集中の接続先は削除されています。新規として保存し直してください"}, nil
 	}
 
 	if index < 0 {
-		connection.ID = newID()
+		if connection.ID == "" {
+			connection.ID = newID()
+		}
 		if err := a.store.insertConnection(connection); err != nil {
-			return ActionResult{OK: false, Message: fmt.Sprintf("SQLite保存に失敗しました: %v", err)}
+			return a.abandonNewSecret(isNew, newPassword, connection,
+				ActionResult{OK: false, Message: fmt.Sprintf("SQLite保存に失敗しました: %v", err)}), nil
 		}
 		a.conns = append(a.conns, connection)
-		return ActionResult{OK: true, Message: fmt.Sprintf("%s を登録しました", connection.Name), ID: connection.ID}
+		a.forgetSecretsLocked(connection.ID)
+		return ActionResult{OK: true, Message: fmt.Sprintf("%s を登録しました", connection.Name), ID: connection.ID}, nil
 	}
 
 	previous := a.conns[index]
-	if connection.Type != "Serial" && connection.usesPassword() && previous.usesPassword() && connection.Credential == "" {
-		connection.Credential = previous.Credential // write-only field left blank: keep it
+	if connection.Type != "Serial" && connection.usesPassword() && previous.usesPassword() && !newPassword {
+		// write-only field left blank: keep it (a keychain reference keeps
+		// CredentialSet, a legacy row its plaintext)
+		connection.Credential = previous.Credential
+		connection.CredentialSet = previous.CredentialSet
 	}
 	connection.LastTestResult = previous.LastTestResult
 	connection.LastTestAt = previous.LastTestAt
 	connection.LastTestMessage = previous.LastTestMessage
 	updated, err := a.store.updateConnection(connection)
 	if err != nil {
-		return ActionResult{OK: false, Message: fmt.Sprintf("SQLite保存に失敗しました: %v", err)}
+		return ActionResult{OK: false, Message: fmt.Sprintf("SQLite保存に失敗しました: %v", err)}, nil
 	}
 	if !updated {
-		return ActionResult{OK: false, Message: "編集中の接続先は削除されています。新規として保存し直してください"}
+		return ActionResult{OK: false, Message: "編集中の接続先は削除されています。新規として保存し直してください"}, nil
 	}
 	if previous.Name != connection.Name {
 		if err := a.store.updatePendingRequestsConnection(previous.Name, connection.ID, connection.Name); err != nil {
@@ -1045,11 +1166,54 @@ func (a *App) saveConnection(connection Connection) ActionResult {
 			}
 		}
 	}
-	if !sameTarget(previous, connection) {
+	// Keychain passwords compare equal ("" on both sides), so a newly typed
+	// one counts as a different target.
+	if newPassword || !sameTarget(previous, connection) {
 		delete(a.sshPassphrases, connection.ID)
 	}
+	a.forgetSecretsLocked(connection.ID)
+	if newPassword && a.sessionSecrets != nil {
+		// The saved password now wins over one given for this session.
+		_ = a.sessionSecrets.Delete(context.Background(), passwordAccount(connection.ID))
+	}
 	a.conns[index] = connection
-	return ActionResult{OK: true, Message: fmt.Sprintf("%s の設定を保存しました", connection.Name), ID: connection.ID}
+	result := ActionResult{OK: true, Message: fmt.Sprintf("%s の設定を保存しました", connection.Name), ID: connection.ID}
+	prev, next := previous, connection
+	return result, func(r ActionResult) ActionResult { return a.afterSerialSave(prev, next, r) }
+}
+
+// saveConflict is the name check of saveConnection, made before a
+// keychain write so a save that is going to fail does not overwrite the
+// stored password first. saveConnection checks again under a.mu.
+func (a *App) saveConflict(connection Connection) string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	found := connection.ID == ""
+	for _, c := range a.conns {
+		if connection.ID != "" && c.ID == connection.ID {
+			found = true
+			continue
+		}
+		if c.Name == connection.Name {
+			return fmt.Sprintf("「%s」という名前の接続先は既にあります。別の名前にしてください", connection.Name)
+		}
+	}
+	if !found {
+		return "編集中の接続先は削除されています。新規として保存し直してください"
+	}
+	return ""
+}
+
+// abandonNewSecret queues the keychain item written for a new connection
+// whose row was then not inserted. Callers hold a.mu (the queue is SQLite
+// only; SaveConnection runs the GC after releasing it).
+func (a *App) abandonNewSecret(isNew bool, newPassword bool, connection Connection, r ActionResult) ActionResult {
+	if isNew && newPassword {
+		if err := a.store.enqueueSecretGC(passwordAccount(connection.ID)); err != nil {
+			log.Printf("queue password for gc: %v", err)
+		}
+	}
+	return r
 }
 
 func (a *App) DeleteConnection(id string) ActionResult {
@@ -1060,8 +1224,17 @@ func (a *App) DeleteConnection(id string) ActionResult {
 	if a.store == nil {
 		return ActionResult{OK: false, Message: errStoreUnavailable.Error()}
 	}
-	if err := a.store.deleteConnection(conn.ID); err != nil {
+	a.secretMu.Lock()
+	err := a.store.deleteConnection(conn.ID) // queues its keychain items
+	if err == nil {
+		a.collectSecretGC()
+	}
+	a.secretMu.Unlock()
+	if err != nil {
 		return ActionResult{OK: false, Message: fmt.Sprintf("%s の削除に失敗しました: %v", conn.Name, err)}
+	}
+	if a.sessionSecrets != nil {
+		a.sessionSecrets.deletePrefix(connSecretPrefix(conn.ID))
 	}
 	a.closeTerminalsForConnection(conn.ID)
 
@@ -1074,6 +1247,7 @@ func (a *App) DeleteConnection(id string) ActionResult {
 	}
 	a.conns = next
 	delete(a.sshPassphrases, conn.ID)
+	a.forgetSecretsLocked(conn.ID)
 	a.mu.Unlock()
 	a.sessionsChanged()
 
@@ -1553,6 +1727,10 @@ func (a *App) resolveConnection(ref string) (Connection, []string, bool) {
 }
 
 func explainSSHError(conn Connection, err error) string {
+	var credErr *credentialError
+	if errors.As(err, &credErr) {
+		return credentialMessage(credErr)
+	}
 	message := err.Error()
 	lower := strings.ToLower(message)
 	if strings.Contains(lower, "unable to authenticate") {
@@ -1626,26 +1804,6 @@ func normalizeConnection(connection Connection) Connection {
 		connection.Tags = []string{}
 	}
 	return connection
-}
-
-var (
-	serialParities = []string{"none", "odd", "even", "mark", "space"}
-	serialStopBits = []string{"1", "1.5", "2"}
-)
-
-// validateSerialParams checks a normalized serial connection's line settings
-// and returns a user-facing message, or "" when they are valid.
-func validateSerialParams(conn Connection) string {
-	if conn.DataBits < 5 || conn.DataBits > 8 {
-		return "データビットは 5〜8 で指定してください"
-	}
-	if !slices.Contains(serialParities, conn.Parity) {
-		return "パリティは none / odd / even / mark / space のいずれかを指定してください"
-	}
-	if !slices.Contains(serialStopBits, conn.StopBits) {
-		return "ストップビットは 1 / 1.5 / 2 のいずれかを指定してください"
-	}
-	return ""
 }
 
 func appConfigDir() string {

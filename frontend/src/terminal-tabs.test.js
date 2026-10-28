@@ -20,7 +20,9 @@ vi.mock('@xterm/xterm', () => ({
     open(el) { this.element = document.createElement('div'); el.appendChild(this.element); }
     onData(cb) { this.cb = cb; return { dispose: () => { this.cb = null; } }; }
     write(d) { this.written.push(typeof d === 'string' ? d : new TextDecoder().decode(d)); }
-    focus() {}
+    focus() { this.focused = (this.focused ?? 0) + 1; }
+    blur() { this.blurred = (this.blurred ?? 0) + 1; }
+    attachCustomKeyEventHandler(fn) { this.keyHandlers = [...(this.keyHandlers ?? []), fn]; }
     dispose() { this.disposed = true; }
   },
 }));
@@ -174,6 +176,39 @@ describe('terminal-tabs', () => {
     expect(res.ok).toBe(true);
   });
 
+  it('needs_password / keyring_unavailable go through ctx.recoverCredential once', async () => {
+    api.StartTerminal.mockResolvedValueOnce({ ok: false, code: 'needs_password', message: 'gone' }).mockResolvedValueOnce({ ok: true });
+    ctx.recoverCredential = vi.fn(async () => true);
+    const res = await mod.openTerminalTab('c1');
+    expect(ctx.recoverCredential).toHaveBeenCalledTimes(1);
+    expect(ctx.recoverCredential.mock.calls[0][1]).toMatchObject({ code: 'needs_password' });
+    expect(api.StartTerminal).toHaveBeenCalledTimes(2);
+    expect(res.ok).toBe(true);
+
+    // Dismissed: the tab goes away without a toast; no third start.
+    api.StartTerminal.mockReset();
+    api.StartTerminal.mockResolvedValue({ ok: false, code: 'keyring_unavailable', message: 'locked' });
+    ctx.recoverCredential = vi.fn(async () => false);
+    ctx.toast.mockClear();
+    const dismissed = await mod.openTerminalTab('c1');
+    expect(dismissed).toMatchObject({ ok: false, code: 'canceled' });
+    expect(api.StartTerminal).toHaveBeenCalledTimes(1);
+    expect(ctx.toast).not.toHaveBeenCalled();
+    expect(mod.terminalTabCount('c1')).toBe(1);
+  });
+
+  it('keeps the exit reason for the toolbar and clears it on reconnect', async () => {
+    api.StartTerminal.mockResolvedValue({ ok: true });
+    const { id } = await mod.openTerminalTab('c1');
+    handlers['terminal:exit']({ id, reason: 'device_removed' });
+    const entry = mod.getTerminalState().tabs.get(id);
+    expect(entry.status).toBe('exited');
+    expect(entry.exitReason).toBe('device_removed');
+    await mod.reconnectTerminalTab(id);
+    expect(entry.exitReason).toBe('');
+    expect(entry.id).not.toBe(id);
+  });
+
   it('failure removes tab and toasts', async () => {
     api.StartTerminal.mockResolvedValue({ ok: false, code: 'connect_failed', message: 'boom' });
     const res = await mod.openTerminalTab('c1');
@@ -225,5 +260,93 @@ describe('terminal-tabs', () => {
     expect(api.CloseTerminal).toHaveBeenCalledWith(id);
     expect(mod.terminalTabCount()).toBe(0);
     expect(await mod.handleTerminalClick({ target: document.body }, ctx)).toBe(false);
+  });
+
+  it('attaches ctx.terminalKeyHandler to each new xterm once, and keeps it on reconnect', async () => {
+    api.StartTerminal.mockResolvedValue({ ok: true });
+    const handler = vi.fn(() => true);
+    ctx.terminalKeyHandler = handler;
+    const a = await mod.openTerminalTab('c1');
+    const b = await mod.openTerminalTab('c2');
+    const { tabs } = mod.getTerminalState();
+    expect(tabs.get(a.id).xterm.keyHandlers).toEqual([handler]);
+    expect(tabs.get(b.id).xterm.keyHandlers).toEqual([handler]);
+    handlers['terminal:exit']({ id: a.id, reason: 'conn_lost' });
+    const x = tabs.get(a.id).xterm;
+    await mod.reconnectTerminalTab(a.id);
+    expect(x.keyHandlers).toEqual([handler]);
+  });
+
+  it('without ctx.terminalKeyHandler nothing is attached', async () => {
+    api.StartTerminal.mockResolvedValue({ ok: true });
+    const { id } = await mod.openTerminalTab('c1');
+    expect(mod.getTerminalState().tabs.get(id).xterm.keyHandlers).toBeUndefined();
+  });
+
+  it('renderTerminalNewShell is the .term-new part only and stays wired to term-new', async () => {
+    api.StartTerminal.mockResolvedValue({ ok: true });
+    const root = document.getElementById('page-root');
+    root.innerHTML = mod.renderTerminalNewShell(ctx.state, ctx.t);
+    expect(root.querySelectorAll('.term-new')).toHaveLength(1);
+    expect(root.querySelector('.term-tabs')).toBeNull();
+    expect([...root.querySelectorAll('option')].map((o) => o.value)).toEqual(['c1', 'c2']);
+    root.querySelector('[data-action="term-new-select"]').value = 'c2';
+    mod.handleTerminalChange({ target: root.querySelector('[data-action="term-new-select"]') });
+    expect(await mod.handleTerminalClick({ target: root.querySelector('[data-action="term-new"]') }, ctx)).toBe(true);
+    expect(api.StartTerminal.mock.calls[0][1]).toBe('c2');
+    // A user-controlled name reaches the page escaped.
+    const evil = { data: { connections: [{ id: 'cx', name: '<img src=x onerror=alert(1)>', type: 'SSH' }] } };
+    root.innerHTML = mod.renderTerminalNewShell(evil, ctx.t);
+    expect(root.querySelector('img')).toBeNull();
+    expect(root.querySelector('option').textContent).toContain('<img src=x onerror=alert(1)>');
+  });
+
+  it('renderTerminalPage with serverFilter lists that connection only and drops .term-new', async () => {
+    api.StartTerminal.mockResolvedValue({ ok: true });
+    const a = await mod.openTerminalTab('c1');
+    const b = await mod.openTerminalTab('c2');
+    const root = document.getElementById('page-root');
+    root.innerHTML = mod.renderTerminalPage(ctx.state, ctx.t, { serverFilter: 'c1' });
+    expect([...root.querySelectorAll('[data-action="term-activate"]')].map((el) => el.dataset.termId)).toEqual([a.id]);
+    expect(root.querySelector('.term-new')).toBeNull();
+    root.innerHTML = mod.renderTerminalPage(ctx.state, ctx.t);
+    expect([...root.querySelectorAll('[data-action="term-activate"]')].map((el) => el.dataset.termId)).toEqual([a.id, b.id]);
+    expect(root.querySelector('.term-new')).not.toBeNull();
+    mod.closeTabsForConnection('c1');
+    root.innerHTML = mod.renderTerminalPage(ctx.state, ctx.t, { serverFilter: 'c1' });
+    expect(root.querySelector('.term-empty').textContent).toContain('tabs.emptyFiltered:{"name":"web-01"}');
+    expect(mod.renderTerminalEmpty(ctx.state, ctx.t)).toContain('tabs.emptyHint');
+  });
+
+  it('setTerminalServerFilter hides and blurs other panes; close stays on the same server', async () => {
+    api.StartTerminal.mockResolvedValue({ ok: true });
+    const a1 = await mod.openTerminalTab('c1');
+    const b1 = await mod.openTerminalTab('c2');
+    const a2 = await mod.openTerminalTab('c1');
+    const { tabs } = mod.getTerminalState();
+    mod.activateTerminalTab(b1.id);
+    expect(mod.setTerminalServerFilter('c1')).toBe(true);
+    expect(mod.setTerminalServerFilter('c1')).toBe(false);
+    expect(mod.getTerminalServerFilter()).toBe('c1');
+    expect(tabs.get(a1.id).pane.hidden).toBe(false);
+    expect(tabs.get(a2.id).pane.hidden).toBe(false);
+    expect(tabs.get(b1.id).pane.hidden).toBe(true);
+    expect(tabs.get(b1.id).xterm.blurred).toBe(1);
+    // A hidden active pane is never focused or measured.
+    const before = tabs.get(b1.id).xterm.focused ?? 0;
+    mod.activateTerminalTab(b1.id);
+    await tick();
+    expect(tabs.get(b1.id).xterm.focused ?? 0).toBe(before);
+    expect(tabs.get(b1.id).needsFit).toBe(true);
+    // New tabs of another connection start hidden.
+    const b2 = await mod.openTerminalTab('c2');
+    expect(tabs.get(b2.id).pane.hidden).toBe(true);
+    // Closing the active c1 tab picks the other c1 tab, not the c2 neighbour.
+    mod.activateTerminalTab(a1.id);
+    await mod.closeTerminalTab(a1.id);
+    expect(mod.getTerminalState().activeId).toBe(a2.id);
+    // Back to all: every pane may show again.
+    expect(mod.setTerminalServerFilter('')).toBe(true);
+    for (const entry of tabs.values()) expect(entry.pane.hidden).toBe(false);
   });
 });

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"regexp"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -48,12 +47,17 @@ const (
 // terminalIDPattern matches the frontend-issued tab id (TERM-<uuid>).
 var terminalIDPattern = regexp.MustCompile(`^TERM-[A-Za-z0-9-]{1,64}$`)
 
-// terminalState is embedded in App; every field is guarded by termMu.
+// terminalState is embedded in App; the maps are guarded by termMu.
 type terminalState struct {
 	termMu       sync.Mutex
 	terms        map[string]*terminalSession // key: session id
-	serialOwners map[string]string           // normalized port -> session id
+	serialOwners map[string]string           // serialReservationKey -> session id
 	lastErr      map[string]string           // connID -> last abnormal end / failed start
+
+	// terminalLoops counts the input pumps and serial read loops, so tests
+	// can wait for them before restoring package variables.
+	terminalLoops sync.WaitGroup
+	serialPresenceCache
 }
 
 // ensureMaps lazily creates the maps (NewApp does not know about them).
@@ -88,6 +92,9 @@ type TerminalInfo struct {
 	Baud      int    `json:"baud,omitempty"` // serial only
 	StartedAt string `json:"startedAt"`      // RFC3339
 	Status    string `json:"status"`         // "connecting" | "open"
+	// SerialMode is the line format in effect, e.g. "8N1" (serial only). It
+	// changes when settings are applied in place.
+	SerialMode string `json:"serialMode,omitempty"`
 }
 
 // terminalSession is one tab. SSH and serial both build one; it owns its
@@ -95,8 +102,9 @@ type TerminalInfo struct {
 // Fields below the line are guarded by termMu.
 type terminalSession struct {
 	id, connID, connName, kind, port string
-	normPort                         string // serial only; key in serialOwners
-	baud                             int
+	normPort                         string        // serial only; serialReservationKey, key in serialOwners
+	serial                           *serialHandle // serial only
+	baud                             int           // guarded by termMu (applySerialSettings changes it)
 	startedAt                        time.Time
 	cancel                           context.CancelFunc
 	input                            chan []byte
@@ -111,6 +119,27 @@ type terminalSession struct {
 	reason     string
 	resize     func(cols, rows int) error
 	closer     func()
+}
+
+// serialHandle owns the open port of one serial tab.
+type serialHandle struct {
+	// port is set once, before the tab turns open; read only after that.
+	port serialPort
+	// applyMu serializes applyNow calls of this tab. Taken before termMu and
+	// writeMu, never while holding either.
+	applyMu sync.Mutex
+	// writeMu is a leaf lock: it is held only around port.Write, port.Drain
+	// and port.SetMode, so input and an in-place SetMode never overlap.
+	writeMu  sync.Mutex
+	settings serialSettings  // guarded by termMu: what the port is set to
+	pending  *serialSettings // guarded by termMu: applied while connecting
+}
+
+// Write is the serial tab's stdin; only pumpTerminalInput calls it.
+func (h *serialHandle) Write(p []byte) (int, error) {
+	h.writeMu.Lock()
+	defer h.writeMu.Unlock()
+	return h.port.Write(p)
 }
 
 func (t *terminalSession) markDone() {
@@ -279,19 +308,21 @@ func (a *App) StartTerminal(id string, connID string, cols int, rows int) Action
 	}
 	if conn.connectionType() == "Serial" {
 		ts.kind = "serial"
-		ts.port = conn.SerialPort
-		if ts.port == "" {
-			ts.port = conn.Host // tolerate device path stored in host
-		}
+		ts.port = strings.TrimSpace(conn.SerialPort)
 		if ts.port == "" {
 			cancel()
-			return ActionResult{OK: false, Code: "connect_failed", Message: "シリアルポートが設定されていません", SessionID: id, ID: conn.ID}
+			return ActionResult{OK: false, Code: "invalid_serial_mode", Message: "シリアルポートが設定されていません", SessionID: id, ID: conn.ID}
 		}
-		ts.normPort = normalizeSerialPort(runtime.GOOS, ts.port)
-		ts.baud = conn.BaudRate
-		if ts.baud <= 0 {
-			ts.baud = 115200
+		// Validate before reserving or opening: on windows a rejected mode
+		// costs the port (phase4-serial-patch §2.3, L7).
+		settings := serialSettingsOf(conn)
+		if err := validateSerialSettings(serialGOOS, settings); err != nil {
+			cancel()
+			return ActionResult{OK: false, Code: "invalid_serial_mode", Message: err.Error(), SessionID: id, ID: conn.ID}
 		}
+		ts.normPort = serialReservationKey(serialGOOS, ts.port) // stats the path: outside termMu
+		ts.baud = settings.Baud
+		ts.serial = &serialHandle{settings: settings}
 	}
 
 	a.termMu.Lock()
@@ -303,13 +334,16 @@ func (a *App) StartTerminal(id string, connID string, cols int, rows int) Action
 	}
 	if ts.kind == "serial" {
 		if owner, held := a.serialOwners[ts.normPort]; held {
-			ownerName := ""
+			message := fmt.Sprintf("%s は別のターミナルで使用中です", ts.port)
 			if other := a.terms[owner]; other != nil {
-				ownerName = other.connName
+				message = fmt.Sprintf("%s は「%s」のターミナルで使用中です", ts.port, other.connName)
+				if other.port != ts.port {
+					message += fmt.Sprintf("（%s と同じデバイス）", other.port)
+				}
 			}
 			a.termMu.Unlock()
 			cancel()
-			return ActionResult{OK: false, Code: "port_in_use", Message: fmt.Sprintf("%s は %s のターミナルで使用中です", ts.port, ownerName), SessionID: id, ID: conn.ID}
+			return ActionResult{OK: false, Code: "port_in_use", Message: message, SessionID: id, ID: conn.ID}
 		}
 		a.serialOwners[ts.normPort] = id
 	}
@@ -329,6 +363,12 @@ func (a *App) StartTerminal(id string, connID string, cols int, rows int) Action
 	}
 	if err != nil {
 		return a.failTerminalStart(ctx, ts, conn, message, err)
+	}
+	if ts.kind == "serial" {
+		a.termMu.Lock()
+		settings := ts.serial.settings
+		a.termMu.Unlock()
+		return ActionResult{OK: true, Message: fmt.Sprintf("%s @ %d %s に接続しました", ts.port, settings.Baud, settings.label()), SessionID: id, ID: conn.ID}
 	}
 	return ActionResult{OK: true, Message: fmt.Sprintf("%s に接続しました", conn.Name), SessionID: id, ID: conn.ID}
 }
@@ -357,12 +397,18 @@ func (a *App) failTerminalStart(ctx context.Context, ts *terminalSession, conn C
 
 	result := ActionResult{OK: false, Message: message, SessionID: ts.id, ID: conn.ID}
 	var missing *passphraseMissingError
+	var credErr *credentialError
+	var serialErr *serialStartError
 	switch {
 	case canceled:
 		result.Code = "canceled"
 		result.Message = "接続を中止しました"
 	case errors.As(err, &missing):
 		result.Code = "needs_passphrase"
+	case errors.As(err, &credErr):
+		result.Code = credErr.code
+	case errors.As(err, &serialErr):
+		result.Code = serialErr.code
 	default:
 		result.Code = "connect_failed"
 	}
@@ -395,8 +441,12 @@ func (a *App) commitTerminal(ts *terminalSession, resize func(cols, rows int) er
 	cols, rows = ts.cols, ts.rows
 	a.ensureMaps()
 	delete(a.lastErr, ts.connID)
+	a.terminalLoops.Add(1)
 	a.termMu.Unlock()
-	go a.pumpTerminalInput(ts)
+	go func() {
+		defer a.terminalLoops.Done()
+		a.pumpTerminalInput(ts)
+	}()
 	a.sessionsChanged()
 	return cols, rows, true
 }
@@ -404,6 +454,17 @@ func (a *App) commitTerminal(ts *terminalSession, resize func(cols, rows int) er
 // openSSHTerminal dials a dedicated client and starts a PTY shell. On error it
 // returns the user-facing message.
 func (a *App) openSSHTerminal(ctx context.Context, ts *terminalSession, conn Connection, strictHostKey bool) (string, error) {
+	// The keychain read is cancelled with the tab (CloseTerminal while it
+	// waits for an unlock dialog).
+	credCtx, credCancel := context.WithTimeout(ctx, guiCredentialTimeout)
+	conn, err := a.resolveCredential(credCtx, conn)
+	credCancel()
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", errTerminalCanceled
+		}
+		return explainSSHError(conn, err), err
+	}
 	dialCtx, dialCancel := context.WithTimeout(ctx, timeoutSeconds(conn.ConnectTimeout, 10))
 	client, err := openSSHClient(dialCtx, conn, strictHostKey)
 	dialCancel()
@@ -489,57 +550,173 @@ func (a *App) openSSHTerminal(ctx context.Context, ts *terminalSession, conn Con
 	return "", nil
 }
 
-// openSerialTerminal opens the reserved port and streams its bytes.
+// openSerialTerminal opens the reserved port with the full line settings and
+// starts its read loop. A failure returns a *serialStartError carrying the
+// StartTerminal code.
 func (a *App) openSerialTerminal(ctx context.Context, ts *terminalSession) (string, error) {
-	port, err := serial.Open(ts.port, &serial.Mode{BaudRate: ts.baud})
+	h := ts.serial
+	a.termMu.Lock()
+	settings := h.settings
+	a.termMu.Unlock()
+	// The open is a blocking syscall that ctx cannot interrupt (O_NDELAY makes
+	// it return at once in practice); a cancel is honored once it returns.
+	port, err := openSerialPort(normalizeSerialPort(serialGOOS, ts.port), settings.mode())
 	if err != nil {
 		if ctx.Err() != nil {
 			return "", errTerminalCanceled
 		}
-		return fmt.Sprintf("%s を開けません: %v", ts.port, err), err
+		code, message := serialOpenError(serialGOOS, ts.port, err)
+		return message, &serialStartError{code: code, err: err}
 	}
-	ts.stdinWriter = port
+	if ctx.Err() != nil {
+		_ = port.Close()
+		return "", errTerminalCanceled
+	}
+	// Written before commitTerminal takes termMu, so whoever sees the tab
+	// open (under termMu) also sees the port.
+	h.port = port
+	ts.stdinWriter = h
 	if _, _, ok := a.commitTerminal(ts, nil, func() { _ = port.Close() }); !ok {
 		_ = port.Close()
 		return "", errTerminalCanceled
 	}
+	a.terminalLoops.Add(1)
 	go func() {
-		buf := make([]byte, 4096)
-		for {
-			n, readErr := port.Read(buf)
-			if n > 0 {
-				_, _ = ts.out.Write(buf[:n])
-			}
-			if readErr != nil {
-				break
-			}
-			if n == 0 {
-				// go.bug.st/serial returns 0, nil when the device vanishes on
-				// some platforms; treat it like a read error.
-				break
-			}
-		}
-		label := fmt.Sprintf("%s @ %d", ts.port, ts.baud)
-		if serialPortPresent(ts.normPort) {
-			a.finishTerminal(ts, exitReasonIOError, nil, fmt.Sprintf("%s の読み込みに失敗しました", label))
-		} else {
-			a.finishTerminal(ts, exitReasonDeviceRemoved, nil, fmt.Sprintf("%s が取り外されました", label))
-		}
+		defer a.terminalLoops.Done()
+		a.serialReadLoop(ts)
 	}()
+	a.termMu.Lock()
+	pending := h.pending
+	h.pending = nil
+	a.termMu.Unlock()
+	if pending != nil {
+		_, _ = a.applyNow(ts, *pending) // on failure the open settings stay
+	}
 	return "", nil
 }
 
-func serialPortPresent(normPort string) bool {
-	ports, err := serial.GetPortsList()
-	if err != nil {
-		return false
+// serialReadLoop streams the port into the tab until a read fails, then
+// decides between device_removed and io_error.
+func (a *App) serialReadLoop(ts *terminalSession) {
+	h := ts.serial
+	buf := make([]byte, 4096)
+	for {
+		n, err := h.port.Read(buf)
+		if n > 0 {
+			_, _ = ts.out.Write(buf[:n])
+		}
+		if err == nil {
+			continue // only a read timeout returns 0, nil; none is set
+		}
+		a.endSerialTerminal(ts, err)
+		return
 	}
-	for _, p := range ports {
-		if normalizeSerialPort(runtime.GOOS, p) == normPort {
-			return true
+}
+
+// endSerialTerminal ends a serial tab after a read or write error. A failure
+// caused by our own Close is ignored: finishTerminal and closeTerminalSession
+// set the reason before the closer runs. Called without locks (it sleeps
+// while probing for the device).
+func (a *App) endSerialTerminal(ts *terminalSession, err error) {
+	if a.terminalClosing(ts) {
+		return
+	}
+	reason, message := serialEndReason(serialGOOS, ts.port, err)
+	a.finishTerminal(ts, reason, nil, message)
+}
+
+func (a *App) terminalClosing(ts *terminalSession) bool {
+	a.termMu.Lock()
+	defer a.termMu.Unlock()
+	return ts.reason != ""
+}
+
+// applySerialSettings pushes new line settings to the serial tab of connID
+// without reopening the port (no DTR toggle, so the board is not reset). It
+// reports whether a tab took them; a connecting tab gets them right after
+// its open. Call without locks (SaveConnection calls it after a.mu).
+func (a *App) applySerialSettings(connID string, s serialSettings) (applied bool, err error) {
+	if err := validateSerialSettings(serialGOOS, s); err != nil {
+		return false, err
+	}
+	a.termMu.Lock()
+	a.ensureMaps()
+	var ts *terminalSession
+	for _, t := range a.terms {
+		// The port reservation allows one serial tab per device, hence per
+		// connection: the first match is the only one.
+		if t.connID == connID && t.kind == "serial" && t.serial != nil && t.reason == "" {
+			ts = t
+			break
 		}
 	}
-	return false
+	if ts == nil {
+		a.termMu.Unlock()
+		return false, nil
+	}
+	if ts.status == terminalStatusConnecting {
+		cp := s
+		ts.serial.pending = &cp
+		a.termMu.Unlock()
+		return true, nil
+	}
+	a.termMu.Unlock()
+	return a.applyNow(ts, s)
+}
+
+// applyNow drains queued output and sets the new mode. On unix a failed
+// SetMode is rolled back (a special baud can leave termios half-changed); on
+// windows the library has already closed the port, so the tab ends with
+// io_error.
+func (a *App) applyNow(ts *terminalSession, s serialSettings) (bool, error) {
+	h := ts.serial
+	h.applyMu.Lock()
+	a.termMu.Lock()
+	prev := h.settings
+	a.termMu.Unlock()
+	if prev == s {
+		h.applyMu.Unlock()
+		return true, nil
+	}
+	goos := serialGOOS
+	h.writeMu.Lock()
+	drainWithTimeout(h.port, serialDrainTimeout)
+	err := h.port.SetMode(s.mode())
+	if err != nil && goos != "windows" {
+		_ = h.port.SetMode(prev.mode())
+	}
+	h.writeMu.Unlock()
+	if err == nil {
+		a.termMu.Lock()
+		h.settings = s
+		ts.baud = s.Baud
+		a.termMu.Unlock()
+	}
+	h.applyMu.Unlock()
+	if err != nil {
+		if goos == "windows" {
+			a.finishTerminal(ts, exitReasonIOError, nil, fmt.Sprintf("%s の通信設定を変更できず、ポートが閉じられました: %v", ts.port, err))
+		}
+		return false, err
+	}
+	a.sessionsChanged()
+	return true, nil
+}
+
+// drainWithTimeout waits for queued output to leave, but not for ever: a
+// removed device may never finish draining.
+func drainWithTimeout(p serialPort, d time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		_ = p.Drain()
+		close(done)
+	}()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	}
 }
 
 // pumpTerminalInput is the single writer to the session's stdin, so input
@@ -551,6 +728,12 @@ func (a *App) pumpTerminalInput(ts *terminalSession) {
 			return
 		case data := <-ts.input:
 			if _, err := ts.stdinWriter.Write(data); err != nil {
+				if ts.kind == "serial" {
+					// Right after an unplug the write side often fails first
+					// (ENXIO / EIO): classify it like a read failure.
+					a.endSerialTerminal(ts, err)
+					return
+				}
 				// A write usually fails because the remote side just closed
 				// (typing ahead after `exit`). Let the session's own end win:
 				// it reports remote_exit with the exit code after every
@@ -782,6 +965,9 @@ func (a *App) listTerminalInfos() []TerminalInfo {
 		if ts.kind == "serial" {
 			info.Port = ts.port
 			info.Baud = ts.baud
+			if ts.serial != nil {
+				info.SerialMode = ts.serial.settings.label()
+			}
 		}
 		infos = append(infos, info)
 		started[ts.id] = ts.startedAt
@@ -833,22 +1019,6 @@ func (a *App) serialPortInUse(connID string) bool {
 	return false
 }
 
-// serialPortOwnerName returns the connection name of the tab holding the
-// (normalized) port, if any.
-func (a *App) serialPortOwnerName(normPort string) (string, bool) {
-	a.termMu.Lock()
-	defer a.termMu.Unlock()
-	a.ensureMaps()
-	owner, ok := a.serialOwners[normPort]
-	if !ok {
-		return "", false
-	}
-	if ts := a.terms[owner]; ts != nil {
-		return ts.connName, true
-	}
-	return "", true
-}
-
 // normalizeSerialPort maps the names one device can go by to a single key:
 // on darwin /dev/tty.X and /dev/cu.X are the same device; on Windows `\\.\`
 // is optional and names are case-insensitive.
@@ -879,32 +1049,31 @@ func (a *App) ListSerialPorts() []string {
 
 // testSerialConnection checks that the port exists without opening it:
 // opening toggles DTR, which resets many boards, and fails with EBUSY while
-// our own terminal holds the port.
+// our own terminal holds the port. Code is in_use / available / missing.
 func (a *App) testSerialConnection(conn Connection) ActionResult {
-	if conn.SerialPort == "" {
-		return ActionResult{OK: false, Message: "シリアルポートが設定されていません"}
+	port := strings.TrimSpace(conn.SerialPort)
+	if port == "" {
+		return ActionResult{OK: false, Message: "シリアルポートが設定されていません", ID: conn.ID}
 	}
-	normPort := normalizeSerialPort(runtime.GOOS, conn.SerialPort)
+	goos := serialGOOS
 	if a.serialPortInUse(conn.ID) {
-		return ActionResult{OK: true, Message: fmt.Sprintf("%s は使用中です（このアプリのターミナルで接続中）", conn.SerialPort), ID: conn.ID}
+		return ActionResult{OK: true, Code: "in_use", Message: fmt.Sprintf("%s は使用中です（このアプリのターミナルで接続中）", port), ID: conn.ID}
 	}
-	if owner, held := a.serialPortOwnerName(normPort); held {
-		return ActionResult{OK: true, Message: fmt.Sprintf("%s は使用中です（%s のターミナルで接続中）", conn.SerialPort, owner), ID: conn.ID}
+	if _, owner, held := a.serialOwnerOf(goos, port); held {
+		return ActionResult{OK: true, Code: "in_use", Message: fmt.Sprintf("%s は使用中です（%s のターミナルで接続中）", port, owner), ID: conn.ID}
 	}
-	ports, err := serial.GetPortsList()
+	present, err := serialPortPresent(goos, port)
 	if err != nil {
-		return ActionResult{OK: false, Message: "シリアルポートを列挙できません: " + err.Error(), ID: conn.ID}
+		return ActionResult{OK: false, Message: fmt.Sprintf("%s を確認できません: %v", port, err), ID: conn.ID}
 	}
-	for _, port := range ports {
-		if normalizeSerialPort(runtime.GOOS, port) == normPort {
-			message := fmt.Sprintf("%s を検出しました（利用可能）", conn.SerialPort)
-			a.recordConnectionTest(conn, "ok", message)
-			return ActionResult{OK: true, Message: message, ID: conn.ID}
-		}
+	if present {
+		message := fmt.Sprintf("%s を検出しました（利用可能）", port)
+		a.recordConnectionTest(conn, "ok", message)
+		return ActionResult{OK: true, Code: "available", Message: message, ID: conn.ID}
 	}
-	message := fmt.Sprintf("%s が見つかりません。ケーブルの接続を確認してください", conn.SerialPort)
+	message := fmt.Sprintf("%s が見つかりません。ケーブルの接続を確認してください", port)
 	a.recordConnectionTest(conn, "failed", message)
-	return ActionResult{OK: false, Message: message, ID: conn.ID}
+	return ActionResult{OK: false, Code: "missing", Message: message, ID: conn.ID}
 }
 
 var _ io.Writer = (*outputBuffer)(nil)

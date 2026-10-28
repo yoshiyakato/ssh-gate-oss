@@ -25,6 +25,8 @@ vi.mock('@xterm/xterm', () => ({
     onData() { return { dispose() {} }; }
     write(data) { this.written.push(typeof data === 'string' ? data : new TextDecoder().decode(data)); }
     focus() {}
+    blur() {}
+    attachCustomKeyEventHandler(fn) { this.keyHandler = fn; }
     dispose() {}
   },
 }));
@@ -63,6 +65,8 @@ vi.mock('../wailsjs/go/main/App', () => {
     DisconnectConnection: ok(),
     DeleteConnection: ok(),
     ListSerialPorts: async () => [],
+    GetApprovalTarget: async (id) => ({ requestId: id, found: true, executable: true, fpChanged: false }),
+    PlaintextBackups: async () => [],
     ApproveCommand: async (id, command) => {
       backend.approve.push([id, command]);
       return { ok: true, message: '' };
@@ -138,7 +142,8 @@ describe('main.js integration', () => {
 
   it('keeps tabs and xterm nodes across navigation and polling, while the sidebar updates', async () => {
     await click('[data-nav="terminal"]');
-    expect(document.querySelector('#terminal-stack').hidden).toBe(false);
+    // No tab yet: the stack stays hidden (phase4 §2.4 stackVisible).
+    expect(document.querySelector('#terminal-stack').hidden).toBe(true);
     const select = document.querySelector('[data-action="term-new-select"]');
     select.value = 'c1';
     await click('[data-action="term-new"]');
@@ -149,7 +154,9 @@ describe('main.js integration', () => {
     const panes = [...document.querySelectorAll('.term-pane')];
     const xterms = [...document.querySelectorAll('.term-pane .xterm')];
     expect(panes).toHaveLength(3);
-    expect([...document.querySelectorAll('.term-tab')].map((tab) => tab.textContent.trim().split(/\s/)[0])).toEqual(['web-01', 'web-01', 'db-01']);
+    expect(document.querySelector('#terminal-stack').hidden).toBe(false);
+    // The tab strip is #shell-subtabs (servertabs.js) since phase 4.
+    expect([...document.querySelectorAll('#shell-subtabs .shell-subtab')].map((tab) => tab.textContent.trim().split(/\s/)[0])).toEqual(['web-01', 'web-01', 'db-01']);
 
     // Navigate away and back: nothing is torn down.
     await click('[data-nav="connections"]');
@@ -185,7 +192,7 @@ describe('main.js integration', () => {
 
   it('closing one tab keeps the others', async () => {
     const before = document.querySelectorAll('.term-pane').length;
-    await click('.term-tab-close');
+    await click('.term-active-actions [data-action="term-close"]');
     expect(document.querySelectorAll('.term-pane')).toHaveLength(before - 1);
   });
 

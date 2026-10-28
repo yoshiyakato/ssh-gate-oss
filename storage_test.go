@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -143,8 +145,8 @@ func TestMigrationV2ToV3(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store2.Close()
-	if store2.prevVersion != schemaVersion || fileExists(path+".bak-v3") {
-		t.Fatalf("v3 reopen migrated again")
+	if store2.prevVersion != schemaVersion || fileExists(fmt.Sprintf("%s.bak-v%d", path, schemaVersion)) {
+		t.Fatalf("v%d reopen migrated again", schemaVersion)
 	}
 }
 
@@ -542,5 +544,560 @@ func TestLoadCommandHistory(t *testing.T) {
 	}
 	if _, found, _ := store.loadCommandRequest("REQ-missing"); found {
 		t.Fatalf("missing request found")
+	}
+}
+
+// --- OS keychain (phase5-keychain.md) -------------------------------------
+
+const (
+	authPassword = "パスワード保管"
+	authKey      = "SSH鍵認証"
+)
+
+var plaintextPasswords = []string{"pw-alpha-7c1e", "pw-bravo-93fd", "pw-charlie-0b2a"}
+
+// makeV3Database writes a v3-shaped database (no credential_store /
+// passphrase_saved / secret_gc) holding three plaintext passwords, one key
+// connection and one serial connection.
+func makeV3Database(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ssh-gete.sqlite")
+	store, err := openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, pw := range plaintextPasswords {
+		conn := Connection{ID: fmt.Sprintf("c%d", i+1), Name: fmt.Sprintf("srv%d", i+1), Type: "SSH", Host: "10.0.0.1",
+			Port: 22, User: "u", AuthMethod: authPassword, Credential: pw, ConnectTimeout: 10, CommandTimeout: 30}
+		if err := store.insertConnection(conn); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, conn := range []Connection{
+		{ID: "k1", Name: "keyed", Type: "SSH", Host: "10.0.0.2", Port: 22, User: "u", AuthMethod: authKey, Credential: "~/.ssh/id_ed25519"},
+		{ID: "s1", Name: "serial", Type: "Serial", SerialPort: "/dev/cu.usbserial", BaudRate: 9600},
+	} {
+		if err := store.insertConnection(conn); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, stmt := range []string{
+		`DROP TABLE secret_gc`,
+		`ALTER TABLE connections DROP COLUMN credential_store`,
+		`ALTER TABLE connections DROP COLUMN passphrase_saved`,
+		`PRAGMA user_version = 3`,
+	} {
+		if _, err := store.db.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	store.Close()
+	return path
+}
+
+func credentialRow(t *testing.T, store *Store, id string) (credential, credStore string) {
+	t.Helper()
+	if err := store.db.QueryRow(`SELECT credential, credential_store FROM connections WHERE id = ?`, id).Scan(&credential, &credStore); err != nil {
+		t.Fatal(err)
+	}
+	return credential, credStore
+}
+
+func secretGCAccounts(t *testing.T, store *Store) []string {
+	t.Helper()
+	accounts, err := store.loadSecretGC()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return accounts
+}
+
+func fileContainsAny(t *testing.T, path string, needles []string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return ""
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range needles {
+		if strings.Contains(string(data), n) {
+			return n
+		}
+	}
+	return ""
+}
+
+func TestMigrationV3ToV4KeepsCredentialsUntilMoved(t *testing.T) {
+	path := makeV3Database(t)
+	store, err := openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if store.prevVersion != 3 || userVersion(t, path) != 4 || !fileExists(path+".bak-v3") {
+		t.Fatalf("v3 -> v4 migration: prev=%d version=%d", store.prevVersion, userVersion(t, path))
+	}
+	if !tableExists(t, path, "secret_gc") {
+		t.Fatalf("secret_gc missing")
+	}
+	// The schema step alone moves nothing: credential_store defaults to db.
+	for i, pw := range plaintextPasswords {
+		if cred, cs := credentialRow(t, store, fmt.Sprintf("c%d", i+1)); cred != pw || cs != credentialStoreDB {
+			t.Fatalf("c%d after schema migration: %q %q", i+1, cred, cs)
+		}
+	}
+	var secureDelete int
+	if err := store.db.QueryRow(`PRAGMA secure_delete`).Scan(&secureDelete); err != nil || secureDelete != 1 {
+		t.Fatalf("secure_delete = %d, %v", secureDelete, err)
+	}
+}
+
+func TestMigrateCredentialsToKeyring(t *testing.T) {
+	path := makeV3Database(t)
+	store, err := openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	secrets := newMemorySecretStore()
+	ctx := context.Background()
+
+	res, err := store.migrateCredentialsToKeyring(ctx, secrets, time.Second)
+	if err != nil || res.Moved != 3 || res.Remaining != 0 || res.Err != nil {
+		t.Fatalf("migrate = %+v, %v", res, err)
+	}
+	for i, pw := range plaintextPasswords {
+		id := fmt.Sprintf("c%d", i+1)
+		if cred, cs := credentialRow(t, store, id); cred != "" || cs != credentialStoreKeyring {
+			t.Fatalf("%s row: %q %q", id, cred, cs)
+		}
+		if v, err := secrets.Get(ctx, passwordAccount(id)); err != nil || v != pw {
+			t.Fatalf("%s secret = %q, %v", id, v, err)
+		}
+	}
+	if cred, cs := credentialRow(t, store, "k1"); cred != "~/.ssh/id_ed25519" || cs != credentialStoreDB {
+		t.Fatalf("key path touched: %q %q", cred, cs)
+	}
+
+	conns, err := store.loadConnections()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range conns {
+		switch c.ID {
+		case "c1", "c2", "c3":
+			if c.Credential != "" || !c.CredentialSet || !credentialInKeyring(c) {
+				t.Fatalf("loaded keychain row: %+v", c)
+			}
+		case "k1":
+			if c.Credential == "" || credentialInKeyring(c) {
+				t.Fatalf("loaded key row: %+v", c)
+			}
+		}
+	}
+
+	// No plaintext is left in the database file or its WAL.
+	for _, p := range []string{path, path + "-wal"} {
+		if hit := fileContainsAny(t, p, plaintextPasswords); hit != "" {
+			t.Fatalf("%s still contains %q", filepath.Base(p), hit)
+		}
+	}
+	// ...but the pre-migration backup does, and is reported.
+	found, err := findPlaintextBackups(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(found) != 1 || found[0].Path != path+".bak-v3" || found[0].Passwords != 3 || found[0].Unreadable {
+		t.Fatalf("plaintext backups = %+v", found)
+	}
+
+	// Running again is a no-op.
+	if res, err := store.migrateCredentialsToKeyring(ctx, secrets, time.Second); err != nil || res.Moved != 0 || res.Remaining != 0 {
+		t.Fatalf("second run = %+v, %v", res, err)
+	}
+}
+
+// Only rows whose keychain write was verified lose their plaintext; the rest
+// stay in the column and the next run finishes the job.
+func TestMigrateCredentialsPartialFailure(t *testing.T) {
+	path := makeV3Database(t)
+	store, err := openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	inner := newMemorySecretStore()
+	f := newFaultSecretStore(inner)
+	f.hook = func(op, _ string, n int) error {
+		if op == "set" && n == 2 {
+			return fmt.Errorf("%w: unlock refused", ErrSecretUnavailable)
+		}
+		return nil
+	}
+	res, err := store.migrateCredentialsToKeyring(ctx, f, time.Second)
+	if err != nil || res.Moved != 1 || res.Remaining != 2 || !errors.Is(res.Err, ErrSecretUnavailable) {
+		t.Fatalf("migrate = %+v, %v", res, err)
+	}
+	if f.count("set") != 2 {
+		t.Fatalf("set calls = %d: an unavailable store must stop the run", f.count("set"))
+	}
+	if cred, cs := credentialRow(t, store, "c1"); cred != "" || cs != credentialStoreKeyring {
+		t.Fatalf("c1 not moved: %q %q", cred, cs)
+	}
+	for i := 2; i <= 3; i++ {
+		id := fmt.Sprintf("c%d", i)
+		if cred, cs := credentialRow(t, store, id); cred != plaintextPasswords[i-1] || cs != credentialStoreDB {
+			t.Fatalf("%s lost its value: %q %q", id, cred, cs)
+		}
+	}
+
+	// A value too big for this row only skips that row.
+	f.hook = func(op, account string, _ int) error {
+		if op == "set" && account == passwordAccount("c2") {
+			return ErrSecretTooBig
+		}
+		return nil
+	}
+	res, err = store.migrateCredentialsToKeyring(ctx, f, time.Second)
+	if err != nil || res.Moved != 1 || res.Remaining != 1 || !errors.Is(res.Err, ErrSecretTooBig) {
+		t.Fatalf("second run = %+v, %v", res, err)
+	}
+	f.hook = nil
+	res, err = store.migrateCredentialsToKeyring(ctx, f, time.Second)
+	if err != nil || res.Moved != 1 || res.Remaining != 0 {
+		t.Fatalf("third run = %+v, %v", res, err)
+	}
+}
+
+// A store that times out (Linux prompt never answered) fails the run at the
+// per-item deadline and keeps every plaintext row.
+func TestMigrateCredentialsHungStore(t *testing.T) {
+	path := makeV3Database(t)
+	store, err := openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	f := newFaultSecretStore(newMemorySecretStore())
+	f.hang.Store(true)
+	start := time.Now()
+	res, err := store.migrateCredentialsToKeyring(context.Background(), f, 50*time.Millisecond)
+	if err != nil || res.Moved != 0 || res.Remaining != 3 || !errors.Is(res.Err, ErrSecretUnavailable) {
+		t.Fatalf("migrate = %+v, %v", res, err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("hung store held the migration for %v", time.Since(start))
+	}
+}
+
+// A mangled read-back keeps the plaintext; a crash after Set (item written,
+// row not yet cleared) is finished by the next run without duplicates.
+func TestMigrateCredentialsReadBackAndRetry(t *testing.T) {
+	path := makeV3Database(t)
+	store, err := openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	res, err := store.migrateCredentialsToKeyring(ctx, mangleStore{newMemorySecretStore()}, time.Second)
+	if err != nil || res.Moved != 0 || res.Remaining != 3 {
+		t.Fatalf("mangled = %+v, %v", res, err)
+	}
+	secrets := newMemorySecretStore()
+	secrets.Set(ctx, passwordAccount("c1"), plaintextPasswords[0]) // written before a crash
+	res, err = store.migrateCredentialsToKeyring(ctx, secrets, time.Second)
+	if err != nil || res.Moved != 3 {
+		t.Fatalf("retry = %+v, %v", res, err)
+	}
+	if v, _ := secrets.Get(ctx, passwordAccount("c1")); v != plaintextPasswords[0] {
+		t.Fatalf("c1 = %q", v)
+	}
+}
+
+func TestKeyringConnectionRoundTripAndGC(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	secrets := newMemorySecretStore()
+	conn := Connection{ID: "c1", Name: "srv", Type: "SSH", Host: "h", Port: 22, User: "u",
+		AuthMethod: authPassword, CredentialSet: true}
+	secrets.Set(ctx, passwordAccount("c1"), "pw")
+	if err := store.insertConnection(conn); err != nil {
+		t.Fatal(err)
+	}
+	if cred, cs := credentialRow(t, store, "c1"); cred != "" || cs != credentialStoreKeyring {
+		t.Fatalf("insert: %q %q", cred, cs)
+	}
+
+	// Switching to key auth queues the password item; GC deletes it.
+	conn.AuthMethod, conn.Credential, conn.CredentialSet = authKey, "~/.ssh/id_ed25519", false
+	if ok, err := store.updateConnection(conn); !ok || err != nil {
+		t.Fatalf("update: %v %v", ok, err)
+	}
+	if got := secretGCAccounts(t, store); len(got) != 1 || got[0] != passwordAccount("c1") {
+		t.Fatalf("queued = %v", got)
+	}
+	if n, err := store.runSecretGC(ctx, secrets); n != 1 || err != nil {
+		t.Fatalf("gc = %d, %v", n, err)
+	}
+	if _, err := secrets.Get(ctx, passwordAccount("c1")); !errors.Is(err, ErrSecretNotFound) {
+		t.Fatalf("password item survived gc")
+	}
+	if got := secretGCAccounts(t, store); len(got) != 0 {
+		t.Fatalf("queue not drained: %v", got)
+	}
+
+	// Back to password before GC runs: the queued account is live again and
+	// must not be deleted.
+	conn.AuthMethod, conn.Credential, conn.CredentialSet = authPassword, "", true
+	store.enqueueSecretGC(passwordAccount("c1"))
+	secrets.Set(ctx, passwordAccount("c1"), "pw2")
+	if ok, err := store.updateConnection(conn); !ok || err != nil {
+		t.Fatalf("update: %v %v", ok, err)
+	}
+	if got := secretGCAccounts(t, store); len(got) != 0 {
+		t.Fatalf("live account still queued: %v", got)
+	}
+	store.enqueueSecretGC(passwordAccount("c1")) // a stale entry from a race
+	if n, _ := store.runSecretGC(ctx, secrets); n != 0 {
+		t.Fatalf("gc deleted a live item")
+	}
+	if v, _ := secrets.Get(ctx, passwordAccount("c1")); v != "pw2" {
+		t.Fatalf("live item = %q", v)
+	}
+
+	// Deleting the connection queues its item in the same transaction. With
+	// the store down the entry stays queued for the next run.
+	if err := store.deleteConnection("c1"); err != nil {
+		t.Fatal(err)
+	}
+	down := newFaultSecretStore(secrets)
+	down.hook = func(string, string, int) error { return ErrSecretUnavailable }
+	if n, err := store.runSecretGC(ctx, down); n != 0 || !errors.Is(err, ErrSecretUnavailable) {
+		t.Fatalf("gc with store down = %d, %v", n, err)
+	}
+	if got := secretGCAccounts(t, store); len(got) != 1 {
+		t.Fatalf("failed delete dropped from queue: %v", got)
+	}
+	if n, err := store.runSecretGC(ctx, secrets); n != 1 || err != nil {
+		t.Fatalf("gc retry = %d, %v", n, err)
+	}
+	if _, err := secrets.Get(ctx, passwordAccount("c1")); !errors.Is(err, ErrSecretNotFound) {
+		t.Fatalf("deleted connection's item survived")
+	}
+}
+
+func TestPassphraseSavedLifecycle(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	secrets := newMemorySecretStore()
+	conn := Connection{ID: "k1", Name: "keyed", Type: "SSH", Host: "h", Port: 22, User: "u",
+		AuthMethod: authKey, Credential: "~/.ssh/id_a"}
+	if err := store.insertConnection(conn); err != nil {
+		t.Fatal(err)
+	}
+	if ids, _ := store.passphraseSavedIDs(); len(ids) != 0 {
+		t.Fatalf("passphrase saved by default: %v", ids)
+	}
+	// A stale key path is refused.
+	if ok, err := store.setPassphraseSaved("k1", "~/.ssh/other", true); ok || err != nil {
+		t.Fatalf("stale path: %v %v", ok, err)
+	}
+	accountA := passphraseAccount("k1", "~/.ssh/id_a")
+	secrets.Set(ctx, accountA, "phrase")
+	if ok, err := store.setPassphraseSaved("k1", "~/.ssh/id_a", true); !ok || err != nil {
+		t.Fatalf("save: %v %v", ok, err)
+	}
+	if ids, _ := store.passphraseSavedIDs(); !ids["k1"] {
+		t.Fatalf("not marked saved")
+	}
+	// Renaming keeps it; changing the key path drops it and queues the item.
+	conn.Name = "renamed"
+	store.updateConnection(conn)
+	if ids, _ := store.passphraseSavedIDs(); !ids["k1"] {
+		t.Fatalf("rename dropped the saved passphrase")
+	}
+	conn.Credential = "~/.ssh/id_b"
+	store.updateConnection(conn)
+	if ids, _ := store.passphraseSavedIDs(); ids["k1"] {
+		t.Fatalf("key path change kept passphrase_saved")
+	}
+	if got := secretGCAccounts(t, store); len(got) != 1 || got[0] != accountA {
+		t.Fatalf("queued = %v", got)
+	}
+	store.runSecretGC(ctx, secrets)
+	if _, err := secrets.Get(ctx, accountA); !errors.Is(err, ErrSecretNotFound) {
+		t.Fatalf("old passphrase item survived")
+	}
+
+	// Turning it off queues the item; deleting the row queues it too.
+	accountB := passphraseAccount("k1", "~/.ssh/id_b")
+	secrets.Set(ctx, accountB, "phrase-b")
+	store.setPassphraseSaved("k1", "~/.ssh/id_b", true)
+	if err := store.deleteConnection("k1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := secretGCAccounts(t, store); len(got) != 1 || got[0] != accountB {
+		t.Fatalf("queued after delete = %v", got)
+	}
+}
+
+func TestDenyPlaintextPasswords(t *testing.T) {
+	store := newTestStore(t)
+	legacy := Connection{ID: "c1", Name: "legacy", Type: "SSH", Host: "h", Port: 22, User: "u",
+		AuthMethod: authPassword, Credential: "old-plain"}
+	if err := store.insertConnection(legacy); err != nil {
+		t.Fatal(err)
+	}
+	store.denyPlaintextPasswords.Store(true)
+
+	fresh := legacy
+	fresh.ID, fresh.Name, fresh.Credential = "c2", "fresh", "new-plain"
+	if err := store.insertConnection(fresh); !errors.Is(err, errPlaintextPassword) {
+		t.Fatalf("insert plaintext: %v", err)
+	}
+	// An unchanged legacy value may stay (not migrated yet)...
+	legacy.Description = "edited"
+	if ok, err := store.updateConnection(legacy); !ok || err != nil {
+		t.Fatalf("unchanged legacy: %v %v", ok, err)
+	}
+	// ...a new one may not.
+	legacy.Credential = "changed-plain"
+	if ok, err := store.updateConnection(legacy); ok || !errors.Is(err, errPlaintextPassword) {
+		t.Fatalf("changed plaintext: %v %v", ok, err)
+	}
+	if cred, _ := credentialRow(t, store, "c1"); cred != "old-plain" {
+		t.Fatalf("refused update wrote %q", cred)
+	}
+	// Keychain-backed and key connections are unaffected.
+	fresh.Credential, fresh.CredentialSet = "", true
+	if err := store.insertConnection(fresh); err != nil {
+		t.Fatalf("keychain insert: %v", err)
+	}
+	key := Connection{ID: "k1", Name: "key", Type: "SSH", Host: "h", Port: 22, User: "u", AuthMethod: authKey, Credential: "~/.ssh/id"}
+	if err := store.insertConnection(key); err != nil {
+		t.Fatalf("key insert: %v", err)
+	}
+}
+
+func TestFindAndRemovePlaintextBackups(t *testing.T) {
+	path := makeV3Database(t)
+	store, err := openStore(path) // writes .bak-v3 with three passwords
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.migrateCredentialsToKeyring(context.Background(), newMemorySecretStore(), time.Second); err != nil {
+		t.Fatal(err)
+	}
+	// A clean backup (taken after the move) is not reported.
+	if _, err := store.db.Exec(`VACUUM INTO ?`, path+".bak-v4"); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	dir := filepath.Dir(path)
+	partial := path + ".bak-v2"
+	os.WriteFile(partial, []byte("partial"), 0o600)
+	os.WriteFile(path+".bak-v3.tmp-1", []byte("x"), 0o600)
+	legacy := filepath.Join(dir, "connections.json.migrated")
+	os.WriteFile(legacy, []byte(`[{"name":"a","authMethod":"パスワード保管","credential":"json-pw"},{"name":"b","authMethod":"SSH鍵認証","credential":"~/.ssh/id"}]`), 0o600)
+	other := filepath.Join(dir, "unrelated.txt")
+	os.WriteFile(other, []byte("keep"), 0o600)
+
+	found, err := findPlaintextBackups(path, legacy, filepath.Join(dir, "missing.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]PlaintextBackup{}
+	for _, b := range found {
+		got[filepath.Base(b.Path)] = b
+	}
+	// A leftover .tmp- (VACUUM INTO cut off) is reported as unreadable.
+	if len(got) != 4 || got["ssh-gete.sqlite.bak-v3"].Passwords != 3 || !got["ssh-gete.sqlite.bak-v2"].Unreadable ||
+		!got["ssh-gete.sqlite.bak-v3.tmp-1"].Unreadable || got["connections.json.migrated"].Passwords != 1 {
+		t.Fatalf("found = %+v", found)
+	}
+
+	removed, err := removePlaintextBackups(path, []string{path + ".bak-v3", path + ".bak-v3.tmp-1", other, path, path + ".bak-v4"}, legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 2 || removed[0] != path+".bak-v3" || removed[1] != path+".bak-v3.tmp-1" {
+		t.Fatalf("removed = %v", removed)
+	}
+	for _, keep := range []string{other, path, path + ".bak-v4", legacy, partial} {
+		if !fileExists(keep) {
+			t.Fatalf("%s was removed", filepath.Base(keep))
+		}
+	}
+	if fileExists(path + ".bak-v3") {
+		t.Fatalf("backup not removed")
+	}
+}
+
+// rawExec runs statements on path without openStore's secure_delete, the way
+// a pre-v4 build wrote the file.
+func rawExec(t *testing.T, path string, stmts ...string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path+"?_pragma=secure_delete(off)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, stmt := range stmts {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+}
+
+// A v0.1.0 row switched from password SSH to Serial kept the password in the
+// credential column; the v4 migration must not leave it there.
+func TestMigrateCredentialsClearsSerialPassword(t *testing.T) {
+	path := makeV3Database(t)
+	const serialPW = "pw-serial-left-5e9d"
+	rawExec(t, path, `UPDATE connections SET credential = '`+serialPW+`', auth_method = 'パスワード保管' WHERE id = 's1'`)
+	store, err := openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	res, err := store.migrateCredentialsToKeyring(context.Background(), newMemorySecretStore(), time.Second)
+	if err != nil || res.Moved != 3 || res.Remaining != 0 {
+		t.Fatalf("migrate = %+v, %v", res, err)
+	}
+	if cred, _ := credentialRow(t, store, "s1"); cred != "" {
+		t.Fatalf("serial credential = %q", cred)
+	}
+	for _, f := range []string{path, path + "-wal"} {
+		if n := fileContainsAny(t, f, []string{serialPW}); n != "" {
+			t.Fatalf("%s still holds %q", filepath.Base(f), n)
+		}
+	}
+}
+
+// Passwords deleted before v4 (secure_delete off) sit in free pages; the
+// first start of v4 scrubs them even when no password row is left to move.
+func TestMigrateCredentialsScrubsOnUpgradeWithoutMoves(t *testing.T) {
+	path := makeV3Database(t)
+	rawExec(t, path, `DELETE FROM connections WHERE id IN ('c1', 'c2', 'c3')`, `PRAGMA wal_checkpoint(TRUNCATE)`)
+	if fileContainsAny(t, path, plaintextPasswords) == "" {
+		t.Skip("sqlite already overwrote the deleted cells; nothing to scrub")
+	}
+	store, err := openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	res, err := store.migrateCredentialsToKeyring(context.Background(), newMemorySecretStore(), time.Second)
+	if err != nil || res.Moved != 0 || res.Remaining != 0 {
+		t.Fatalf("migrate = %+v, %v", res, err)
+	}
+	for _, f := range []string{path, path + "-wal"} {
+		if n := fileContainsAny(t, f, plaintextPasswords); n != "" {
+			t.Fatalf("%s still holds %q", filepath.Base(f), n)
+		}
 	}
 }

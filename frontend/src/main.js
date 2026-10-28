@@ -7,20 +7,15 @@ import './style.css';
 import logoUrl from './assets/ssh-gate-logo.png';
 
 import {
-  ApproveCommand,
-  ApproveCommandAndBypassAgent,
-  ApproveCommandConfirmed,
   DeleteCommandRequest,
   DeleteMCPSettings,
   GenerateMCPToken,
   GetInitialData,
-  RejectCommand,
-  RevokeAgentApprovalBypass,
   SaveMCPSettings,
 } from '../wailsjs/go/main/App';
-import { EventsOn } from '../wailsjs/runtime/runtime';
+import { Environment, EventsOn } from '../wailsjs/runtime/runtime';
 
-import { escapeHtml, interpolate, requestStateLabelKey } from './model.js';
+import { connStateLabelKey, escapeHtml, interpolate } from './model.js';
 import { I18N } from './i18n.js';
 import { pageTitle, renderNav as navHtml, renderSkeleton } from './shell.js';
 import { handleSidebarClick, updateSidebarStatus } from './sidebar.js';
@@ -40,25 +35,60 @@ import {
 } from './editor.js';
 import {
   activateConnection,
+  activateTerminalTab,
   closeTabsForConnection,
+  closeTerminalTab,
+  getTerminalState,
   handleTerminalChange,
   handleTerminalClick,
   initTerminalTabs,
   openTerminalTab,
   reconcileTerminalTabs,
-  renderTerminalPage,
+  renderTerminalEmpty,
+  renderTerminalNewShell,
   restoreTerminalTabs,
   setTerminalPageVisible,
+  setTerminalServerFilter,
 } from './terminal-tabs.js';
+import {
+  createApprovalsState,
+  handleApprovalsClick,
+  handleApprovalsInput,
+  renderCommandsPage,
+  selectedCommandRequest,
+} from './approvals.js';
+import {
+  agentsSectionBusy,
+  forgetIssuedAgentToken,
+  handleAgentsClick,
+  handleAgentsInput,
+  handleAgentsSubmit,
+  mountAgentsSection,
+} from './agents.js';
+import { ALL_SERVERS, normalizeServerFilter, renderServerTabs, renderShellSubtabs } from './servertabs.js';
+import { createShortcutHandler, cycleIndex, cycleServer, detectPlatform, resolveTabIndex } from './shortcuts.js';
+import { deriveServerView, loadServerFilter, saveServerFilter } from './serverview.js';
+import { handleCredentialsClick, mountKeychainNotices, recoverCredential } from './credentials.js';
 
 document.body.className = 'layout-fixed sidebar-expand-lg bg-body-tertiary';
 
 const app = document.querySelector('#app');
 
+// localStorage can be missing or throw (private mode, blocked site data);
+// every use is best-effort.
+function safeLocalStorage() {
+  try {
+    return window.localStorage ?? null;
+  } catch {
+    return null;
+  }
+}
+
+const storage = safeLocalStorage();
 
 function detectLang() {
   try {
-    const saved = localStorage.getItem('sshgate-lang');
+    const saved = storage?.getItem('sshgate-lang');
     if (saved === 'ja' || saved === 'en') return saved;
   } catch {
     // localStorage unavailable; fall through to navigator.
@@ -73,7 +103,7 @@ function t(key, vars) {
 function setLang(lang) {
   state.lang = lang;
   try {
-    localStorage.setItem('sshgate-lang', lang);
+    storage?.setItem('sshgate-lang', lang);
   } catch {
     // Persisting language is best-effort.
   }
@@ -92,9 +122,14 @@ const state = {
     connections: [],
     requests: [],
     agentPolicies: [],
+    // Per-agent tokens (no secrets): approvals.js reads them to tell
+    // whether an agent can use an approval bypass.
+    agentTokens: [],
     // Always the latest poll: the sidebar's MCP block reads it.
     mcp: {},
     storageError: '',
+    // Passwords the startup migration could not move to the keychain.
+    keychainPending: 0,
     sessions: [],
     terminals: [],
     runningTotal: 0,
@@ -104,7 +139,19 @@ const state = {
   settingsMcp: {},
   // Owned by editor.js (selection and draft are keyed by connection id).
   editor: createEditorState(),
+  // Owned by approvals.js (the cached execution-target lookup).
+  approvals: createApprovalsState(),
   selectedRequestId: '',
+  // The top server tab (phase4-ui-integration §1): '' is 「すべて」, otherwise
+  // a Connection.id. Only setServerFilter / reconcileServerFilter write it.
+  serverFilter: loadServerFilter(storage),
+  // False until the first successful refresh: the saved value is checked
+  // against the connection list only once there is one.
+  serverFilterReady: false,
+  // Connections saved with settings an open tab does not use yet
+  // (reconnect_required / serial_mode_not_applied): their tab offers a
+  // reconnect.
+  reconnectNeeded: new Set(),
   dirty: {
     settings: false,
     // The approval command textarea was edited; polling must not reset it.
@@ -117,6 +164,10 @@ const state = {
   // Token returned by GenerateMCPToken; kept only until the user leaves the page.
   issuedToken: '',
 };
+
+// 'darwin' | 'windows' | 'linux' from the Wails runtime; editor.js disables
+// serial options the OS cannot do. Unknown until Environment() answers.
+let platform = '';
 
 // ctx is the only channel between the page modules (phase2-contract §2.2).
 const ctx = {
@@ -134,6 +185,20 @@ const ctx = {
   promptPassphrase: (conn) => promptPassphrase(conn, ctx),
   showConnection,
   sessionFor: (connId) => (state.data.sessions ?? []).find((session) => session.connId === connId),
+  copyText,
+  // phase4-ui-integration §1.1
+  serverFilter: () => state.serverFilter,
+  setServerFilter: (connId, opts) => setServerFilter(connId, opts),
+  // editor.js: the user moved the list selection (phase4 §2.3, 一覧 → タブ).
+  onSelectionChange: (id, { reason } = {}) => {
+    if (reason !== 'delete') syncServerFilterFromEditor(id);
+  },
+  onConnectionSaved: (result) => noteConnectionSaved(result),
+  platform: () => platform,
+  // needs_password / keyring_unavailable (phase5-keychain §8).
+  recoverCredential: (conn, result, opts) => recoverCredential(ctx, conn, result, opts),
+  startErrorMessage: (result) => startErrorMessage(result),
+  terminalKeyHandler: null, // set below, before initTerminalTabs
 };
 
 function field(object, key, fallback = '') {
@@ -159,29 +224,6 @@ function mcpStatusLabel(status) {
 function mcpStatusBadge(status, className = '') {
   const value = status || '停止中';
   return `<span class="badge ${mcpStatusClass(value)} ${className}">${escapeHtml(mcpStatusLabel(value))}</span>`;
-}
-
-// Request status is a backend state code (pending, running, succeeded, ...).
-function requestStatusLabel(status) {
-  const key = requestStateLabelKey(status);
-  const label = t(key);
-  return label === key ? status : label;
-}
-
-function requestStatusClass(status) {
-  if (status === 'pending') return 'text-bg-warning';
-  if (status === 'running' || status === 'auto_running') return 'text-bg-info';
-  if (status === 'succeeded' || status === 'auto_succeeded') return 'text-bg-success';
-  if (status === 'failed' || status === 'auto_failed' || status === 'interrupted') return 'text-bg-danger';
-  return 'text-bg-secondary';
-}
-
-function formatTimestamp(value) {
-  if (!value) return '-';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  const pad = (n) => String(n).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
 function mcpEndpoint(mcp) {
@@ -217,18 +259,47 @@ async function copyText(text) {
 
 // The toast lives outside #app so showing/hiding it never re-renders the
 // page (a full render would reset unsaved form input and the terminal).
-function showToast(message) {
+// variant 'warning' is for results that need the user to act.
+function showToast(message, { variant = 'dark' } = {}) {
   let root = document.querySelector('#toast-root');
   if (!root) {
     root = document.createElement('div');
     root.id = 'toast-root';
     document.body.appendChild(root);
   }
+  const tone = variant === 'warning' ? 'text-bg-warning' : 'text-bg-dark';
   root.innerHTML = message
-    ? `<div class="toast show align-items-center text-bg-dark border-0 ssh-toast"><div class="d-flex"><div class="toast-body">${escapeHtml(message)}</div></div></div>`
+    ? `<div class="toast show align-items-center ${tone} border-0 ssh-toast" role="status"><div class="d-flex"><div class="toast-body">${escapeHtml(message)}</div></div></div>`
     : '';
   window.clearTimeout(showToast.timer);
   showToast.timer = window.setTimeout(() => { root.innerHTML = ''; }, 3200);
+}
+
+// StartTerminal failure codes (phase4-serial-patch §10-4, and the keychain
+// codes of phase5-keychain): JA shows the backend message (it names the
+// device and the other connection), EN a fixed text per code.
+const START_ERROR_CODES = ['port_in_use', 'port_busy', 'permission_denied', 'port_not_found', 'invalid_serial_mode', 'open_failed',
+  'needs_password', 'keyring_unavailable'];
+
+function startErrorMessage(result) {
+  const code = result?.code ?? '';
+  if (state.lang === 'en' && START_ERROR_CODES.includes(code)) return t(`term.code.${code}`);
+  return String(result?.message ?? '');
+}
+
+// SaveConnection codes about open serial tabs (phase4-serial-patch §10-3).
+function noteConnectionSaved(result) {
+  const code = result?.code ?? '';
+  const id = result?.id ?? '';
+  if (code === 'serial_mode_applied') {
+    state.reconnectNeeded.delete(id);
+    showToast(state.lang === 'en' ? t('term.save.serial_mode_applied') : result.message);
+    return;
+  }
+  if (code === 'serial_mode_not_applied' || code === 'reconnect_required') {
+    if (id) state.reconnectNeeded.add(id);
+    showToast(state.lang === 'en' ? t(`term.save.${code}`) : result.message, { variant: 'warning' });
+  }
 }
 
 // ---------------------------------------------------------------- rendering
@@ -249,7 +320,7 @@ function renderHeader() {
 let lastNavHtml = '';
 
 // Rewritten only when it changes, so the 5s poll does not steal focus from a
-// nav button.
+// nav button. The pending badge is never filtered by the server tab.
 function renderNav() {
   const root = document.getElementById('sidebar-nav');
   if (!root) return;
@@ -260,8 +331,85 @@ function renderNav() {
   root.innerHTML = html;
 }
 
+// The sidebar always shows every connection (phase4 §2.5).
 function renderSidebar() {
   updateSidebarStatus(document.getElementById('sidebar-status'), state.data, { t, lang: state.lang, now: Date.now() });
+}
+
+function currentView() {
+  return deriveServerView(state, getTerminalState());
+}
+
+// applyTerminalFilter mirrors the filter into the panes and moves the active
+// tab into it (phase4 §2.4). It returns the view after that move.
+function applyTerminalFilter() {
+  let view = currentView();
+  setTerminalServerFilter(view.filter);
+  if (view.activeTermId && view.activeTermId !== getTerminalState().activeId) {
+    activateTerminalTab(view.activeTermId);
+    view = currentView();
+  }
+  return view;
+}
+
+function selectTerminalTab(termId) {
+  activateTerminalTab(termId);
+  renderPage();
+}
+
+// renderServerTabsBar redraws the top tabs and the shell sub-tabs only.
+// Both are diffed by data key, so nodes (and focus) survive every poll.
+function renderServerTabsBar(view = currentView()) {
+  const tabs = document.getElementById('server-tabs');
+  if (tabs) {
+    renderServerTabs(tabs, view.tabs, {
+      t,
+      lang: state.lang,
+      onSelect: (connId) => setServerFilter(connId, { source: 'tab' }),
+      labelKeyOf: connStateLabelKey,
+    });
+  }
+  const sub = document.getElementById('shell-subtabs');
+  if (!sub) return;
+  sub.hidden = state.active !== 'terminal';
+  if (!sub.hidden) {
+    renderShellSubtabs(sub, view.subtabs, {
+      t,
+      lang: state.lang,
+      onActivate: (termId) => selectTerminalTab(termId),
+      onNewShell: (connId) => openTerminalTab(connId),
+    });
+  }
+}
+
+// renderTerminalScreen is #page-root on the terminal page (phase4 §2.4): the
+// actions of the active tab and, under 「すべて」, the new-shell picker. The
+// tab strip itself is #shell-subtabs.
+function renderTerminalScreen(view) {
+  const entry = getTerminalState().tabs.get(view.activeTermId);
+  let actions = '';
+  if (entry) {
+    const id = escapeHtml(entry.id);
+    const exited = entry.status === 'exited';
+    const stale = !exited && state.reconnectNeeded.has(entry.connId);
+    const note = exited
+      ? t(`tabs.exit.${entry.exitReason || 'conn_lost'}`)
+      : stale ? t('term.settingsChanged') : '';
+    actions = `
+      <div class="term-active-actions${exited ? ' is-exited' : ''}${entry.exitReason === 'device_removed' ? ' is-device-removed' : ''}">
+        ${note ? `<span class="term-active-note${exited ? ' text-danger-emphasis' : ' text-warning-emphasis'}" role="status"><i class="bi ${exited ? 'bi-exclamation-octagon' : 'bi-exclamation-triangle'} me-1" aria-hidden="true"></i>${escapeHtml(note)}</span>` : ''}
+        ${exited ? `<button class="btn btn-sm btn-primary" type="button" data-action="term-reconnect" data-term-id="${id}"><i class="bi bi-arrow-repeat me-1"></i>${escapeHtml(t('tabs.reconnect'))}</button>` : ''}
+        ${stale ? `<button class="btn btn-sm btn-warning" type="button" data-action="restart-terminal" data-term-id="${id}"><i class="bi bi-arrow-repeat me-1"></i>${escapeHtml(t('tabs.reconnect'))}</button>` : ''}
+        <button class="btn btn-sm btn-outline-secondary" type="button" data-action="term-close" data-term-id="${id}" aria-label="${escapeHtml(t('tabs.closeTab', { label: entry.label }))}"><i class="bi bi-x-lg me-1"></i>${escapeHtml(t('tabs.close'))}</button>
+      </div>`;
+  }
+  return `
+    <div class="term-toolbar">
+      ${actions}
+      ${view.filter === ALL_SERVERS ? renderTerminalNewShell(state, t) : ''}
+    </div>
+    ${view.subtabs.items.length ? '' : renderTerminalEmpty(state, t, { serverFilter: view.filter })}
+  `;
 }
 
 // renderPage redraws #page-root only. The terminal panes live in
@@ -269,11 +417,19 @@ function renderSidebar() {
 function renderPage() {
   const root = document.getElementById('page-root');
   if (!root) return;
+  const view = applyTerminalFilter();
   if (state.active === 'connections') root.innerHTML = renderConnectionsPage(state, ctx);
-  else if (state.active === 'commands') root.innerHTML = renderCommands();
-  else if (state.active === 'terminal') root.innerHTML = renderTerminalPage(state, t);
-  else root.innerHTML = renderSettings();
-  setTerminalPageVisible(state.active === 'terminal');
+  else if (state.active === 'commands') renderCommandsPage(root, ctx, view);
+  else if (state.active === 'terminal') root.innerHTML = renderTerminalScreen(view);
+  else {
+    root.innerHTML = renderSettings();
+    mountKeychainNotices(root.querySelector('#keychain-notices'), ctx);
+    mountAgentsSection(root.querySelector('#agents-root'), ctx);
+  }
+  // Hidden as a whole when the filter has no tab: another server's pane
+  // must not stay visible (and typeable) under this server's tab.
+  setTerminalPageVisible(view.stackVisible);
+  renderServerTabsBar(view);
 }
 
 function renderModals() {
@@ -292,10 +448,162 @@ function renderAll() {
 // The page is left alone while the user is in the middle of an edit there.
 function pageIsBusy() {
   if (state.active === 'connections') return editorHasFocus();
-  if (state.active === 'settings') return state.dirty.settings;
+  if (state.active === 'settings') return state.dirty.settings || agentsSectionBusy();
   if (state.active === 'commands') return state.dirty.approval;
   return false;
 }
+
+// ---------------------------------------------------------- server filter
+
+// setServerFilter is the only writer of state.serverFilter (phase4 §2.0). It
+// resolves to true when the filter changed. On the connections page the list
+// selection follows the tab first, through the unsaved-changes dialog; if
+// that is cancelled the filter stays and the tabs are redrawn as they were.
+async function setServerFilter(connId, { source = 'tab', render = true } = {}) {
+  if (!state.serverFilterReady) {
+    renderServerTabsBar();
+    return false;
+  }
+  const next = normalizeServerFilter(connId, state.data.sessions);
+  if (next === state.serverFilter) {
+    // Pressing the selected tab again re-selects its row (e.g. after the
+    // list moved to a new draft).
+    if (source === 'tab' && state.active === 'connections' && next && state.editor.selectedId !== next) {
+      await selectConnection(next, ctx, { notify: false });
+    }
+    renderServerTabsBar();
+    return false;
+  }
+  if (state.active === 'connections' && next && source !== 'editor') {
+    if (!(await selectConnection(next, ctx, { notify: false }))) {
+      renderServerTabsBar();
+      return false;
+    }
+  }
+  if (state.active === 'commands' && state.dirty.approval) {
+    // The filter can take the edited request off the screen.
+    if (!window.confirm(t('cmd.discardEditOnFilter'))) {
+      renderServerTabsBar();
+      return false;
+    }
+    state.dirty.approval = false;
+  }
+  state.serverFilter = next;
+  saveServerFilter(storage, next);
+  if (render) renderPage();
+  else {
+    applyTerminalFilter();
+    renderServerTabsBar();
+  }
+  return true;
+}
+
+// reconcileServerFilter drops a filter whose connection was deleted
+// (phase4 §3.1). At startup ('init') that happens silently.
+function reconcileServerFilter({ reason }) {
+  if (reason === 'init') state.serverFilterReady = true;
+  if (!state.serverFilterReady) return;
+  const next = normalizeServerFilter(state.serverFilter, state.data.sessions);
+  if (next === state.serverFilter) return;
+  state.serverFilter = next;
+  saveServerFilter(storage, next);
+  if (reason !== 'init') showToast(t('srvfilter.removed'));
+}
+
+// List → tab (phase4 §2.3). A new draft ('') does not move the tab; neither
+// does a selection whose session is not listed yet (right after a save).
+function syncServerFilterFromEditor(id) {
+  if (!id || id === state.serverFilter) return;
+  if (!(state.data.sessions ?? []).some((session) => session.connId === id)) return;
+  setServerFilter(id, { source: 'editor', render: state.active !== 'connections' });
+}
+
+// ------------------------------------------------------------ shortcuts
+
+const MODAL_ROOTS = ['#editor-modal-root', '#agents-modal-root', '#credential-modal-root'];
+
+function modalOpen() {
+  return MODAL_ROOTS.some((selector) => Boolean(document.querySelector(selector)?.childElementCount))
+    || Boolean(state.deleteCommand.open);
+}
+
+function isTextInputFocused() {
+  const el = document.activeElement;
+  if (!el || el === document.body) return false;
+  return el.matches?.('input, textarea, select, [contenteditable=""], [contenteditable="true"]') ?? false;
+}
+
+function activeTabConnId() {
+  const terminal = getTerminalState();
+  return terminal.tabs.get(terminal.activeId)?.connId ?? '';
+}
+
+// Sub-tab moves follow the filtered order on screen, not every tab.
+function moveSubtab(delta) {
+  const items = currentView().subtabs.items;
+  const current = items.findIndex((item) => item.id === getTerminalState().activeId);
+  const next = cycleIndex(current, items.length, delta);
+  if (next >= 0) selectTerminalTab(items[next].id);
+}
+
+function pickSubtab(index) {
+  const items = currentView().subtabs.items;
+  const next = resolveTabIndex(index, items.length);
+  if (next >= 0) selectTerminalTab(items[next].id);
+}
+
+function stepServer(delta) {
+  const ids = currentView().tabs.tabs.filter((tab) => tab.connId).map((tab) => tab.connId);
+  return setServerFilter(cycleServer(state.serverFilter, ids, delta), { source: 'shortcut' });
+}
+
+const shortcutPlatform = detectPlatform();
+
+// One instance goes to every xterm (terminal-tabs.js createTab) and to the
+// document: shortcuts.js dedupes per event only within one instance.
+const termShortcuts = createShortcutHandler({
+  platform: shortcutPlatform,
+  enabled: () => state.active === 'terminal' && !modalOpen(),
+  actions: {
+    newShell: () => {
+      const connId = state.serverFilter || activeTabConnId();
+      if (connId) return openTerminalTab(connId);
+      return undefined;
+    },
+    closeTab: () => {
+      // The tab the screen shows: '' when the selected server has no shells
+      // (the raw active id may then be another server's hidden tab).
+      const id = currentView().activeTermId;
+      if (id) return closeTerminalTab(id);
+      return undefined;
+    },
+    nextTab: () => moveSubtab(+1),
+    prevTab: () => moveSubtab(-1),
+    selectTab: ({ index }) => pickSubtab(index),
+    nextServer: () => stepServer(+1),
+    prevServer: () => stepServer(-1),
+    allServers: () => setServerFilter(ALL_SERVERS, { source: 'shortcut' }),
+  },
+  onError: (error) => showToast(String(error?.message ?? error)),
+});
+
+// Other pages: server moves only, and never while typing.
+const pageShortcuts = createShortcutHandler({
+  platform: shortcutPlatform,
+  enabled: () => state.active !== 'terminal' && !modalOpen() && !isTextInputFocused(),
+  actions: {
+    nextServer: () => stepServer(+1),
+    prevServer: () => stepServer(-1),
+    allServers: () => setServerFilter(ALL_SERVERS, { source: 'shortcut' }),
+  },
+  onError: (error) => showToast(String(error?.message ?? error)),
+});
+
+ctx.terminalKeyHandler = termShortcuts;
+
+document.addEventListener('keydown', (event) => {
+  (state.active === 'terminal' ? termShortcuts : pageShortcuts).onDocumentKeydown(event);
+});
 
 // ------------------------------------------------------------------ data
 
@@ -332,16 +640,26 @@ async function fetchData({ silent = false } = {}) {
   state.data.connections = next.connections ?? [];
   state.data.requests = next.requests ?? [];
   state.data.agentPolicies = next.agentPolicies ?? [];
+  state.data.agentTokens = next.agentTokens ?? [];
   state.data.mcp = next.mcp ?? {};
   if (!protectSettings) state.settingsMcp = state.data.mcp;
   state.data.storageError = next.storageError ?? '';
+  state.data.keychainPending = Number(next.keychainPending ?? 0);
   applySessions(next);
   reconcileEditor(state);
+  reconcileServerFilter({ reason: state.serverFilterReady ? 'refresh' : 'init' });
+  for (const id of state.reconnectNeeded) {
+    if (!state.data.connections.some((conn) => conn.id === id)) state.reconnectNeeded.delete(id);
+  }
   reconcileTerminalTabs(state.data.terminals);
   renderSidebar();
   renderNav();
   if (!pageIsBusy()) renderPage();
-  else if (state.active === 'connections') refreshEditorChrome(ctx);
+  else {
+    // The tab bar is outside #page-root: it always follows the data.
+    renderServerTabsBar(applyTerminalFilter());
+    if (state.active === 'connections') refreshEditorChrome(ctx);
+  }
   // Startup restore runs on the first refresh that succeeds, so a failed
   // first GetInitialData does not leave live backend terminals without tabs.
   if (!tabsRestored) {
@@ -372,12 +690,16 @@ function pollData() {
 
 EventsOn('sessions:changed', (payload) => {
   if (!applySessions(payload)) return;
+  reconcileServerFilter({ reason: 'sessions' });
   renderSidebar();
-  // The tab strip shows live tab states.
+  // The sub-tabs show live tab states and serial line settings.
   if (state.active === 'terminal') renderPage();
-  // The editor's connection badge and disconnect button follow the sessions;
-  // the inputs are left alone.
-  else if (state.active === 'connections') refreshEditorChrome(ctx);
+  else {
+    renderServerTabsBar(applyTerminalFilter());
+    // The editor's connection badge and disconnect button follow the
+    // sessions; the inputs are left alone.
+    if (state.active === 'connections') refreshEditorChrome(ctx);
+  }
 });
 
 // ------------------------------------------------------------ navigation
@@ -388,23 +710,35 @@ async function navigate(page) {
   if (state.active === 'settings') {
     state.issuedToken = '';
     state.dirty.settings = false;
+    forgetIssuedAgentToken();
   }
   if (state.active === 'commands') state.dirty.approval = false;
   state.active = page;
   renderHeader();
   renderNav();
   renderPage();
+  // Tab → list (phase4 §2.3): entering the editor selects the filtered
+  // connection. Leaving the editor already went through its guard.
+  if (page === 'connections' && state.serverFilter && state.editor.selectedId !== state.serverFilter) {
+    await selectConnection(state.serverFilter, ctx, { notify: false });
+  }
   return true;
 }
 
-// Sidebar row click: jump to that connection's terminal tab if it has one,
-// otherwise open it in the editor.
+// Sidebar row click (phase4 §2.5): select its server tab, then jump to the
+// connection's terminal tab if it has one, otherwise open it in the editor.
 async function showConnection(connId) {
+  const target = normalizeServerFilter(connId, state.data.sessions);
+  const changed = await setServerFilter(connId, { source: 'sidebar', render: false });
+  // Cancelled in an unsaved-changes dialog (editor, or the edited approval
+  // command): stay where we are.
+  if (!changed && target && state.serverFilter !== target) return;
   if (activateConnection(connId)) {
     await navigate('terminal');
-    return;
+  } else if (await navigate('connections')) {
+    await selectConnection(connId, ctx, { notify: false });
   }
-  if (await navigate('connections')) await selectConnection(connId, ctx);
+  renderAll();
 }
 
 // ---------------------------------------------------------- commands page
@@ -435,173 +769,6 @@ function deleteCommandModal() {
   `;
 }
 
-// The pending request the on-screen approval form belongs to, or null when the
-// form is gone, was drawn for another request than the selection, or the
-// request is no longer pending. Approve / reject act only on this one, so an
-// edited command can never run under another request's id.
-function approvalTarget() {
-  const formId = document.querySelector('#approval-command')?.dataset.requestId ?? '';
-  const selected = selectedCommandRequest();
-  if (!formId || !selected || selected.id !== formId || selected.status !== 'pending') return null;
-  return selected;
-}
-
-// Called when the approval form no longer matches its request: redraw it so
-// the user sees what is pending now.
-function refuseStaleApproval() {
-  state.dirty.approval = false;
-  showToast(t('cmd.staleSelection'));
-  renderPage();
-}
-
-// Selection is tracked by request ID, not by list index: the poll prepends new
-// (auto-executed) entries to state.data.requests, so indexes shift under the user.
-function selectedCommandRequest() {
-  const requests = state.data.requests ?? [];
-  return requests.find((request) => request.id === state.selectedRequestId)
-    ?? requests.find((request) => request.status === 'pending')
-    ?? null;
-}
-
-function renderCommands() {
-  const requests = state.data.requests ?? [];
-  const queueRequests = requests.filter((request) => request.status === 'pending');
-  const selected = selectedCommandRequest();
-  const selectedId = selected?.id ?? '';
-  // Pin the request whose approval form is drawn: a poll that prepends a new
-  // pending request must not move the fallback selection under an edit.
-  if (selected?.status === 'pending') state.selectedRequestId = selected.id;
-  return `
-    <div class="row g-3">
-      <div class="col-12 col-xl-4">
-        <div class="card card-outline card-warning h-100">
-          <div class="card-header">
-            <div class="d-flex align-items-center justify-content-between">
-              <h3 class="card-title fw-bold">${escapeHtml(t('cmd.queueTitle'))}</h3>
-              <span class="badge text-bg-warning">${queueRequests.length}${escapeHtml(t('cmd.queueWaiting'))}</span>
-            </div>
-          </div>
-          <div class="card-body p-0">
-            <div class="list-group list-group-flush ssh-list">
-              ${queueRequests.length ? queueRequests.map((request) => requestRow(request, selectedId)).join('') : emptyBlock(t('cmd.queueEmpty'))}
-            </div>
-          </div>
-        </div>
-      </div>
-      <div class="col-12 col-xl-8">
-        ${selected ? commandDetail(selected) : emptyCommandDetail()}
-      </div>
-      <div class="col-12">
-        <div class="card">
-          <div class="card-header">
-            <h3 class="card-title fw-bold">${escapeHtml(t('cmd.historyTitle'))}</h3>
-          </div>
-          <div class="card-body p-0">
-            ${requests.length ? historyTable(requests, selectedId) : emptyBlock(t('cmd.historyEmpty'))}
-          </div>
-        </div>
-      </div>
-    </div>
-  `;
-}
-
-function requestRow(request, selectedId) {
-  return `
-    <button class="list-group-item list-group-item-action ${request.id === selectedId ? 'active' : ''}" type="button" data-select-request="${escapeHtml(request.id)}">
-      <div class="d-flex align-items-start justify-content-between gap-2">
-        <div>
-          <div class="fw-bold">${escapeHtml(request.id)}</div>
-          <small>${escapeHtml(request.host || '-')} / ${escapeHtml(request.requestedBy || t('cmd.unknownAgent'))} / ${escapeHtml(formatTimestamp(request.requestedAt))}</small>
-        </div>
-        <span class="badge ${requestStatusClass(request.status)}">${escapeHtml(requestStatusLabel(request.status))}</span>
-      </div>
-      <code class="d-block mt-2 small text-truncate">${escapeHtml(request.command)}</code>
-    </button>
-  `;
-}
-
-function commandDetail(selected) {
-  const bypassEnabled = agentBypassEnabled(selected.requestedBy);
-  const pending = selected.status === 'pending';
-  const bypassAllowed = Boolean(state.data.mcp?.bypassAllowed);
-  const executed = selected.executedCommand || '';
-  const edited = executed && executed !== selected.command;
-  return `
-    <div class="card card-outline ${pending ? 'card-warning' : 'card-secondary'} h-100">
-      <div class="card-header">
-        <div class="d-flex align-items-start justify-content-between gap-3">
-          <div>
-            <h3 class="card-title fw-bold mb-1">${escapeHtml(pending ? t('cmd.approveTitle') : t('cmd.detailTitle'))}</h3>
-            <div class="text-secondary small">${escapeHtml(pending ? t('cmd.approveSubtitle') : t('cmd.detailSubtitle'))}</div>
-          </div>
-          <span class="badge ${requestStatusClass(selected.status)}">${escapeHtml(requestStatusLabel(selected.status))}</span>
-        </div>
-      </div>
-      <div class="card-body">
-        <div class="command-agent mb-3">
-          <span>${escapeHtml(t('cmd.agent'))}</span>
-          <strong>${escapeHtml(selected.requestedBy || t('cmd.unknownAgent'))}</strong>
-          ${bypassEnabled ? `<em>${escapeHtml(t('cmd.bypassing'))}</em> <button class="btn btn-link btn-sm p-0 ms-2" type="button" data-action="revoke-bypass" data-agent-name="${escapeHtml(selected.requestedBy)}">${escapeHtml(t('cmd.revokeBypass'))}</button>` : ''}
-        </div>
-        <div class="small text-secondary mb-3">${escapeHtml(selected.host || '-')} · ${escapeHtml(formatTimestamp(selected.requestedAt))} · risk ${escapeHtml(selected.risk)}${selected.decidedAt ? ` · ${escapeHtml(t('cmd.decided'))} ${escapeHtml(formatTimestamp(selected.decidedAt))} (${escapeHtml(selected.decidedBy)})` : ''}${selected.exitCode !== null && selected.exitCode !== undefined ? ` · ${escapeHtml(t('cmd.exitCode'))} ${escapeHtml(selected.exitCode)}` : ''}</div>
-
-        <div class="mb-3">
-          <div class="d-flex justify-content-between align-items-center mb-2">
-            <h5 class="fw-bold mb-0">${escapeHtml(t('cmd.plannedCommand'))}</h5>
-            <button class="btn btn-outline-secondary btn-sm" type="button" data-action="copy-command">${escapeHtml(t('common.copy'))}</button>
-          </div>
-          ${pending
-            ? `<textarea class="form-control font-monospace" id="approval-command" data-request-id="${escapeHtml(selected.id)}" rows="3" spellcheck="false" autocapitalize="none" autocorrect="off">${escapeHtml(selected.command)}</textarea>
-               <div class="form-text">${escapeHtml(t('cmd.editHint'))}</div>`
-            : `<pre class="command-block"><code>${escapeHtml(executed || selected.command)}</code></pre>
-               ${edited ? `<div class="small text-warning-emphasis mt-1">${escapeHtml(t('cmd.edited'))}: <code>${escapeHtml(selected.command)}</code></div>` : ''}`}
-        </div>
-
-        <div class="mb-3">
-          <h5 class="fw-bold">${escapeHtml(t('cmd.reason'))}</h5>
-          <div class="reason-box">${escapeHtml(selected.reason || t('cmd.reasonEmpty'))}</div>
-        </div>
-
-        <div class="row g-3">
-          ${terminalPanel('stdout', selected.stdout || (pending ? t('cmd.stdoutPlaceholder') : t('cmd.stdoutEmpty')))}
-          ${terminalPanel('stderr', selected.stderr || t('cmd.stderrPlaceholder'), true)}
-        </div>
-      </div>
-      <div class="card-footer d-flex gap-2">
-        <button class="btn btn-outline-danger" type="button" data-action="delete-command-request" data-command-request-id="${escapeHtml(selected.id)}">
-          <i class="bi bi-trash me-1"></i>${escapeHtml(t('cmd.deleteHistory'))}
-        </button>
-        ${pending ? `
-        <button class="btn btn-danger" type="button" data-action="reject-command">${escapeHtml(t('cmd.reject'))}</button>
-        <span title="${bypassAllowed ? '' : escapeHtml(t('cmd.bypassNeedsBearer'))}">
-          <button class="btn btn-outline-primary" type="button" data-action="approve-bypass-agent" ${bypassAllowed ? '' : 'disabled'}>
-            ${escapeHtml(t('cmd.approveBypass'))}
-          </button>
-        </span>
-        <button class="btn btn-primary ms-auto" type="button" data-action="approve-command">${escapeHtml(t('cmd.approve'))}</button>
-        ` : ''}
-      </div>
-    </div>
-  `;
-}
-
-function agentBypassEnabled(agentName) {
-  const name = String(agentName ?? '').trim();
-  return Boolean(name && (state.data.agentPolicies ?? []).some((policy) => policy.agentName === name && policy.approvalBypass));
-}
-
-function emptyCommandDetail() {
-  return `
-    <div class="card h-100">
-      <div class="card-body empty-state">
-        <i class="bi bi-terminal fs-1 text-secondary"></i>
-        <h4>${escapeHtml(t('cmd.emptyTitle'))}</h4>
-        <p>${escapeHtml(t('cmd.emptyDesc'))}</p>
-      </div>
-    </div>
-  `;
-}
-
 // ---------------------------------------------------------- settings page
 
 function renderSettings() {
@@ -609,6 +776,7 @@ function renderSettings() {
   const endpoint = mcpEndpoint(mcp);
   const config = agentConfig(mcp);
   return `
+    <div id="keychain-notices" class="keychain-notices" hidden></div>
     <form class="row g-3" id="mcp-form">
       <div class="col-12 col-xl-8">
         <div class="card card-outline card-primary">
@@ -720,6 +888,9 @@ function renderSettings() {
         </div>
       </div>
     </form>
+    <div class="row g-3 mt-0">
+      <div class="col-12" id="agents-root"></div>
+    </div>
   `;
 }
 
@@ -765,52 +936,6 @@ function checkCol(label, name, value, col = 'col-12 col-md-6') {
   `;
 }
 
-function terminalPanel(title, content, error = false) {
-  return `
-    <div class="col-12 col-lg-6">
-      <div class="terminal-panel ${error ? 'terminal-error' : ''}">
-        <div class="terminal-title">${title}</div>
-        <pre>${escapeHtml(content)}</pre>
-      </div>
-    </div>
-  `;
-}
-
-function historyTable(requests, selectedId) {
-  return `
-    <div class="table-responsive">
-      <table class="table table-hover align-middle mb-0">
-        <thead>
-          <tr>
-            <th>${escapeHtml(t('hist.time'))}</th>
-            <th>${escapeHtml(t('hist.agent'))}</th>
-            <th>${escapeHtml(t('hist.status'))}</th>
-            <th>${escapeHtml(t('hist.command'))}</th>
-            <th>${escapeHtml(t('hist.reason'))}</th>
-            <th class="text-end">${escapeHtml(t('hist.action'))}</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${requests.map((request) => `
-            <tr class="${request.id === selectedId ? 'table-active' : ''}" data-select-request="${escapeHtml(request.id)}" style="cursor:pointer">
-              <td class="text-nowrap">${escapeHtml(formatTimestamp(request.requestedAt))}</td>
-              <td>${escapeHtml(request.host || '-')}<br><small class="text-secondary">${escapeHtml(request.requestedBy || t('cmd.unknownAgent'))}</small></td>
-              <td><span class="badge ${requestStatusClass(request.status)}">${escapeHtml(requestStatusLabel(request.status))}</span></td>
-              <td><code>${escapeHtml(request.executedCommand || request.command)}</code></td>
-              <td>${escapeHtml(request.reason || '-')}</td>
-              <td class="text-end">
-                <button class="btn btn-outline-danger btn-sm" type="button" data-action="delete-command-request" data-command-request-id="${escapeHtml(request.id)}" title="${escapeHtml(t('cmd.deleteHistory'))}">
-                  <i class="bi bi-trash"></i>
-                </button>
-              </td>
-            </tr>
-          `).join('')}
-        </tbody>
-      </table>
-    </div>
-  `;
-}
-
 function endpointRow(label, path, auth) {
   return `
     <div class="endpoint-row">
@@ -828,10 +953,6 @@ function usageRow(name, description) {
       <span>${escapeHtml(description)}</span>
     </div>
   `;
-}
-
-function emptyBlock(message) {
-  return `<div class="p-4 text-center text-secondary">${escapeHtml(message)}</div>`;
 }
 
 function collectMCPForm() {
@@ -869,170 +990,116 @@ function collectMCPForm() {
 
 // ------------------------------------------------------------- handlers
 
+// The commands page's approve / reject / bypass / copy / selection live in
+// approvals.js; what stays here is the delete modal, the 「すべて表示」 of
+// the filtered queue, and the settings page.
 async function handleCommonClick(event) {
   const actionElement = event.target.closest('[data-action]');
   const action = actionElement?.dataset.action;
+  if (!action) return;
 
-  if (action) {
-    // Must resolve the same request the detail pane renders (selectedCommandRequest),
-    // never by list index: history entries prepend as agents run and indexes shift.
-    const selectedRequest = selectedCommandRequest();
-
-    if (action === 'delete-command-request') {
-      const requestId = actionElement?.dataset.commandRequestId || selectedRequest?.id || '';
-      if (!requestId) return;
-      state.deleteCommand = { open: true, requestId };
-      renderModals();
-      return;
-    }
-
-    if (action === 'close-delete-command') {
-      state.deleteCommand = { open: false, requestId: '' };
-      renderModals();
-      return;
-    }
-
-    if (action === 'confirm-delete-command') {
-      const requestId = state.deleteCommand.requestId;
-      if (!requestId) return;
-      ctx.bumpGen();
-      const result = await DeleteCommandRequest(requestId);
-      if (result.ok) {
-        state.data.requests = state.data.requests.filter((request) => request.id !== requestId);
-        if (state.selectedRequestId === requestId) {
-          state.selectedRequestId = '';
-        }
-      }
-      state.deleteCommand = { open: false, requestId: '' };
-      renderModals();
-      showToast(result.message);
-      await refreshData({ silent: true });
-      return;
-    }
-
-    if (action === 'copy-command') {
-      await copyText(selectedRequest?.command ?? '');
-      return;
-    }
-
-    if (action === 'copy-mcp-endpoint') {
-      await copyText(mcpEndpoint(state.settingsMcp ?? {}));
-      return;
-    }
-
-    if (action === 'copy-agent-config') {
-      await copyText(agentConfig(state.settingsMcp ?? {}));
-      return;
-    }
-
-    if (action === 'approve-command') {
-      if (!selectedRequest) return;
-      if (approvalTarget() !== selectedRequest) {
-        refuseStaleApproval();
-        return;
-      }
-      state.dirty.approval = false;
-      const command = document.querySelector('#approval-command')?.value ?? selectedRequest.command ?? '';
-      actionElement.disabled = true;
-      ctx.bumpGen();
-      let result = await ApproveCommand(selectedRequest.id ?? '', command);
-      if (!result.ok && result.code === 'risk_increased' && window.confirm(`${result.message}\n\n${t('cmd.riskConfirm')}`)) {
-        result = await ApproveCommandConfirmed(selectedRequest.id ?? '', command);
-      }
-      // Keep the approved request selected so its stdout/stderr shows in the pane.
-      state.selectedRequestId = selectedRequest.id ?? '';
-      showToast(result.message);
-      await refreshData({ silent: true });
-      return;
-    }
-
-    if (action === 'approve-bypass-agent') {
-      if (!selectedRequest) return;
-      if (approvalTarget() !== selectedRequest) {
-        refuseStaleApproval();
-        return;
-      }
-      state.dirty.approval = false;
-      const command = document.querySelector('#approval-command')?.value ?? selectedRequest.command ?? '';
-      actionElement.disabled = true;
-      ctx.bumpGen();
-      const result = await ApproveCommandAndBypassAgent(selectedRequest.id ?? '', command);
-      state.selectedRequestId = selectedRequest.id ?? '';
-      showToast(result.message);
-      await refreshData({ silent: true });
-      return;
-    }
-
-    if (action === 'revoke-bypass') {
-      ctx.bumpGen();
-      const result = await RevokeAgentApprovalBypass(actionElement.dataset.agentName ?? '');
-      showToast(result.message);
-      await refreshData({ silent: true });
-      return;
-    }
-
-    if (action === 'generate-token') {
-      ctx.bumpGen();
-      const result = await GenerateMCPToken();
-      showToast(result.message);
-      if (result.token) state.issuedToken = result.token;
-      state.dirty.settings = false;
-      await refreshData({ silent: true });
-      return;
-    }
-
-    if (action === 'copy-token') {
-      await copyText(state.issuedToken);
-      return;
-    }
-
-    if (action === 'copy-lan-url') {
-      await copyText(state.settingsMcp?.lanURL ?? '');
-      return;
-    }
-
-    if (action === 'reject-command') {
-      if (!selectedRequest) return;
-      if (approvalTarget() !== selectedRequest) {
-        refuseStaleApproval();
-        return;
-      }
-      state.dirty.approval = false;
-      ctx.bumpGen();
-      const result = await RejectCommand(selectedRequest.id ?? '');
-      showToast(result.message);
-      await refreshData({ silent: true });
-      return;
-    }
-
-    if (action === 'refresh-mcp') {
-      await refreshData({ silent: true });
-      showToast(t('mcp.refreshed'));
-      return;
-    }
-
-    if (action === 'delete-mcp') {
-      if (!window.confirm(t('mcp.deleteConfirm'))) {
-        return;
-      }
-      ctx.bumpGen();
-      const result = await DeleteMCPSettings();
-      showToast(result.message);
-      state.dirty.settings = false;
-      await refreshData({ silent: true });
-      return;
-    }
+  if (action === 'delete-command-request') {
+    // The request the detail pane shows (filtered, by id; never by index).
+    const requestId = actionElement?.dataset.commandRequestId || selectedCommandRequest(state, currentView())?.id || '';
+    if (!requestId) return;
+    state.deleteCommand = { open: true, requestId };
+    renderModals();
+    return;
   }
 
-  const request = event.target.closest('[data-select-request]');
-  if (request) {
-    state.selectedRequestId = request.dataset.selectRequest;
-    state.dirty.approval = false;
-    renderPage();
+  if (action === 'close-delete-command') {
+    state.deleteCommand = { open: false, requestId: '' };
+    renderModals();
+    return;
+  }
+
+  if (action === 'confirm-delete-command') {
+    const requestId = state.deleteCommand.requestId;
+    if (!requestId) return;
+    ctx.bumpGen();
+    const result = await DeleteCommandRequest(requestId);
+    if (result.ok) {
+      state.data.requests = state.data.requests.filter((request) => request.id !== requestId);
+      if (state.selectedRequestId === requestId) {
+        state.selectedRequestId = '';
+      }
+    }
+    state.deleteCommand = { open: false, requestId: '' };
+    renderModals();
+    showToast(result.message);
+    await refreshData({ silent: true });
+    return;
+  }
+
+  if (action === 'srvfilter-show-all') {
+    await setServerFilter(ALL_SERVERS, { source: 'commands' });
+    return;
+  }
+
+  if (action === 'restart-terminal') {
+    // An open tab whose saved settings changed: close it and open a new one
+    // (a new TERM id) on the same connection.
+    const id = actionElement.dataset.termId ?? '';
+    const connId = getTerminalState().tabs.get(id)?.connId ?? '';
+    if (!connId) return;
+    state.reconnectNeeded.delete(connId);
+    await closeTerminalTab(id);
+    await openTerminalTab(connId);
+    return;
+  }
+
+  if (action === 'copy-mcp-endpoint') {
+    await copyText(mcpEndpoint(state.settingsMcp ?? {}));
+    return;
+  }
+
+  if (action === 'copy-agent-config') {
+    await copyText(agentConfig(state.settingsMcp ?? {}));
+    return;
+  }
+
+  if (action === 'generate-token') {
+    ctx.bumpGen();
+    const result = await GenerateMCPToken();
+    showToast(result.message);
+    if (result.token) state.issuedToken = result.token;
+    state.dirty.settings = false;
+    await refreshData({ silent: true });
+    return;
+  }
+
+  if (action === 'copy-token') {
+    await copyText(state.issuedToken);
+    return;
+  }
+
+  if (action === 'copy-lan-url') {
+    await copyText(state.settingsMcp?.lanURL ?? '');
+    return;
+  }
+
+  if (action === 'refresh-mcp') {
+    await refreshData({ silent: true });
+    showToast(t('mcp.refreshed'));
+    return;
+  }
+
+  if (action === 'delete-mcp') {
+    if (!window.confirm(t('mcp.deleteConfirm'))) {
+      return;
+    }
+    ctx.bumpGen();
+    const result = await DeleteMCPSettings();
+    showToast(result.message);
+    state.dirty.settings = false;
+    await refreshData({ silent: true });
   }
 }
 
 app.addEventListener('click', async (event) => {
+  // servertabs.js handles its own buttons on #server-tabs / #shell-subtabs.
+  if (event.target.closest('[data-action^="srvtab-"]')) return;
+
   const langButton = event.target.closest('[data-lang]');
   if (langButton) {
     const lang = langButton.dataset.lang;
@@ -1050,12 +1117,16 @@ app.addEventListener('click', async (event) => {
 
   if (state.active === 'connections' && await handleEditorClick(event, ctx)) return;
   if (state.active === 'terminal' && await handleTerminalClick(event, ctx)) return;
+  if (state.active === 'commands' && await handleApprovalsClick(event, ctx, currentView())) return;
+  if (state.active === 'settings' && await handleAgentsClick(event, ctx)) return;
+  if (state.active === 'settings' && await handleCredentialsClick(event, ctx)) return;
 
   await handleCommonClick(event);
 });
 
 app.addEventListener('submit', async (event) => {
   event.preventDefault();
+  if (state.active === 'settings' && await handleAgentsSubmit(event, ctx)) return;
   if (state.active === 'connections' && await handleEditorSubmit(event, ctx)) return;
   if (event.target.id === 'mcp-form') {
     const form = collectMCPForm();
@@ -1074,7 +1145,8 @@ app.addEventListener('submit', async (event) => {
 
 app.addEventListener('input', (event) => {
   if (state.active === 'connections' && handleEditorInput(event, ctx)) return;
-  if (event.target.id === 'approval-command') state.dirty.approval = true;
+  if (state.active === 'commands' && handleApprovalsInput(event, ctx)) return;
+  if (state.active === 'settings' && handleAgentsInput(event)) return;
   if (event.target.closest('#mcp-form')) state.dirty.settings = true;
 });
 
@@ -1086,13 +1158,25 @@ app.addEventListener('change', async (event) => {
 
 // ------------------------------------------------------------- startup
 
+function loadPlatform() {
+  try {
+    Promise.resolve(Environment())
+      .then((env) => { platform = String(env?.platform ?? ''); })
+      .catch(() => {});
+  } catch {
+    // No Wails runtime (tests); OS-specific serial checks stay off.
+  }
+}
+
 async function start() {
   app.innerHTML = renderSkeleton({ t, logoUrl });
+  // ctx.terminalKeyHandler is already set: every xterm gets the shortcuts.
   initTerminalTabs(ctx);
+  loadPlatform();
   renderAll();
   window.setInterval(pollData, 5000);
   // On failure the error stays in #page-root until a later poll succeeds
-  // (that poll also restores the terminal tabs).
+  // (that poll also restores the terminal tabs and checks the saved filter).
   if (!(await refreshData())) return;
   renderAll();
 }

@@ -16,6 +16,10 @@ import {
   sortSessionsForSidebar,
   summarizeSessions,
 } from './model.js';
+import * as model from './model.js';
+import * as serverfilter from './serverfilter.js';
+import { serverTabs } from './serverfilter.js';
+import { serverStateSymbol } from './servertabs.js';
 
 const NOW = Date.parse('2026-10-27T12:00:00Z');
 const ago = (minutes) => new Date(NOW - minutes * 60000).toISOString();
@@ -263,8 +267,20 @@ describe('state labels', () => {
     ['disconnected', '○'],
     ['error', '▲'],
     ['in_use', '◆'],
+    ['idle', '●'],
+    ['available', '○'],
+    ['missing', '○'],
+    ['weird', '○'],
   ])('connStateSymbol(%s) = %s', (code, symbol) => {
     expect(connStateSymbol(code)).toBe(symbol);
+  });
+
+  it('serverfilter.js and servertabs.js fallback use the same symbols', () => {
+    for (const code of ['connected', 'connecting', 'disconnected', 'error', 'in_use', 'available', 'missing']) {
+      const [, tab] = serverTabs([{ id: 'c', name: 'n' }], [{ connId: 'c', connState: code }], []);
+      expect(tab.symbol, code).toBe(connStateSymbol(code));
+      expect(serverStateSymbol(code), code).toBe(connStateSymbol(code));
+    }
   });
 
   it('label keys exist in MODEL_I18N for every known code', () => {
@@ -318,5 +334,17 @@ describe('escapeHtml', () => {
     [0, '0'],
   ])('%j', (input, want) => {
     expect(escapeHtml(input)).toBe(want);
+  });
+});
+
+describe('server filter re-exports', () => {
+  it('model.js re-exports the serverfilter.js functions unchanged', () => {
+    for (const name of ['filterByServer', 'isUnknownConnection', 'recordConnId', 'connectionIndex']) {
+      expect(model[name], name).toBe(serverfilter[name]);
+    }
+    const conns = [{ id: 'c-web', name: 'web-01' }];
+    const reqs = [{ id: 'R1', connectionId: 'c-web' }, { id: 'R2', connectionId: 'c-gone' }];
+    expect(model.filterByServer(reqs, 'c-web', conns).map((r) => r.id)).toEqual(['R1']);
+    expect(model.filterByServer(reqs, '', conns).map((r) => r.id)).toEqual(['R1', 'R2']);
   });
 });

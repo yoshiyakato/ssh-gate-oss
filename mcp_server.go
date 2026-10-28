@@ -34,7 +34,7 @@ var requestStates = []string{
 	stateInterrupted, stateAutoRunning, stateAutoSucceeded, stateAutoFailed,
 }
 
-var errorKinds = []string{"connect", "auth", "hostkey", "hostkey_unknown", "timeout", "exit_nonzero", "canceled"}
+var errorKinds = []string{"connect", "auth", "credential_unavailable", "hostkey", "hostkey_unknown", "timeout", "exit_nonzero", "canceled"}
 
 type rpcRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -496,7 +496,7 @@ func (a *App) runBypassedCommand(ctx context.Context, conn Connection, args exec
 	go func() {
 		// Released after finishRequest, so the drain sees the stored outcome.
 		defer release()
-		result, execErr := a.executeSSH(execCtx, conn, args.Command, args.TimeoutSeconds)
+		result, execErr := a.executeSSH(execCtx, conn, args.Command, args.TimeoutSeconds, mcpCredentialTimeout)
 		state := stateAutoSucceeded
 		switch {
 		case execErr == nil:

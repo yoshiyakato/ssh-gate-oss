@@ -551,115 +551,207 @@ body {
   border-bottom: 1px solid var(--bs-border-color);
 }
 
-.term-tabs {
+/* Phase 4: the top server tabs (#server-tabs) and the shell sub-tabs
+   (#shell-subtabs) replace the phase 2 .term-tabs strip. State is always
+   carried by the symbol and text too; colour only helps. */
+.server-tabs-bar {
   display: flex;
-  flex: 1 1 auto;
   gap: .25rem;
-  min-width: 0;
+  margin-bottom: .75rem;
+  padding-bottom: .25rem;
   overflow-x: auto;
   scrollbar-width: thin;
+  border-bottom: 1px solid var(--bs-border-color);
 }
 
-.term-tab {
+.server-tabs-bar:empty {
+  display: none;
+}
+
+.server-tab {
   display: inline-flex;
   flex: 0 0 auto;
   align-items: center;
-  max-width: 16rem;
+  gap: .35rem;
+  max-width: 18rem;
+  padding: .35rem .7rem;
+  color: var(--bs-secondary-color);
+  background: var(--bs-tertiary-bg);
+  border: 1px solid var(--bs-border-color);
+  border-radius: 999px;
+  font-size: .86rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.server-tab:hover {
+  color: var(--bs-body-color);
+}
+
+.server-tab.is-active {
+  color: #fff;
+  background: var(--ssh-accent);
+  border-color: var(--ssh-accent);
+}
+
+.server-tab:focus-visible,
+.shell-subtab:focus-visible,
+.shell-subtab-new:focus-visible {
+  outline: 2px solid var(--ssh-accent);
+  outline-offset: 2px;
+}
+
+.server-tab-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.server-tab-symbol {
+  font-size: .8em;
+}
+
+.server-tab.is-connected:not(.is-active) .server-tab-symbol {
+  color: var(--bs-success);
+}
+
+.server-tab.is-error:not(.is-active) .server-tab-symbol {
+  color: var(--bs-danger);
+}
+
+.server-tab.is-in_use:not(.is-active) .server-tab-symbol {
+  color: var(--bs-info);
+}
+
+.server-tab.is-missing .server-tab-name {
+  text-decoration: line-through;
+  text-decoration-color: rgba(var(--bs-secondary-rgb), .6);
+}
+
+.server-tab-shells,
+.server-tab-pending {
+  padding: 0 .35rem;
+  border-radius: .3rem;
+  font-size: .76rem;
+  background: rgba(var(--bs-secondary-rgb), .15);
+}
+
+.server-tab-pending {
+  color: var(--bs-warning-text-emphasis);
+  background: var(--bs-warning-bg-subtle);
+}
+
+.server-tab.is-active .server-tab-shells,
+.server-tab.is-active .server-tab-pending {
+  color: inherit;
+  background: rgba(255, 255, 255, .2);
+}
+
+.shell-subtabs-bar {
+  display: flex;
+  gap: .25rem;
+  margin-bottom: .5rem;
+  overflow-x: auto;
+  scrollbar-width: thin;
+  border-bottom: 1px solid var(--bs-border-color);
+}
+
+.shell-subtab,
+.shell-subtab-new {
+  flex: 0 0 auto;
+  max-width: 22rem;
   margin-bottom: -1px;
+  padding: .4rem .7rem;
+  overflow: hidden;
   color: var(--bs-secondary-color);
   background: var(--bs-tertiary-bg);
   border: 1px solid var(--bs-border-color);
   border-radius: .45rem .45rem 0 0;
-}
-
-.term-tab > button {
-  min-width: 0;
-  padding: .4rem .6rem;
-  color: inherit;
-  background: transparent;
-  border: 0;
   font-size: .86rem;
   font-weight: 700;
-}
-
-.term-tab > button[data-action="term-activate"] {
-  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.term-tab:hover {
+.shell-subtab:hover,
+.shell-subtab-new:hover {
   color: var(--bs-body-color);
 }
 
-.term-tab.is-active {
+.shell-subtab.is-active {
   color: var(--bs-body-color);
   background: var(--bs-body-bg);
   border-bottom-color: var(--bs-body-bg);
   box-shadow: inset 0 2px 0 var(--ssh-accent);
 }
 
-.term-tab.is-starting > button[data-action="term-activate"] {
+.shell-subtab.is-starting {
   opacity: .7;
   font-style: italic;
 }
 
-.term-tab.is-exited {
+.shell-subtab.is-exited {
   border-style: dashed;
-}
-
-.term-tab.is-exited > button[data-action="term-activate"] {
-  color: var(--bs-secondary-color);
   text-decoration: line-through;
   text-decoration-color: rgba(var(--bs-secondary-rgb), .6);
 }
 
-/* "(接続中…)" / "(終了)" next to the label. inline-block keeps the exited
-   tab's strikethrough off the status word itself. */
-.term-tab-status {
-  display: inline-block;
-  margin-left: .2rem;
-  color: var(--bs-secondary-color);
-  font-size: .76rem;
-  font-weight: 600;
-  font-style: normal;
-  text-decoration: none;
-}
-
-.term-tab > .term-tab-reconnect {
-  margin: 0 .1rem;
-  padding: .12rem .45rem;
+.shell-subtab-new {
   color: var(--ssh-accent);
-  border: 1px solid currentColor;
-  border-radius: .3rem;
-  font-size: .74rem;
-  font-weight: 800;
-  white-space: nowrap;
+  border-style: dashed;
 }
 
-.term-tab > .term-tab-reconnect:hover,
-.term-tab > .term-tab-reconnect:focus-visible {
-  color: #fff;
-  background: var(--ssh-accent);
-  border-color: var(--ssh-accent);
+/* Panes of other servers get the hidden attribute (terminal-tabs.js
+   setTerminalServerFilter); nothing may override it. */
+.term-pane[hidden] {
+  display: none !important;
 }
 
-.term-tab > .term-tab-close {
-  flex: 0 0 auto;
-  padding: .3rem .4rem;
-  line-height: 1;
-  border-radius: .3rem;
+.term-active-actions {
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .5rem;
+  padding-bottom: .4rem;
 }
 
-.term-tab > .term-tab-close:hover,
-.term-tab > .term-tab-close:focus-visible {
-  color: var(--bs-danger);
-  background: rgba(var(--bs-danger-rgb), .1);
+.term-active-note {
+  font-size: .86rem;
+  font-weight: 700;
 }
 
-.term-tab > button:focus-visible {
-  outline: 2px solid var(--ssh-accent);
-  outline-offset: -2px;
+.unknown-conn {
+  font-weight: 700;
+}
+
+.approval-hostkey code,
+.editor-hostkey-fp,
+.plaintext-backup-path {
+  word-break: break-all;
+}
+
+.agents-section .table td {
+  overflow-wrap: anywhere;
+}
+
+.agents-scope {
+  margin: 0;
+  padding-left: 1rem;
+}
+
+#agents-modal-root .modal,
+#credential-modal-root .modal {
+  overflow-y: auto;
+}
+
+#credential-modal-root .modal-footer {
+  flex-wrap: wrap;
+  gap: .5rem;
+}
+
+#credential-modal-root .modal-footer > * {
+  margin: 0;
 }
 
 .term-new {
@@ -834,7 +926,7 @@ body {
 }
 
 @media (prefers-reduced-motion: no-preference) {
-  .term-tab.is-starting > button[data-action="term-activate"] {
+  .shell-subtab.is-starting {
     animation: term-starting 1.2s ease-in-out infinite;
   }
 }

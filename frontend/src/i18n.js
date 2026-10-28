@@ -8,6 +8,11 @@ import { MODEL_I18N, mergeI18n } from './model.js';
 import { SIDEBAR_I18N } from './sidebar.js';
 import { EDITOR_I18N } from './editor.js';
 import { TERMINAL_I18N } from './terminal-tabs.js';
+import { APPROVALS_I18N } from './approvals.js';
+import { AGENTS_I18N } from './agents.js';
+import { SERVERTABS_I18N } from './servertabs.js';
+import { SHORTCUTS_I18N } from './shortcuts.js';
+import { CREDENTIALS_I18N } from './credentials.js';
 
 export const BASE_I18N = {
   ja: {
@@ -89,7 +94,7 @@ export const BASE_I18N = {
     'hist.action': '操作',
 
     'mcp.title': 'MCPサーバー待受設定',
-    'mcp.subtitle': 'ローカルエージェントがssh-geteへ接続するためのHTTP MCP待受を管理します。',
+    'mcp.subtitle': 'ローカルエージェントがssh-geteを使うためのHTTP MCP待受を管理します。',
     'mcp.enable': 'MCP待受を有効化',
     'mcp.bearer': 'Bearer認証',
     'mcp.listenAddress': '待受アドレス',
@@ -136,6 +141,27 @@ export const BASE_I18N = {
     'mcp.deleteConfirm': 'MCPサーバー待受設定を削除し、待受を停止します。よろしいですか？',
 
     'fatal.init': 'Wailsバックエンドの初期化に失敗しました。',
+
+    // phase 4: server filter (phase4-ui-integration §3.3). The filtered
+    // queue texts live in approvals.js (appr.*), the empty shell text in
+    // terminal-tabs.js (tabs.emptyFiltered).
+    'srvfilter.removed': '選んでいた接続先が無くなったため「すべて」に戻しました',
+    'cmd.discardEditOnFilter': '編集中のコマンドを破棄して切り替えますか？',
+    // StartTerminal failure codes (phase4-serial-patch §10-4). JA shows the
+    // backend message; these are the EN texts.
+    'term.code.port_in_use': '同じデバイスは別のターミナルで使用中です',
+    'term.code.port_busy': 'ポートは他のアプリケーションが使用中です',
+    'term.code.permission_denied': 'ポートを開く権限がありません',
+    'term.code.port_not_found': 'ポートが見つかりません',
+    'term.code.invalid_serial_mode': 'シリアルの通信設定が正しくありません',
+    'term.code.open_failed': 'ポートを開けませんでした',
+    'term.code.needs_password': '保存したパスワードがキーチェーンに見つかりません。接続先画面でパスワードを入力し直してください',
+    'term.code.keyring_unavailable': 'キーチェーンを利用できないため、保存したパスワードを読み出せません。キーチェーンのロックを解除するか、このセッションだけ使うパスワードを入力してください',
+    // SaveConnection codes about an open serial tab (§10-3).
+    'term.save.serial_mode_applied': '開いているターミナルに新しい通信設定を適用しました',
+    'term.save.serial_mode_not_applied': '開いているターミナルには通信設定を適用できませんでした。再接続すると反映されます',
+    'term.save.reconnect_required': '開いているターミナルは変更前の設定のままです。再接続すると反映されます',
+    'term.settingsChanged': '接続先の設定が変わりました。再接続すると反映されます',
   },
   en: {
     'sidebar.toggle': 'Toggle sidebar',
@@ -216,7 +242,7 @@ export const BASE_I18N = {
     'hist.action': 'Action',
 
     'mcp.title': 'MCP Server Listener Settings',
-    'mcp.subtitle': 'Manage the HTTP MCP listener that local agents use to connect to ssh-gete.',
+    'mcp.subtitle': 'Manage the HTTP MCP listener that local agents use to call ssh-gete.',
     'mcp.enable': 'Enable MCP Listener',
     'mcp.bearer': 'Bearer Auth',
     'mcp.listenAddress': 'Listen Address',
@@ -263,7 +289,33 @@ export const BASE_I18N = {
     'mcp.deleteConfirm': 'This deletes the MCP server listener settings and stops the listener. Continue?',
 
     'fatal.init': 'Failed to initialize the Wails backend.',
+
+    'srvfilter.removed': 'The selected connection was removed; showing all',
+    'cmd.discardEditOnFilter': 'Discard the edited command and switch?',
+    'term.code.port_in_use': 'The same device is in use by another terminal',
+    'term.code.port_busy': 'The port is in use by another application',
+    'term.code.permission_denied': 'Permission denied when opening the port',
+    'term.code.port_not_found': 'Port not found',
+    'term.code.invalid_serial_mode': 'Invalid serial line settings',
+    'term.code.open_failed': 'Could not open the port',
+    'term.code.needs_password': 'The saved password is not in the keychain. Enter the password again on the connections page',
+    'term.code.keyring_unavailable': 'The saved password cannot be read because the keychain is unavailable. Unlock the keychain, or enter a password for this session only',
+    'term.save.serial_mode_applied': 'The new line settings were applied to the open terminal',
+    'term.save.serial_mode_not_applied': 'The line settings could not be applied to the open terminal. Reconnect to apply them',
+    'term.save.reconnect_required': 'The open terminal still uses the previous settings. Reconnect to apply them',
+    'term.settingsChanged': 'The connection settings changed. Reconnect to apply them',
   },
 };
 
-export const I18N = mergeI18n(BASE_I18N, TERMINAL_I18N, SIDEBAR_I18N, EDITOR_I18N, MODEL_I18N);
+export const I18N = mergeI18n(
+  BASE_I18N,
+  TERMINAL_I18N,
+  SIDEBAR_I18N,
+  EDITOR_I18N,
+  MODEL_I18N,
+  APPROVALS_I18N,
+  AGENTS_I18N,
+  SERVERTABS_I18N,
+  SHORTCUTS_I18N,
+  CREDENTIALS_I18N,
+);

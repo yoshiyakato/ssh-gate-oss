@@ -59,6 +59,8 @@ exports[`renderSkeleton > renders the fixed containers once (en) 1`] = `
         </div>
         <div class="app-content">
           <div class="container-fluid">
+            <div id="server-tabs" class="server-tabs-bar"></div>
+            <div id="shell-subtabs" class="shell-subtabs-bar" hidden></div>
             <div id="page-root"></div>
             <div id="terminal-dock"></div>
           </div>
@@ -128,6 +130,8 @@ exports[`renderSkeleton > renders the fixed containers once (ja) 1`] = `
         </div>
         <div class="app-content">
           <div class="container-fluid">
+            <div id="server-tabs" class="server-tabs-bar"></div>
+            <div id="shell-subtabs" class="shell-subtabs-bar" hidden></div>
             <div id="page-root"></div>
             <div id="terminal-dock"></div>
           </div>

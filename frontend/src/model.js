@@ -2,6 +2,18 @@
 // Nothing here touches the DOM, Wails, or module state, so each function can
 // be unit tested with plain values.
 
+// Server filter helpers (design-v1 §7 phase 4 names them under model.js). The
+// implementation lives in serverfilter.js; it is re-exported here so modules
+// that may only import model.js (contract §2.1) can use the same rules.
+// normalizeServerFilter is deliberately not re-exported: servertabs.js has a
+// sessions-based function of the same name, and main.js imports that one.
+export {
+  connectionIndex,
+  recordConnId,
+  filterByServer,
+  isUnknownConnection,
+} from './serverfilter.js';
+
 // MODEL_I18N holds the state labels of design §6.3 under the `state.` prefix.
 export const MODEL_I18N = {
   ja: {
@@ -240,9 +252,13 @@ export function connStateLabelKey(code) {
   return `state.conn.${CONN_STATES.includes(code) ? code : 'disconnected'}`;
 }
 
+// connStateSymbol is the single symbol table (design §6.1 / §6.3, contract
+// §2.6). Serial `available` and `missing` are both ○: an unplugged adapter is
+// not an error (phase4-serial-patch.md §10.7), and the label says which.
+// serverfilter.js and servertabs.js (via `symbolOf`) use this function.
 export function connStateSymbol(code) {
   if (code === 'connected' || code === 'idle') return '●';
-  if (code === 'error' || code === 'missing') return '▲';
+  if (code === 'error') return '▲';
   if (code === 'in_use') return '◆';
   return '○';
 }

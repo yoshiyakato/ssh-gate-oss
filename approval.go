@@ -307,6 +307,11 @@ func (a *App) approve(id string, command string, allowRiskIncrease bool, grantBy
 		}
 	}
 	conn, _, connOK := a.resolveRequestTarget(req)
+	// Serial connections are interactive-only: refuse before the request
+	// leaves pending (phase4-serial-patch §7.5).
+	if connOK && conn.connectionType() == "Serial" {
+		return ActionResult{OK: false, Code: "serial_not_supported", Message: "シリアルの接続先では承認・実行できません。この要求は拒否してください"}
+	}
 	// A request is approved for the user@host:port the agent asked about. If
 	// the connection was edited since, refuse; the agent has to ask again.
 	if connOK && req.TargetFP != "" && targetFingerprint(conn) != req.TargetFP {
@@ -371,7 +376,7 @@ func (a *App) approve(id string, command string, allowRiskIncrease bool, grantBy
 		a.finishRequest(running, stateFailed, commandResult{}, errors.New("対象ホストが接続先一覧にありません"))
 		return ActionResult{OK: false, Message: "対象ホストが接続先一覧にありません" + bypassNote}
 	}
-	result, execErr := a.executeSSH(execCtx, conn, command, 0)
+	result, execErr := a.executeSSH(execCtx, conn, command, 0, guiCredentialTimeout)
 	if errors.Is(execErr, errShuttingDown) {
 		// finishRequest records it as interrupted.
 		a.finishRequest(running, stateFailed, result, execErr)
@@ -403,7 +408,7 @@ func agentStderr(stderr string, errorKind string) string {
 		return stderr[:i] + execErrorMarker + agentErrorMessage(errorKind)
 	}
 	switch errorKind {
-	case "connect", "auth", "hostkey", "hostkey_unknown":
+	case "connect", "auth", "credential_unavailable", "hostkey", "hostkey_unknown":
 		return execErrorMarker + agentErrorMessage(errorKind)
 	}
 	return stderr
@@ -415,6 +420,8 @@ func agentErrorMessage(errorKind string) string {
 		return "could not connect to the host"
 	case "auth":
 		return "SSH authentication failed"
+	case "credential_unavailable":
+		return "the saved password could not be read from the keychain; retry later or ask the human to unlock it"
 	case "hostkey":
 		return "host key verification failed: the presented key does not match the trusted key"
 	case "hostkey_unknown":
@@ -569,9 +576,18 @@ func (a *App) queueCommand(conn Connection, command string, reason string, reque
 	return req, a.recordCommandRequest(req)
 }
 
-func (a *App) executeSSH(parent context.Context, conn Connection, command string, timeoutOverride int) (commandResult, error) {
+// credTimeout bounds the keychain read of a stored password
+// (guiCredentialTimeout for a GUI approval, mcpCredentialTimeout for an
+// agent's direct run).
+func (a *App) executeSSH(parent context.Context, conn Connection, command string, timeoutOverride int, credTimeout time.Duration) (commandResult, error) {
 	if conn.connectionType() == "Serial" {
 		return commandResult{}, errors.New("serial connections are interactive-only")
+	}
+	credCtx, credCancel := context.WithTimeout(parent, credTimeout)
+	conn, err := a.resolveCredential(credCtx, conn)
+	credCancel()
+	if err != nil {
+		return commandResult{}, err
 	}
 	timeout := timeoutSeconds(conn.CommandTimeout, 30)
 	if timeoutOverride > 0 {
@@ -584,7 +600,9 @@ func (a *App) executeSSH(parent context.Context, conn Connection, command string
 	a.mu.RLock()
 	outputCap := a.mcp.MaxOutputKB * 1024
 	strictHostKey := a.mcp.StrictHostKey
-	conn.KeyPassphrase = a.sshPassphrases[conn.ID]
+	if conn.KeyPassphrase == "" {
+		conn.KeyPassphrase = a.sshPassphrases[conn.ID]
+	}
 	a.mu.RUnlock()
 	if outputCap <= 0 {
 		outputCap = defaultOutputCap
@@ -618,9 +636,12 @@ func isExitError(err error) bool {
 
 func classifyExecError(err error) string {
 	var missing *passphraseMissingError
+	var credErr *credentialError
 	switch {
 	case err == nil:
 		return ""
+	case errors.As(err, &credErr):
+		return "credential_unavailable"
 	case isStopCause(err):
 		return "canceled"
 	case isExitError(err):

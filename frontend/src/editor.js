@@ -16,9 +16,12 @@ import {
 import {
   DeleteConnection,
   DisconnectConnection,
+  GetHostKeyInfo,
   ListSerialPorts,
+  ResetHostKey,
   SaveConnection,
   TestConnectionConfig,
+  TestConnectionWithPassphraseSave,
 } from '../wailsjs/go/main/App';
 
 export const EDITOR_I18N = {
@@ -97,6 +100,38 @@ export const EDITOR_I18N = {
     'edit.passphrase.label': 'パスフレーズ',
     'edit.passphrase.help': 'SQLiteには保存せず、このアプリ起動中のSSH接続だけに使います。',
     'edit.passphrase.submit': '続行',
+    'edit.passphrase.save': 'キーチェーンに保存する（次回から入力不要）',
+    'edit.dataBits': 'データビット',
+    'edit.parity': 'パリティ',
+    'edit.parity.none': 'なし (none)',
+    'edit.parity.odd': '奇数 (odd)',
+    'edit.parity.even': '偶数 (even)',
+    'edit.parity.mark': 'マーク (mark)',
+    'edit.parity.space': 'スペース (space)',
+    'edit.stopBits': 'ストップビット',
+    'edit.flowControlNote': 'RTS/CTS フロー制御は非対応です。',
+    'edit.serial.err.dataBits': 'データビットは 5〜8 で指定してください',
+    'edit.serial.err.parity': 'パリティは none / odd / even / mark / space のいずれかです',
+    'edit.serial.err.parityOS': 'この OS ではマーク/スペースパリティを使えません',
+    'edit.serial.err.stopBits': 'ストップビットは 1 / 1.5 / 2 のいずれかです',
+    'edit.serial.err.stopBits15OS': 'この OS では 1.5 ストップビットを使えません',
+    'edit.serial.err.stopBits15': '1.5 ストップビットはデータビット 5 のときだけ使えます',
+    'edit.serial.err.stopBits5': 'データビット 5 では 2 ストップビットを使えません（1.5 を選んでください）',
+    'edit.serialDropsSSH': 'Serial として保存すると、この接続先の SSH 設定（ホスト・ユーザー・鍵パス・保存済みパスワード）と MCP 初回信頼の設定は削除されます。保存する前に SSH に戻せば元のままです。',
+    'edit.hostKey': 'ホスト鍵',
+    'edit.hostKeyLoading': '読み込み中…',
+    'edit.hostKeyUnknown': '未記録です。次の接続テストで記録します。',
+    'edit.hostKeyUnsaved': '保存して接続テストすると記録します。',
+    'edit.hostKeyError': 'ホスト鍵を読み込めません: {message}',
+    'edit.hostKeyRecorded': '記録 {date}',
+    'edit.hostKeyAddress': '対象: {address}（同じホストとポートの接続先すべてで共通）',
+    'edit.hostKeyShared': '共有している接続先: {names}',
+    'edit.hostKeyDraftDiffers': '表示しているのは保存済みのホストとポートの鍵です。',
+    'edit.hostKeyReset': 'ホスト鍵をリセット',
+    'edit.hostKeyReset.title': 'ホスト鍵をリセット',
+    'edit.hostKeyReset.body': '{address} に記録したホスト鍵を削除します。',
+    'edit.hostKeyReset.scope': '同じホストとポートを使う接続先すべてに効きます:',
+    'edit.hostKeyReset.after': '次の接続テストで新しい鍵を記録します。それまで MCP からの実行は hostkey_unknown で失敗します。鍵が変わった理由が分からないときはリセットしないでください。',
   },
   en: {
     'edit.listTitle': 'Connection List',
@@ -173,6 +208,38 @@ export const EDITOR_I18N = {
     'edit.passphrase.label': 'Passphrase',
     'edit.passphrase.help': 'Not stored in SQLite; used only for SSH while this app is running.',
     'edit.passphrase.submit': 'Continue',
+    'edit.passphrase.save': 'Save in keychain (no need to enter it next time)',
+    'edit.dataBits': 'Data Bits',
+    'edit.parity': 'Parity',
+    'edit.parity.none': 'None',
+    'edit.parity.odd': 'Odd',
+    'edit.parity.even': 'Even',
+    'edit.parity.mark': 'Mark',
+    'edit.parity.space': 'Space',
+    'edit.stopBits': 'Stop Bits',
+    'edit.flowControlNote': 'RTS/CTS flow control is not supported.',
+    'edit.serial.err.dataBits': 'Data bits must be 5 to 8.',
+    'edit.serial.err.parity': 'Parity must be none / odd / even / mark / space.',
+    'edit.serial.err.parityOS': 'Mark / space parity is not available on this OS.',
+    'edit.serial.err.stopBits': 'Stop bits must be 1 / 1.5 / 2.',
+    'edit.serial.err.stopBits15OS': '1.5 stop bits are not available on this OS.',
+    'edit.serial.err.stopBits15': '1.5 stop bits are only available with 5 data bits.',
+    'edit.serial.err.stopBits5': '2 stop bits are not available with 5 data bits (choose 1.5).',
+    'edit.serialDropsSSH': "Saving as Serial deletes this connection's SSH settings (host, user, key path, stored password) and its MCP first-trust setting. Switching back to SSH before saving keeps them.",
+    'edit.hostKey': 'Host Key',
+    'edit.hostKeyLoading': 'Loading…',
+    'edit.hostKeyUnknown': 'Not recorded. The next connection test records it.',
+    'edit.hostKeyUnsaved': 'Save and run a connection test to record it.',
+    'edit.hostKeyError': 'Cannot load the host key: {message}',
+    'edit.hostKeyRecorded': 'recorded {date}',
+    'edit.hostKeyAddress': 'For {address} (shared by every connection with this host and port)',
+    'edit.hostKeyShared': 'Shared with: {names}',
+    'edit.hostKeyDraftDiffers': 'This is the key of the saved host and port.',
+    'edit.hostKeyReset': 'Reset Host Key',
+    'edit.hostKeyReset.title': 'Reset Host Key',
+    'edit.hostKeyReset.body': 'Delete the host key recorded for {address}.',
+    'edit.hostKeyReset.scope': 'This affects every connection that uses the same host and port:',
+    'edit.hostKeyReset.after': 'The next connection test records the new key. Until then, runs from MCP fail with hostkey_unknown. Do not reset if you do not know why the key changed.',
   },
 };
 
@@ -183,6 +250,10 @@ const AUTH_PASSWORD = 'パスワード保管';
 // disconnected so an unexpected backend value never lands in a class name.
 const CONN_STATES = ['connected', 'connecting', 'disconnected', 'error', 'in_use'];
 const DISCONNECTABLE = ['connected', 'in_use', 'connecting'];
+const DATA_BITS = [5, 6, 7, 8];
+const PARITIES = ['none', 'odd', 'even', 'mark', 'space'];
+const STOP_BITS = ['1', '1.5', '2'];
+const SERIAL_FIELDS = ['dataBits', 'parity', 'stopBits'];
 
 function emptyTest() {
   return { ok: null, message: '', target: '', connId: '' };
@@ -199,7 +270,70 @@ export function createEditorState() {
     filter: '',
     busy: '', // '' | 'save' | 'test' — disables the matching buttons while awaiting
     keyPathStash: null, // { id, value }: key path set aside while password auth is chosen
+    fieldErrors: {}, // { dataBits|parity|stopBits|baudRate: message } from the last save
+    hostKey: emptyHostKey(),
   };
+}
+
+function emptyHostKey() {
+  return { connId: '', status: 'idle', info: null, error: '', seq: 0 };
+}
+
+// The serial line settings with the backend defaults (8 / none / 1) filled in.
+export function serialLineOf(connection) {
+  return {
+    dataBits: Number(connection?.dataBits) || 8,
+    parity: String(connection?.parity ?? '').trim().toLowerCase() || 'none',
+    stopBits: String(connection?.stopBits ?? '').trim() || '1',
+  };
+}
+
+function platformRules(platform) {
+  const p = String(platform || '').toLowerCase();
+  if (!p) return 'unknown';
+  if (p === 'windows' || p === 'linux') return p;
+  return 'darwin'; // darwin, freebsd, openbsd...: no CMSPAR, no 1.5 stop bits
+}
+
+// serialLineIssue mirrors validateSerialSettings (phase4-serial-patch §2.3,
+// V2-V8): the first problem as { field, key }, or null. Go stays the source
+// of truth; with an unknown platform only the OS-independent rules apply.
+export function serialLineIssue(connection, platform) {
+  const { dataBits, parity, stopBits } = serialLineOf(connection);
+  const os = platformRules(platform);
+  if (!DATA_BITS.includes(dataBits)) return { field: 'dataBits', key: 'edit.serial.err.dataBits' };
+  if (!PARITIES.includes(parity)) return { field: 'parity', key: 'edit.serial.err.parity' };
+  if (os === 'darwin' && (parity === 'mark' || parity === 'space')) return { field: 'parity', key: 'edit.serial.err.parityOS' };
+  if (!STOP_BITS.includes(stopBits)) return { field: 'stopBits', key: 'edit.serial.err.stopBits' };
+  if (stopBits === '1.5') {
+    if (os === 'darwin' || os === 'linux') return { field: 'stopBits', key: 'edit.serial.err.stopBits15OS' };
+    if (os === 'windows' && dataBits !== 5) return { field: 'stopBits', key: 'edit.serial.err.stopBits15' };
+  }
+  if (os === 'windows' && dataBits === 5 && stopBits === '2') return { field: 'stopBits', key: 'edit.serial.err.stopBits5' };
+  return null;
+}
+
+// Whether an option would fail serialLineIssue on this platform (with the
+// other settings as currently chosen).
+function serialOptionInvalid(line, field, value, platform) {
+  return Boolean(serialLineIssue({ ...line, [field]: value }, platform)?.field === field);
+}
+
+function platformOf(ctx) {
+  const platform = typeof ctx.platform === 'function' ? ctx.platform() : ctx.platform;
+  return String(platform || '');
+}
+
+// Lets main.js follow user-driven selection changes (phase4-ui-integration
+// §2.3 / §8-4). reconcileEditor never calls it.
+function notifySelection(ctx, previousId, reason) {
+  const id = ctx.state.editor.selectedId;
+  if (id === previousId) return;
+  try {
+    ctx.onSelectionChange?.(id, { previousId, reason });
+  } catch (error) {
+    console.error('onSelectionChange', error);
+  }
 }
 
 function savedConnections(state) {
@@ -230,7 +364,13 @@ function currentId(state) {
 function dirtyStateOf(state) {
   const draft = state.editor.draft;
   if (!draft) return 'saved';
-  return connectionDirtyState(draft, savedById(state, draft.id));
+  const saved = savedById(state, draft.id);
+  const code = connectionDirtyState(draft, saved);
+  // model.js may not compare the serial line settings yet
+  // (phase4-serial-patch §10-2); without this a changed parity could not be saved.
+  if (code === 'saved' && draft.type === 'Serial' && saved
+    && JSON.stringify(serialLineOf(draft)) !== JSON.stringify(serialLineOf(saved))) return 'modified';
+  return code;
 }
 
 export function isEditorDirty(state) {
@@ -279,6 +419,9 @@ function newDraft(t) {
     credential: '~/.ssh/id_ed25519',
     serialPort: '',
     baudRate: 115200,
+    dataBits: 8,
+    parity: 'none',
+    stopBits: '1',
     connectTimeout: 10,
     commandTimeout: 30,
     tags: [],
@@ -314,6 +457,9 @@ function syncFormToDraft(state) {
     credential: pick('credential'),
     serialPort: pick('serialPort'),
     baudRate: pickNum('baudRate', 115200),
+    dataBits: pickNum('dataBits', 8),
+    parity: pick('parity') || 'none',
+    stopBits: pick('stopBits') || '1',
     connectTimeout: pickNum('connectTimeout', 10),
     commandTimeout: pickNum('commandTimeout', 30),
     tags: ('tags' in data ? String(data.tags) : (base.tags ?? []).join(', '))
@@ -335,24 +481,32 @@ function ensureDraft(state) {
 
 // What SaveConnection / TestConnectionConfig receive. lastTest* and
 // credentialSet are ignored by the backend; mcpFirstTrust must be sent back
-// as-is because the update writes it.
-function connectionPayload(connection) {
+// as-is because the update writes it. The other transport's fields are sent
+// empty, as SaveConnection stores them: the draft keeps them only so that
+// switching SSH <-> Serial back and forth loses nothing, and leftovers would
+// make the backend's sameTarget miss and skip recording the test result.
+export function connectionPayload(connection) {
+  const serial = connection.type === 'Serial';
+  const line = serialLineOf(connection);
   return {
     id: connection.id ?? '',
     name: connection.name ?? '',
-    type: connection.type === 'Serial' ? 'Serial' : 'SSH',
-    host: connection.host ?? '',
+    type: serial ? 'Serial' : 'SSH',
+    host: serial ? '' : (connection.host ?? ''),
     port: Number(connection.port) || 22,
-    user: connection.user ?? '',
+    user: serial ? '' : (connection.user ?? ''),
     authMethod: connection.authMethod || AUTH_KEY,
-    credential: connection.credential ?? '',
-    serialPort: connection.serialPort ?? '',
-    baudRate: Number(connection.baudRate) || 115200,
+    credential: serial ? '' : (connection.credential ?? ''),
+    serialPort: serial ? (connection.serialPort ?? '') : '',
+    baudRate: serial ? (Number(connection.baudRate) || 115200) : 0,
+    dataBits: serial ? line.dataBits : 0,
+    parity: serial ? line.parity : '',
+    stopBits: serial ? line.stopBits : '',
     connectTimeout: Number(connection.connectTimeout) || 10,
     commandTimeout: Number(connection.commandTimeout) || 30,
     tags: [...(connection.tags ?? [])],
     description: connection.description ?? '',
-    mcpFirstTrust: Boolean(connection.mcpFirstTrust),
+    mcpFirstTrust: serial ? false : Boolean(connection.mcpFirstTrust),
   };
 }
 
@@ -360,6 +514,7 @@ function resetTransient(editor) {
   editor.test = emptyTest();
   editor.alert = '';
   editor.keyPathStash = null;
+  editor.fieldErrors = {};
 }
 
 // Drops the draft. A discarded new draft returns to the row that was selected
@@ -408,6 +563,9 @@ export function editorHasFocus() {
 export function renderConnectionsPage(state, ctx) {
   const { t } = ctx;
   const editor = state.editor;
+  // The caller puts the HTML in place synchronously; the host key block is
+  // filled right after (and loaded when it is not cached for this id).
+  queueMicrotask(() => paintHostKey(ctx));
   return `
     <div class="row g-3">
       <div class="col-12 col-xl-4">
@@ -664,7 +822,9 @@ function renderForm(state, ctx) {
         <div class="row g-3">
           ${inputCol(t('edit.name'), 'name', connection.name)}
           ${typeCol(t, connection.type)}
-          ${isSerial ? serialFields(state, t, connection) : sshFields(state, t, connection)}
+          ${isSerial ? serialDropsSSHNotice(state, t, connection) : ''}
+          ${isSerial ? serialFields(state, ctx, connection) : sshFields(state, t, connection)}
+          ${isSerial ? '' : hostKeyCol(t, connection)}
           ${inputCol(t('edit.tags'), 'tags', (connection.tags ?? []).join(', '), 'text', 'col-12')}
           <div class="col-12">
             <label class="form-label fw-bold">${escapeHtml(t('edit.description'))}</label>
@@ -758,7 +918,72 @@ function passwordHelp(t, connection, isSet) {
   return isSet ? t('edit.passwordKeep') : '';
 }
 
-function serialFields(state, t, connection) {
+// Shown when an SSH connection is about to be saved as Serial: SaveConnection
+// clears host / user / credential (and the stored password) for serial rows.
+function serialDropsSSHNotice(state, t, connection) {
+  const saved = savedById(state, connection.id);
+  const hadSSH = saved ? saved.type !== 'Serial' : Boolean(String(connection.user || '').trim() || String(connection.credential || '').trim());
+  if (!hadSSH) return '';
+  return `<div class="col-12"><div class="alert alert-warning mb-0 editor-serial-drops-ssh" role="note">${escapeHtml(t('edit.serialDropsSSH'))}</div></div>`;
+}
+
+function fieldError(state, field) {
+  return state.editor.fieldErrors?.[field] || '';
+}
+
+function invalidClass(state, field) {
+  return fieldError(state, field) ? ' is-invalid' : '';
+}
+
+function invalidFeedback(state, field) {
+  const message = fieldError(state, field);
+  return message ? `<div class="invalid-feedback d-block" data-field-error="${field}">${escapeHtml(message)}</div>` : '';
+}
+
+function serialLineCols(state, ctx, connection) {
+  const { t } = ctx;
+  const platform = platformOf(ctx);
+  const line = serialLineOf(connection);
+  // The chosen value is never disabled (a disabled option drops out of the
+  // FormData); the save-time check reports it instead.
+  const option = (field, value, label) => {
+    const selected = String(line[field]) === String(value);
+    const disabled = !selected && serialOptionInvalid(line, field, value, platform);
+    return `<option value="${escapeHtml(value)}" ${selected ? 'selected' : ''} ${disabled ? 'disabled' : ''}>${escapeHtml(label)}</option>`;
+  };
+  const withCurrent = (values, current) => (values.map(String).includes(String(current)) ? values : [...values, current]);
+  const select = (field, label, options) => `
+    <div class="col-12 col-md-4">
+      <label class="form-label fw-bold">${escapeHtml(label)}</label>
+      <select class="form-select${invalidClass(state, field)}" name="${field}" data-action="edit-serial-line" aria-invalid="${fieldError(state, field) ? 'true' : 'false'}">${options}</select>
+      ${invalidFeedback(state, field)}
+    </div>
+  `;
+  return `
+    ${select('dataBits', t('edit.dataBits'), withCurrent(DATA_BITS, line.dataBits).map((bits) => option('dataBits', bits, String(bits))).join(''))}
+    ${select('parity', t('edit.parity'), withCurrent(PARITIES, line.parity).map((parity) => option('parity', parity, PARITIES.includes(parity) ? t(`edit.parity.${parity}`) : parity)).join(''))}
+    ${select('stopBits', t('edit.stopBits'), withCurrent(STOP_BITS, line.stopBits).map((bits) => option('stopBits', bits, bits)).join(''))}
+    <div class="col-12"><div class="form-text mt-0">${escapeHtml(t('edit.flowControlNote'))}</div></div>
+  `;
+}
+
+// The host key block is drawn empty here and filled with textContent by
+// paintHostKey once GetHostKeyInfo answers (address and names come from the
+// user, fingerprints from the server).
+function hostKeyCol(t, connection) {
+  if (!connection.id) {
+    return `
+      <div class="col-12 editor-hostkey">
+        <div class="form-label fw-bold mb-1">${escapeHtml(t('edit.hostKey'))}</div>
+        <div class="small text-secondary">${escapeHtml(t('edit.hostKeyUnsaved'))}</div>
+      </div>
+    `;
+  }
+  return `<div class="col-12 editor-hostkey" id="editor-hostkey" data-conn-id="${escapeHtml(connection.id)}" aria-live="polite"></div>`;
+}
+
+function serialFields(state, ctx, connection) {
+  const { t } = ctx;
   const current = connection.serialPort || '';
   // Include the configured port even if it is unplugged / not scanned yet.
   const options = [...new Set([current, ...(state.editor.serialPorts ?? [])].filter(Boolean))];
@@ -779,10 +1004,12 @@ function serialFields(state, t, connection) {
     </div>
     <div class="col-12 col-md-6">
       <label class="form-label fw-bold">${escapeHtml(t('edit.baudRate'))}</label>
-      <select class="form-select" name="baudRate">
+      <select class="form-select${invalidClass(state, 'baudRate')}" name="baudRate">
         ${[...new Set([...BAUD_RATES, baud])].sort((x, y) => x - y).map((rate) => `<option value="${rate}" ${rate === baud ? 'selected' : ''}>${rate}</option>`).join('')}
       </select>
+      ${invalidFeedback(state, 'baudRate')}
     </div>
+    ${serialLineCols(state, ctx, connection)}
   `;
 }
 
@@ -803,6 +1030,7 @@ function refreshChrome(ctx) {
     const saved = savedById(state, connection.id);
     help.textContent = passwordHelp(t, connection, Boolean(saved?.credentialSet && isPassword(saved)));
   }
+  paintHostKey(ctx);
 }
 
 // Exported for sessions:changed: connection badges and the disconnect button
@@ -832,6 +1060,163 @@ function renderAfterAction(ctx) {
   set('#editor-last-test', renderLastTest(state, ctx));
   const title = document.querySelector('#editor-title');
   if (title) title.textContent = formTitle(state, t);
+  paintFieldErrors(state);
+}
+
+// Field errors without replacing the selects (the partial redraw above).
+function paintFieldErrors(state) {
+  for (const field of [...SERIAL_FIELDS, 'baudRate']) {
+    const input = document.querySelector(`#connection-form [name="${field}"]`);
+    if (!input) continue;
+    const message = fieldError(state, field);
+    input.classList.toggle('is-invalid', Boolean(message));
+    input.setAttribute('aria-invalid', message ? 'true' : 'false');
+    let feedback = input.parentElement.querySelector(`[data-field-error="${field}"]`);
+    if (!message) {
+      feedback?.remove();
+      continue;
+    }
+    if (!feedback) {
+      feedback = element('div', 'invalid-feedback d-block');
+      feedback.dataset.fieldError = field;
+      input.after(feedback);
+    }
+    feedback.textContent = message;
+  }
+}
+
+// ----------------------------------------------------------------- host key
+
+function hostKeyAddressOf(connection) {
+  return `${String(connection?.host ?? '').trim().toLowerCase()}:${Number(connection?.port) || 22}`;
+}
+
+// Saved SSH connections whose recorded host key is the same known_hosts entry.
+function connectionsSharingHostKey(state, connection) {
+  const address = hostKeyAddressOf(connection);
+  return savedConnections(state).filter((other) => other.type !== 'Serial' && hostKeyAddressOf(other) === address);
+}
+
+function invalidateHostKey(editor) {
+  editor.hostKey = { ...emptyHostKey(), seq: (editor.hostKey?.seq ?? 0) + 1 };
+}
+
+async function loadHostKey(ctx, connId) {
+  const editor = ctx.state.editor;
+  const seq = (editor.hostKey?.seq ?? 0) + 1;
+  editor.hostKey = { connId, status: 'loading', info: null, error: '', seq };
+  paintHostKey(ctx);
+  let info = null;
+  let error = '';
+  try {
+    info = await GetHostKeyInfo(connId);
+  } catch (err) {
+    error = String(err?.message ?? err);
+  }
+  if (ctx.state.editor !== editor || editor.hostKey.seq !== seq) return; // superseded
+  editor.hostKey = { connId, status: error ? 'error' : 'ready', info, error, seq };
+  paintHostKey(ctx);
+}
+
+function formatRecorded(value, lang) {
+  const at = Date.parse(value);
+  if (Number.isNaN(at)) return String(value);
+  return new Date(at).toLocaleString(lang === 'en' ? 'en-US' : 'ja-JP', { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+function element(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+// Fills #editor-hostkey from state.editor.hostKey with textContent only.
+function paintHostKey(ctx) {
+  const { state, t } = ctx;
+  const root = document.querySelector('#editor-hostkey');
+  if (!root || !state.editor) return;
+  const connId = root.dataset.connId || '';
+  const hostKey = state.editor.hostKey ?? emptyHostKey();
+  if (hostKey.connId !== connId || hostKey.status === 'idle') {
+    void loadHostKey(ctx, connId);
+    return;
+  }
+  const saved = savedById(state, connId);
+  const header = element('div', 'd-flex align-items-center justify-content-between gap-2 flex-wrap mb-1');
+  header.append(element('span', 'form-label fw-bold mb-0', t('edit.hostKey')));
+  const known = hostKey.status === 'ready' && Boolean(hostKey.info?.known);
+  const reset = element('button', 'btn btn-outline-danger btn-sm');
+  reset.type = 'button';
+  reset.dataset.action = 'edit-reset-hostkey';
+  reset.disabled = !known || Boolean(state.editor.busy);
+  reset.append(element('i', 'bi bi-key me-1'), document.createTextNode(t('edit.hostKeyReset')));
+  header.append(reset);
+  const body = [header];
+  if (hostKey.status === 'loading') {
+    body.push(element('div', 'small text-secondary', t('edit.hostKeyLoading')));
+  } else if (hostKey.status === 'error') {
+    body.push(element('div', 'small text-danger', t('edit.hostKeyError', { message: hostKey.error })));
+  } else if (!known) {
+    body.push(element('div', 'small text-secondary', t('edit.hostKeyUnknown')));
+  } else {
+    const list = element('ul', 'list-unstyled small mb-1 editor-hostkey-list');
+    for (const key of hostKey.info.keys ?? []) {
+      const item = element('li');
+      item.append(element('code', 'editor-hostkey-fp', `${key.type || ''} ${key.fingerprint || ''}`.trim()));
+      const recordedAt = key.recordedAt || hostKey.info.recordedAt;
+      if (recordedAt) item.append(document.createTextNode(` (${t('edit.hostKeyRecorded', { date: formatRecorded(recordedAt, ctx.lang?.()) })})`));
+      list.append(item);
+    }
+    body.push(list);
+  }
+  if (saved && hostKey.status !== 'loading') {
+    const address = hostKey.info?.address || hostKeyAddressOf(saved);
+    body.push(element('div', 'form-text mt-0', t('edit.hostKeyAddress', { address })));
+    const others = connectionsSharingHostKey(state, saved).filter((other) => other.id !== saved.id);
+    if (others.length) body.push(element('div', 'form-text mt-0', t('edit.hostKeyShared', { names: others.map((other) => other.name).join(', ') })));
+    const draft = state.editor.draft;
+    if (draft && draft.id === saved.id && hostKeyAddressOf(draft) !== hostKeyAddressOf(saved)) {
+      body.push(element('div', 'form-text mt-0 text-warning-emphasis', t('edit.hostKeyDraftDiffers')));
+    }
+  }
+  root.replaceChildren(...body);
+}
+
+async function resetHostKey(ctx) {
+  const { state, t } = ctx;
+  const editor = state.editor;
+  const connection = currentConnection(state);
+  const saved = savedById(state, connection?.id);
+  if (!saved || saved.type === 'Serial') return;
+  const address = editor.hostKey?.connId === saved.id && editor.hostKey.info?.address
+    ? editor.hostKey.info.address
+    : hostKeyAddressOf(saved);
+  const body = element('div');
+  body.append(
+    element('p', 'mb-2', t('edit.hostKeyReset.body', { address })),
+    element('p', 'mb-1 fw-bold', t('edit.hostKeyReset.scope')),
+  );
+  const names = element('ul', 'mb-2 editor-hostkey-affected');
+  for (const affected of connectionsSharingHostKey(state, saved)) names.append(element('li', '', affected.name));
+  body.append(names, element('p', 'text-secondary mb-0', t('edit.hostKeyReset.after')));
+  const ok = await confirmModal(ctx, {
+    title: t('edit.hostKeyReset.title'),
+    bodyNode: body,
+    okLabel: t('edit.hostKeyReset'),
+    icon: 'bi-key',
+  });
+  if (!ok) return;
+  let result;
+  try {
+    result = await ResetHostKey(saved.id);
+  } catch (error) {
+    result = { ok: false, message: String(error) };
+  }
+  if (result?.message) ctx.toast(result.message);
+  editor.alert = result?.ok ? '' : (result?.message || '');
+  invalidateHostKey(editor);
+  renderAfterAction(ctx);
 }
 
 function refreshList(ctx) {
@@ -859,7 +1244,7 @@ function modalRoot() {
 // not touch it). Modals are queued: a second request waits for the first to
 // close. Resolves with { value, input } for a button / submit, or null for
 // close / Escape / backdrop.
-function showModal({ title, bodyHtml, buttons, input = null }) {
+function showModal({ title, bodyHtml = '', bodyNode = null, bodyAfter = null, buttons, input = null }) {
   const run = modalChain.then(() => new Promise((resolve) => {
     const root = modalRoot();
     const host = document.createElement('div');
@@ -888,6 +1273,8 @@ function showModal({ title, bodyHtml, buttons, input = null }) {
         </div>
       </div>
     `;
+    if (bodyNode) host.querySelector('.modal-body').prepend(bodyNode);
+    if (bodyAfter) host.querySelector('.modal-body').append(bodyAfter);
     root.appendChild(host);
     let done = false;
     const finish = (result) => {
@@ -927,11 +1314,31 @@ function showModal({ title, bodyHtml, buttons, input = null }) {
   return run;
 }
 
+// A saved connection also gets 「キーチェーンに保存」 (opt-in, off by default;
+// phase5-keychain.md §5.4 / §10-3). When it is checked the passphrase is
+// tested against the saved settings and kept in the keychain for that key
+// path; the caller's own test or retry then runs as before.
 export async function promptPassphrase(conn, ctx) {
   const { t } = ctx;
+  let saveBox = null;
+  let saveNode = null;
+  if (conn?.id) {
+    saveBox = document.createElement('input');
+    saveBox.type = 'checkbox';
+    saveBox.className = 'form-check-input';
+    saveBox.id = 'editor-modal-save-passphrase';
+    const label = document.createElement('label');
+    label.className = 'form-check-label';
+    label.htmlFor = saveBox.id;
+    label.textContent = t('edit.passphrase.save');
+    saveNode = document.createElement('div');
+    saveNode.className = 'form-check mt-3';
+    saveNode.append(saveBox, label);
+  }
   const result = await showModal({
     title: t('edit.passphrase.title'),
     bodyHtml: `<p class="text-secondary mb-3">${escapeHtml(t('edit.passphrase.body', { name: displayName(conn, t) }))}</p>`,
+    bodyAfter: saveNode,
     input: {
       label: t('edit.passphrase.label'),
       type: 'password',
@@ -944,14 +1351,25 @@ export async function promptPassphrase(conn, ctx) {
       { value: 'submit', submit: true, label: t('edit.passphrase.submit'), className: 'btn-primary' },
     ],
   });
-  return result ? result.input : null;
+  if (!result) return null;
+  if (result.input && saveBox?.checked) {
+    let saved;
+    try {
+      saved = await TestConnectionWithPassphraseSave(conn.id, result.input, true);
+    } catch (error) {
+      saved = { ok: false, message: String(error) };
+    }
+    if (saved?.message) ctx.toast(saved.message);
+  }
+  return result.input;
 }
 
-function confirmModal(ctx, { title, bodyHtml, okLabel, okClass = 'btn-danger', icon = '' }) {
+function confirmModal(ctx, { title, bodyHtml, bodyNode, okLabel, okClass = 'btn-danger', icon = '' }) {
   const { t } = ctx;
   return showModal({
     title,
     bodyHtml,
+    bodyNode,
     buttons: [
       { dismiss: true, label: t('edit.cancel') },
       { value: 'ok', label: okLabel, className: okClass, icon },
@@ -967,6 +1385,18 @@ async function saveDraft(ctx) {
   syncFormToDraft(state);
   const draft = editor.draft;
   if (!draft || !isEditorDirty(state)) return true;
+  editor.fieldErrors = {};
+  if (draft.type === 'Serial') {
+    const issue = serialLineIssue(draft, platformOf(ctx));
+    if (issue) {
+      const message = ctx.t(issue.key);
+      editor.fieldErrors = { [issue.field]: message };
+      editor.alert = message;
+      renderAfterAction(ctx);
+      return false;
+    }
+  }
+  const previousId = editor.selectedId;
   editor.busy = 'save';
   refreshChrome(ctx);
   ctx.bumpGen();
@@ -979,17 +1409,31 @@ async function saveDraft(ctx) {
     editor.busy = '';
   }
   if (result?.message) ctx.toast(result.message);
+  if (!result?.ok && result?.code === 'keyring_unavailable' && draft.id && draft.credential && ctx.recoverCredential) {
+    // The keychain refused the new password. The draft stays unsaved; the
+    // typed password may still be used for this session (never the DB).
+    ctx.recoverCredential(draft, result, { password: draft.credential });
+  }
   if (!result?.ok) {
     editor.alert = result?.message || '';
+    // invalid_serial_mode (phase4-serial-patch §10-3) may name the field.
+    if (result?.field && [...SERIAL_FIELDS, 'baudRate'].includes(result.field)) {
+      editor.fieldErrors = { [result.field]: result.message || '' };
+    }
     renderAfterAction(ctx);
     return false;
   }
+  // serial_mode_applied / serial_mode_not_applied / reconnect_required
+  // (phase4-serial-patch §10-3) concern open tabs: main.js shows them.
+  ctx.onConnectionSaved?.(result);
   editor.selectedId = result.id || draft.id;
   editor.draft = null;
   editor.returnId = '';
   resetTransient(editor);
+  invalidateHostKey(editor); // host / port may have changed
   await ctx.refresh({ silent: true });
   renderAfterAction(ctx);
+  notifySelection(ctx, previousId, 'save');
   return true;
 }
 
@@ -1019,9 +1463,12 @@ export async function confirmLeaveEditor(ctx) {
   return false;
 }
 
-export async function selectConnection(connId, ctx) {
+// options.notify=false skips ctx.onSelectionChange (for main.js calling this
+// itself while following a server tab, so the change does not echo back).
+export async function selectConnection(connId, ctx, { notify = true } = {}) {
   const { state } = ctx;
   const editor = state.editor;
+  const previousId = editor.selectedId;
   if (connId === editor.selectedId && !(connId === '' && !hasNewDraft(editor))) return true;
   if (!(await confirmLeaveEditor(ctx))) return false;
   // confirmLeaveEditor left either no draft or a non-dirty one; neither may
@@ -1031,6 +1478,7 @@ export async function selectConnection(connId, ctx) {
   editor.returnId = '';
   resetTransient(editor);
   ctx.renderPage();
+  if (notify) notifySelection(ctx, previousId, 'select');
   return true;
 }
 
@@ -1040,8 +1488,10 @@ async function startNewDraft(ctx) {
   if (hasNewDraft(editor)) {
     // Only one new draft: "New" just brings it back into view.
     if (editor.selectedId !== '') {
+      const previousId = editor.selectedId;
       editor.selectedId = '';
       ctx.renderPage();
+      notifySelection(ctx, previousId, 'new');
     }
     return;
   }
@@ -1052,14 +1502,17 @@ async function startNewDraft(ctx) {
   editor.returnId = returnId;
   resetTransient(editor);
   ctx.renderPage();
+  notifySelection(ctx, returnId, 'new');
 }
 
 async function cancelEdit(ctx) {
   const { state } = ctx;
   if (!isEditorDirty(state)) return;
+  const previousId = state.editor.selectedId;
   discardDraft(state);
   reconcileEditor(state);
   ctx.renderPage();
+  notifySelection(ctx, previousId, 'cancel');
 }
 
 async function runConnectionTest(ctx) {
@@ -1083,6 +1536,16 @@ async function runConnectionTest(ctx) {
       refreshChrome(ctx);
       result = await TestConnectionConfig(tested, passphrase);
     }
+    // needs_password / keyring_unavailable: the common dialog (main.js)
+    // re-enters the password or keeps one for this session; retry once.
+    if (!result?.ok && ['needs_password', 'keyring_unavailable'].includes(result?.code) && connId && ctx.recoverCredential) {
+      editor.busy = '';
+      refreshChrome(ctx);
+      if (!(await ctx.recoverCredential(tested, result))) return;
+      editor.busy = 'test';
+      refreshChrome(ctx);
+      result = await TestConnectionConfig(tested, '');
+    }
   } catch (error) {
     result = { ok: false, message: String(error) };
   } finally {
@@ -1091,6 +1554,8 @@ async function runConnectionTest(ctx) {
   // Only the test panel changes; connState is the backend's business.
   editor.test = { ok: Boolean(result?.ok), message: result?.message || '', target: testTarget(tested), connId };
   if (result?.message) ctx.toast(result.message);
+  // A GUI test is where an unknown host key gets recorded (TOFU).
+  invalidateHostKey(editor);
   // The backend records lastTest when the tested values equal the saved ones.
   await ctx.refresh({ silent: true });
   renderAfterAction(ctx);
@@ -1140,12 +1605,14 @@ async function disconnect(ctx) {
 async function deleteConnection(ctx, connId) {
   const { state, t } = ctx;
   const editor = state.editor;
+  const previousId = editor.selectedId;
   if (!connId) {
     // An unsaved new draft is simply discarded.
     if (hasNewDraft(editor)) {
       discardDraft(state);
       reconcileEditor(state);
       ctx.renderPage();
+      notifySelection(ctx, previousId, 'delete');
     }
     return;
   }
@@ -1184,6 +1651,7 @@ async function deleteConnection(ctx, connId) {
   await ctx.refresh({ silent: true });
   reconcileEditor(state);
   ctx.renderPage();
+  notifySelection(ctx, previousId, 'delete');
 }
 
 async function rescanSerialPorts(ctx) {
@@ -1227,7 +1695,7 @@ export async function handleEditorClick(event, ctx) {
   if (!element) return false;
   const action = element.dataset.action;
   // Inputs, selects and the submit button are handled by input/change/submit.
-  if (action === 'edit-search' || action === 'edit-type' || action === 'edit-auth' || action === 'edit-save') return false;
+  if (['edit-search', 'edit-type', 'edit-auth', 'edit-save', 'edit-serial-line'].includes(action)) return false;
   if (element.disabled) return true;
   switch (action) {
     case 'edit-new':
@@ -1240,8 +1708,10 @@ export async function handleEditorClick(event, ctx) {
       if (ctx.state.editor.selectedId !== '') {
         // Unreachable in practice (leaving a new draft discards it), but keep
         // the row clickable if a draft somehow survives.
+        const previousId = ctx.state.editor.selectedId;
         ctx.state.editor.selectedId = '';
         ctx.renderPage();
+        notifySelection(ctx, previousId, 'new');
       }
       return true;
     case 'edit-cancel':
@@ -1275,6 +1745,9 @@ export async function handleEditorClick(event, ctx) {
     }
     case 'edit-copy-test':
       await copyTestResult(ctx);
+      return true;
+    case 'edit-reset-hostkey':
+      await resetHostKey(ctx);
       return true;
     default:
       return false;
@@ -1321,8 +1794,23 @@ export async function handleEditorChange(event, ctx) {
     return true;
   }
   if (target.name === 'type') {
+    state.editor.fieldErrors = {};
     if (draft.type === 'Serial' && (state.editor.serialPorts ?? []).length === 0) await loadSerialPorts(state);
     ctx.renderPage();
+    return true;
+  }
+  if (SERIAL_FIELDS.includes(target.name) || target.name === 'baudRate') {
+    // The allowed options depend on each other (Windows: 1.5 / 2 stop bits
+    // follow the data bits), so redraw and keep the focus on this select.
+    const errors = { ...(state.editor.fieldErrors ?? {}) };
+    const cleared = [target.name, ...(target.name === 'dataBits' ? ['stopBits'] : [])];
+    for (const field of cleared) {
+      if (errors[field] && state.editor.alert === errors[field]) state.editor.alert = '';
+      delete errors[field];
+    }
+    state.editor.fieldErrors = errors;
+    ctx.renderPage();
+    document.querySelector(`#connection-form [name="${target.name}"]`)?.focus();
     return true;
   }
   refreshChrome(ctx);

@@ -16,7 +16,7 @@ const tFor = (lang) => (key, vars) => interpolate(I18N[lang][key] ?? key, vars);
 describe('i18n', () => {
   it('merges every module dictionary with matching ja/en keys', () => {
     expect(Object.keys(I18N.ja).sort()).toEqual(Object.keys(I18N.en).sort());
-    for (const prefix of ['nav.', 'tabs.', 'side.', 'edit.', 'state.']) {
+    for (const prefix of ['nav.', 'tabs.', 'side.', 'edit.', 'state.', 'appr.', 'agents.', 'srvtab.', 'keys.', 'srvfilter.', 'cred.']) {
       expect(Object.keys(I18N.ja).some((key) => key.startsWith(prefix))).toBe(true);
     }
   });
@@ -37,11 +37,14 @@ describe('renderSkeleton', () => {
       const html = renderSkeleton({ t: tFor(lang), logoUrl: 'logo.png' });
       expect(html).toMatchSnapshot();
       document.body.innerHTML = `<div id="app">${html}</div>`;
-      for (const id of ['sidebar-nav', 'sidebar-status', 'page-root', 'terminal-dock', 'modal-root', 'page-title', 'header-title']) {
+      for (const id of ['sidebar-nav', 'sidebar-status', 'server-tabs', 'shell-subtabs', 'page-root', 'terminal-dock', 'modal-root', 'page-title', 'header-title']) {
         expect(document.querySelectorAll(`#${id}`)).toHaveLength(1);
       }
       // #terminal-dock must sit outside #page-root so renderPage never replaces it.
       expect(document.querySelector('#page-root #terminal-dock')).toBeNull();
+      // The tab bars sit outside #page-root so a page redraw keeps their nodes.
+      expect(document.querySelector('#page-root #server-tabs, #page-root #shell-subtabs')).toBeNull();
+      expect(document.querySelector('#shell-subtabs').hidden).toBe(true);
       expect(document.querySelector('#sidebar-status').closest('.app-sidebar')).not.toBeNull();
     });
   }

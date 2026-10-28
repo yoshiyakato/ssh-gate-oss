@@ -39,6 +39,9 @@ func isolateEnv(t *testing.T) string {
 	t.Setenv("SSH_GETE_MCP_ADDR", "")
 	t.Setenv("SSH_GETE_STRICT_HOSTKEY", "")
 	t.Setenv("SSH_GETE_NO_SEED", "")
+	// Never touch the real keychain from tests.
+	t.Setenv("SSH_GETE_KEYRING", "memory")
+	t.Setenv("SSH_GETE_KEYRING_SERVICE", "")
 	return dir
 }
 
@@ -840,7 +843,7 @@ func TestCommandTimeoutWithStreamingOutput(t *testing.T) {
 	conn := srv.Connection("lab")
 	conn.CommandTimeout = 1
 	conn = addTrustedConnection(t, app, conn)
-	result, err := app.executeSSH(context.Background(), conn, "yes", 0)
+	result, err := app.executeSSH(context.Background(), conn, "yes", 0, mcpCredentialTimeout)
 	if err == nil || classifyExecError(err) != "timeout" {
 		t.Fatalf("expected timeout, got %v", err)
 	}
