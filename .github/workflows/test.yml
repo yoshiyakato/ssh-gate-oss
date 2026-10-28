@@ -126,10 +126,12 @@ jobs:
           docker run --rm -v ssh-gete-smoke:/data --entrypoint /usr/local/bin/ssh-gete ssh-gete:smoke --version
           tok="$(docker run --rm -v ssh-gete-smoke:/data ssh-gete:smoke --print-admin-token)"
           case "${tok}" in sgadm_*) ;; *) echo "::error::--print-admin-token did not print a token"; exit 1 ;; esac
-          docker run -d --name ssh-gete-smoke -p 127.0.0.1:18788:8788 -v ssh-gete-smoke:/data ssh-gete:smoke
+          # Same port on both sides: a remapped port needs web.publicURL, or the
+          # Host / Origin check answers 403 (docs/headless.md §8).
+          docker run -d --name ssh-gete-smoke -p 127.0.0.1:8788:8788 -v ssh-gete-smoke:/data ssh-gete:smoke
           ok=""
           for i in $(seq 1 30); do
-            if curl -fsSk -o /dev/null https://127.0.0.1:18788/login; then ok=1; break; fi
+            if curl -fsSk -o /dev/null https://127.0.0.1:8788/login; then ok=1; break; fi
             sleep 1
           done
           docker logs ssh-gete-smoke 2>&1 | grep -v "${tok}" || true
