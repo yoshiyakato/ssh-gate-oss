@@ -171,6 +171,17 @@
   .steps li::before { content: counter(s); position: absolute; left: 0; top: 11px; width: 28px; height: 28px; border-radius: 50%; background: var(--navy-900); color: var(--gold-2); font-family: var(--mono); font-size: 13px; font-weight: 700; display: grid; place-items: center; border: 1px solid rgba(201,162,39,0.4); }
   .steps li b { color: var(--ink); }
 
+  /* v1 */
+  #v1 .sec-label { text-transform: none; }
+  .v1-note { margin: 0 0 22px; padding: 14px 16px; border-radius: 12px; background: #fff; border: 1px solid var(--line); border-left: 3px solid var(--gold-1); font-size: 14.5px; color: var(--ink-soft); }
+  h3.v1-group { display: flex; align-items: center; gap: 10px; margin: 26px 0 2px; font-size: 15px; font-weight: 800; color: var(--ink); }
+  h3.v1-group .pill { font-size: 11.5px; font-weight: 800; letter-spacing: 0.06em; padding: 2px 10px; border-radius: 999px; }
+  .pill.done { color: var(--good); background: rgba(21,145,95,0.08); border: 1px solid rgba(21,145,95,0.35); }
+  .pill.wip { color: var(--gold-ink); background: rgba(201,162,39,0.10); border: 1px solid rgba(201,162,39,0.45); }
+  .feat-list .ft h4 { margin: 4px 0 5px; font-size: 16.5px; }
+  .feat-list .num.wip { background: #fff; color: var(--gold-ink); border: 1px dashed rgba(201,162,39,0.7); box-shadow: none; }
+  .v1-group-note { margin: 0; font-size: 13.5px; color: var(--muted); }
+
   /* faq */
   .faq details { border-bottom: 1px solid var(--line); }
   .faq summary { cursor: pointer; padding: 14px 2px; font-weight: 700; font-size: 16px; list-style: none; display: flex; justify-content: space-between; gap: 14px; color: var(--ink); }
@@ -220,6 +231,7 @@
     <nav class="nav-links">
       <a href="#why" data-i18n="nav.why">なぜ必要か</a>
       <a href="#features" data-i18n="nav.features">機能</a>
+      <a href="#v1" data-i18n="nav.v1">v1 の変更</a>
       <a href="#oss" data-i18n="nav.oss">オープンソース</a>
       <a href="#faq" data-i18n="nav.faq">FAQ</a>
       <span class="lang-switch" aria-label="Language">
@@ -251,6 +263,7 @@
       </div>
       <div class="note" data-i18n="hero.note">macOS（Apple Silicon）/ Windows · オープンソース · 通信はローカルだけ</div>
 
+      <!-- TODO: screenshot — v0.1.0 の画面。v1 のサイドバー（SSHセッション／エージェント欄）とターミナルの複数タブが写ったものに差し替える -->
       <img class="shot" src="assets/screenshot-terminal.png" alt="SSH GATE の画面 — 接続先の詳細と xterm のインタラクティブシェル" loading="lazy" />
     </div>
   </section>
@@ -327,6 +340,7 @@
         </p>
         <img class="cable" src="assets/serial-cable.png" alt="USB–シリアル変換ケーブル（USB-A / D-sub 9pin）" loading="lazy" />
       </div>
+      <!-- TODO: screenshot — v1 のターミナル（1つの接続先に複数タブ）の画面に差し替える -->
       <img class="shot" src="assets/screenshot-terminal.png" alt="SSH GATE のターミナル画面 — 接続先の詳細と xterm のインタラクティブシェル" loading="lazy" />
     </div>
   </section>
@@ -347,8 +361,41 @@
 
   <div class="divider"></div>
 
+  <!-- V1 -->
+  <section id="v1" class="band">
+    <div class="wrap body">
+      <p class="sec-label" data-i18n="v1.label">v1 の変更</p>
+      <h2 class="sec-title" data-i18n="v1.title">安全の層を、もう一段厚く。</h2>
+      <p class="v1-note" data-i18n="v1.note">この節は次の版（v1）の内容です。<strong>いま配布している v0.1.0 には含まれていません。</strong>「実装済み」はコードとテストがそろったもの、「開発中」はまだ組み込みの途中で、画面も含めて完成していないものです。</p>
+
+      <h3 class="v1-group"><span class="pill done" data-i18n="v1.done.pill">実装済み</span><span data-i18n="v1.done.h">未リリース</span></h3>
+      <ul class="feat-list">
+        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d1.h">ブラウザ経由の攻撃を遮断</h4><p data-i18n="v1.d1.p">悪意ある Web ページから localhost の MCP へ要求を送り込む経路を塞ぎます。<code>Origin</code> ヘッダ付きの要求は既定で拒否（403）、<code>Host</code> はポート番号まで照合（DNS rebinding 対策）、POST は <code>application/json</code> 以外を拒否。127.0.0.1 以外で待ち受けるには Bearer 認証が必須です。</p></div></li>
+        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d2.h">承認しても、実行は1回だけ</h4><p data-i18n="v1.d2.p">承認・拒否は DB の compare-and-swap で状態を進めます。ボタンの二重クリックや「承認」と「拒否」が競合しても、実行は1回だけ。実行中にアプリが終了した要求は、次の起動時に「中断」として記録され、もう一度承認することはできません。</p></div></li>
+        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d3.h">承認省略は Bearer 必須、High は必ずキューへ</h4><p data-i18n="v1.d3.p">エージェント名を名乗るだけでは、承認省略は使えません。Bearer 認証を有効にしてはじめて付与でき、それでも <strong>High リスクは常に承認キュー</strong>に入ります。既定では、<code>sudo</code> を含むコマンド、本番タグ（<code>prod</code> など）の接続先、Low 以外のコマンドも承認が必要です。</p></div></li>
+        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d4.h">承認時の修正と、その記録</h4><p data-i18n="v1.d4.p">承認画面でコマンドを直してから実行できます。直したコマンドはリスクを判定し直し、上がった場合はもう一度確認を求めます。要求されたコマンドと実際に実行したコマンドは、別々に履歴へ残ります。</p></div></li>
+        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d5.h">監査 API の保護</h4><p data-i18n="v1.d5.p">監査用のエンドポイント <code>/audit/events</code> は GET だけを受け付け、Bearer 認証が有効なときはトークンが必要です。返す件数にも上限（既定 100 件、最大 500 件）を設けました。</p></div></li>
+        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d6.h">接続先の管理と編集画面</h4><p data-i18n="v1.d6.p">接続先は名前ではなく不変の ID で管理するため、名前を変えても履歴やタブがついてきます。パスワードは保存後に画面へ返しません（空欄のまま保存すれば、保存済みの値を保ちます）。「接続テスト」は保存前の入力でも試せて、保存済みの状態は書き換えません。編集画面には「保存済み／未保存の変更あり」を表示し、未保存のまま移ろうとすると確認します。</p></div></li>
+        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d7.h">ターミナルの複数タブと、新しいサイドバー</h4><p data-i18n="v1.d7.p">1つの接続先に、シェルをいくつでも開けます。タブは画面を移っても閉じず、1つ閉じても他のタブはそのまま。サイドバーには、接続中のセッション、シェルの数、実行中のコマンド数、MCP の待受状態と承認待ちの件数を表示します。</p></div></li>
+        <!-- TODO: screenshot — 複数タブのターミナル、新しいサイドバー、接続先編集画面の画像をここに追加する -->
+        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d8.h">MCP：結果の取得・再送・終了コード</h4><p data-i18n="v1.d8.p"><code>get_request_status</code> で、承認キューに入った要求の状態と結果を取得できます（<code>wait_seconds</code> で最大 60 秒待てます）。<code>client_request_id</code> を付ければ、24 時間以内の再送は新しく実行せず、同じ <code>request_id</code> を返します。結果には <code>exit_code</code> が入り、失敗は <code>isError</code> で判定できます。</p></div></li>
+        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d9.h">CI と依存関係</h4><p data-i18n="v1.d9.p">テストは macOS・Windows・Linux の3つの OS で <code>-race</code> 付きで実行し、<code>govulncheck</code> と <code>npm audit</code>（high 以上で失敗）も毎回かけます。GitHub Actions は commit SHA で固定し、更新は Dependabot で追います。リリース用のワークフローは、成果物に <code>SHA256SUMS.txt</code> を添付します。</p></div></li>
+      </ul>
+
+      <h3 class="v1-group"><span class="pill wip" data-i18n="v1.wip.pill">開発中</span><span data-i18n="v1.wip.h">組み込みの途中・画面は未完成</span></h3>
+      <p class="v1-group-note" data-i18n="v1.wip.note">内容や名前は変わることがあります。</p>
+      <ul class="feat-list">
+        <li><span class="num wip">…</span><div class="ft"><h4 data-i18n="v1.w1.h">ホスト鍵の検証（TOFU）</h4><p data-i18n="v1.w1.p">初めて接続したホストの鍵を専用の known_hosts に記録し、以後、鍵が一致しなければ接続を拒否します。</p></div></li>
+        <li><span class="num wip">…</span><div class="ft"><h4 data-i18n="v1.w2.h">エージェント専用トークン</h4><p data-i18n="v1.w2.p">共有のトークンだけでは承認省略を使えないようにし、エージェントごとのトークンに期限・上限リスク・対象の接続先を持たせます。</p></div></li>
+        <li><span class="num wip">…</span><div class="ft"><h4 data-i18n="v1.w3.h">リスク判定の強化</h4><p data-i18n="v1.w3.p"><code>;</code> や <code>&amp;&amp;</code> でつないだコマンド、フルパスの <code>sudo</code>、<code>env</code>／<code>xargs</code> 経由の実行も見分けます。</p></div></li>
+        <li><span class="num wip">…</span><div class="ft"><h4 data-i18n="v1.w4.h">実行先が変わったら承認を止める</h4><p data-i18n="v1.w4.p">要求のあとで接続先の user@host:port が変わっていたら、承認しても実行しません。</p></div></li>
+        <li><span class="num wip">…</span><div class="ft"><h4 data-i18n="v1.w5.h">上部のサーバータブとショートカット</h4><p data-i18n="v1.w5.p">画面の上に接続先ごとのタブを置き、承認キューや履歴をその接続先で絞り込みます。キーボードショートカットも追加します。</p></div></li>
+      </ul>
+    </div>
+  </section>
+
   <!-- OPEN SOURCE -->
-  <section id="oss" class="band">
+  <section id="oss">
     <div class="wrap body">
       <p class="sec-label" data-i18n="oss.label">オープンソース</p>
       <h2 class="sec-title" data-i18n="oss.title">大事な SSH／シリアルだからこそ、中身が見える。</h2>
@@ -367,6 +414,8 @@
     </div>
   </section>
 
+  <div class="divider"></div>
+
   <!-- FAQ -->
   <section id="faq">
     <div class="wrap body faq">
@@ -381,7 +430,7 @@
       </details>
       <details>
         <summary data-i18n="faq.q2.s">本当にエージェントから勝手に実行されませんか？</summary>
-        <div class="ans" data-i18n="faq.q2.a">はい。MCP 経由のコマンドはリスクに関係なく承認キューに入ります。実行されるのは、人間が GUI で承認したときか、特定エージェントに明示的に「承認省略」を与えたときだけです。後者は人間が意図的に付与した場合のみ有効です。</div>
+        <div class="ans" data-i18n="faq.q2.a">はい。MCP 経由のコマンドはリスクに関係なく承認キューに入ります。実行されるのは、人間が GUI で承認したときか、特定エージェントに明示的に「承認省略」を与えたときだけです。後者は人間が意図的に付与した場合のみ有効です。<br /><small>v1（未リリース）では、承認省略は Bearer 認証を有効にしたときだけ付与でき、High リスクのコマンドは承認省略があっても必ず承認キューに入ります。</small></div>
       </details>
       <details>
         <summary data-i18n="faq.q3.s">リスク分類（High/Medium/Low）はどこまで信用できますか？</summary>
@@ -389,7 +438,7 @@
       </details>
       <details>
         <summary data-i18n="faq.q4.s">外部に公開されますか？</summary>
-        <div class="ans" data-i18n="faq.q4.a">既定の待受は <code>127.0.0.1:8787</code>。ローカルのエージェントとだけ通信する前提です。必要に応じて Bearer 認証・ボディサイズ上限・CORS 制限を設定できます。</div>
+        <div class="ans" data-i18n="faq.q4.a">既定の待受は <code>127.0.0.1:8787</code>。ローカルのエージェントとだけ通信する前提です。必要に応じて Bearer 認証・ボディサイズ上限・CORS 制限を設定できます。<br /><small>v1（未リリース）では、<code>Origin</code> ヘッダ付きの要求を既定で拒否し、127.0.0.1 以外で待ち受けるには Bearer 認証が必須になります。</small></div>
       </details>
       <details>
         <summary data-i18n="faq.q5.s">シリアルポートにも使えますか？</summary>
@@ -397,7 +446,7 @@
       </details>
       <details>
         <summary data-i18n="faq.q6.s">資格情報はどこに保存されますか？</summary>
-        <div class="ans" data-i18n="faq.q6.a">接続先の鍵パス／パスワードと Bearer トークンは SQLite に保存されます。一方、<strong>SSH 鍵のパスフレーズは保存せず</strong>、アプリ起動中のメモリにのみ保持します。DB ファイルは <code>0700</code> のディレクトリに置かれます。</div>
+        <div class="ans" data-i18n="faq.q6.a">接続先の鍵パス／パスワードと Bearer トークンは SQLite に保存されます。一方、<strong>SSH 鍵のパスフレーズは保存せず</strong>、アプリ起動中のメモリにのみ保持します。DB ファイルは <code>0700</code> のディレクトリに置かれます。<br /><small>v1（未リリース）では、DB ファイル自体も <code>0600</code> で作成し、保存したパスワードは画面に返しません。</small></div>
       </details>
       <details>
         <summary data-i18n="faq.q7.s">保証はありますか？</summary>
@@ -454,6 +503,7 @@
         </div>
       </div>
       <div class="dl-note" data-i18n="dl.note">
+        配布中のバージョンは <strong>v0.1.0</strong> です。「v1 の変更」節の内容は、まだ含まれていません。<br />
         初回起動の注意（macOS）：未署名アプリのため、初回は <code>.app</code> を右クリック →「開く」で許可してください。<br />
         初回起動の注意（Windows）：未署名のため SmartScreen が出る場合は「詳細情報」→「実行」で起動できます。<br />
         ソースからビルド：<code>wails build</code>（Go 1.25 / Node が必要）。詳細は GitHub の README を参照。<br />
@@ -488,6 +538,7 @@
 
       "nav.why": "なぜ必要か",
       "nav.features": "機能",
+      "nav.v1": "v1 の変更",
       "nav.oss": "オープンソース",
       "nav.faq": "FAQ",
       "nav.download": "ダウンロード",
@@ -561,6 +612,43 @@
       "sec.s4.h": "資格情報の最小保持",
       "sec.s4.p": "SSH 鍵パスフレーズはメモリのみ（DB 非保存）。トークンはマスク表示で平文を返しません。",
 
+      "v1.label": "v1 の変更",
+      "v1.title": "安全の層を、もう一段厚く。",
+      "v1.note": "この節は次の版（v1）の内容です。<strong>いま配布している v0.1.0 には含まれていません。</strong>「実装済み」はコードとテストがそろったもの、「開発中」はまだ組み込みの途中で、画面も含めて完成していないものです。",
+      "v1.done.pill": "実装済み",
+      "v1.done.h": "未リリース",
+      "v1.d1.h": "ブラウザ経由の攻撃を遮断",
+      "v1.d1.p": "悪意ある Web ページから localhost の MCP へ要求を送り込む経路を塞ぎます。<code>Origin</code> ヘッダ付きの要求は既定で拒否（403）、<code>Host</code> はポート番号まで照合（DNS rebinding 対策）、POST は <code>application/json</code> 以外を拒否。127.0.0.1 以外で待ち受けるには Bearer 認証が必須です。",
+      "v1.d2.h": "承認しても、実行は1回だけ",
+      "v1.d2.p": "承認・拒否は DB の compare-and-swap で状態を進めます。ボタンの二重クリックや「承認」と「拒否」が競合しても、実行は1回だけ。実行中にアプリが終了した要求は、次の起動時に「中断」として記録され、もう一度承認することはできません。",
+      "v1.d3.h": "承認省略は Bearer 必須、High は必ずキューへ",
+      "v1.d3.p": "エージェント名を名乗るだけでは、承認省略は使えません。Bearer 認証を有効にしてはじめて付与でき、それでも <strong>High リスクは常に承認キュー</strong>に入ります。既定では、<code>sudo</code> を含むコマンド、本番タグ（<code>prod</code> など）の接続先、Low 以外のコマンドも承認が必要です。",
+      "v1.d4.h": "承認時の修正と、その記録",
+      "v1.d4.p": "承認画面でコマンドを直してから実行できます。直したコマンドはリスクを判定し直し、上がった場合はもう一度確認を求めます。要求されたコマンドと実際に実行したコマンドは、別々に履歴へ残ります。",
+      "v1.d5.h": "監査 API の保護",
+      "v1.d5.p": "監査用のエンドポイント <code>/audit/events</code> は GET だけを受け付け、Bearer 認証が有効なときはトークンが必要です。返す件数にも上限（既定 100 件、最大 500 件）を設けました。",
+      "v1.d6.h": "接続先の管理と編集画面",
+      "v1.d6.p": "接続先は名前ではなく不変の ID で管理するため、名前を変えても履歴やタブがついてきます。パスワードは保存後に画面へ返しません（空欄のまま保存すれば、保存済みの値を保ちます）。「接続テスト」は保存前の入力でも試せて、保存済みの状態は書き換えません。編集画面には「保存済み／未保存の変更あり」を表示し、未保存のまま移ろうとすると確認します。",
+      "v1.d7.h": "ターミナルの複数タブと、新しいサイドバー",
+      "v1.d7.p": "1つの接続先に、シェルをいくつでも開けます。タブは画面を移っても閉じず、1つ閉じても他のタブはそのまま。サイドバーには、接続中のセッション、シェルの数、実行中のコマンド数、MCP の待受状態と承認待ちの件数を表示します。",
+      "v1.d8.h": "MCP：結果の取得・再送・終了コード",
+      "v1.d8.p": "<code>get_request_status</code> で、承認キューに入った要求の状態と結果を取得できます（<code>wait_seconds</code> で最大 60 秒待てます）。<code>client_request_id</code> を付ければ、24 時間以内の再送は新しく実行せず、同じ <code>request_id</code> を返します。結果には <code>exit_code</code> が入り、失敗は <code>isError</code> で判定できます。",
+      "v1.d9.h": "CI と依存関係",
+      "v1.d9.p": "テストは macOS・Windows・Linux の3つの OS で <code>-race</code> 付きで実行し、<code>govulncheck</code> と <code>npm audit</code>（high 以上で失敗）も毎回かけます。GitHub Actions は commit SHA で固定し、更新は Dependabot で追います。リリース用のワークフローは、成果物に <code>SHA256SUMS.txt</code> を添付します。",
+      "v1.wip.pill": "開発中",
+      "v1.wip.h": "組み込みの途中・画面は未完成",
+      "v1.wip.note": "内容や名前は変わることがあります。",
+      "v1.w1.h": "ホスト鍵の検証（TOFU）",
+      "v1.w1.p": "初めて接続したホストの鍵を専用の known_hosts に記録し、以後、鍵が一致しなければ接続を拒否します。",
+      "v1.w2.h": "エージェント専用トークン",
+      "v1.w2.p": "共有のトークンだけでは承認省略を使えないようにし、エージェントごとのトークンに期限・上限リスク・対象の接続先を持たせます。",
+      "v1.w3.h": "リスク判定の強化",
+      "v1.w3.p": "<code>;</code> や <code>&amp;&amp;</code> でつないだコマンド、フルパスの <code>sudo</code>、<code>env</code>／<code>xargs</code> 経由の実行も見分けます。",
+      "v1.w4.h": "実行先が変わったら承認を止める",
+      "v1.w4.p": "要求のあとで接続先の user@host:port が変わっていたら、承認しても実行しません。",
+      "v1.w5.h": "上部のサーバータブとショートカット",
+      "v1.w5.p": "画面の上に接続先ごとのタブを置き、承認キューや履歴をその接続先で絞り込みます。キーボードショートカットも追加します。",
+
       "oss.label": "オープンソース",
       "oss.title": "大事な SSH／シリアルだからこそ、中身が見える。",
       "oss.p": "承認をすり抜けて実行する裏口がないか。資格情報をこっそり外へ送っていないか。\n        —— サーバーの鍵やコンソールを預ける道具が<strong>ブラックボックスでは、意味がありません</strong>。\n        SSH GATE は<strong>ソースを丸ごと公開</strong>しています（<strong>MIT ライセンス</strong>。商用利用・改変・再配布OK）。\n        動作は<strong>ローカルだけ</strong>で完結し、外部に何も送りません。気になる挙動は、コードでそのまま確かめられます。",
@@ -571,15 +659,15 @@
       "faq.q1.s": "もっと詳しい紹介・背景は？",
       "faq.q1.a": '開発の背景や使いどころを Qiita の紹介記事にまとめています →\n          <a href="https://qiita.com/yoshiyakato/private/7987aa7a671f089f06ea" target="_blank" rel="noopener">SSH GATE 紹介記事（Qiita）</a>。\n          <br /><small>※ 限定共有リンクです。</small>',
       "faq.q2.s": "本当にエージェントから勝手に実行されませんか？",
-      "faq.q2.a": "はい。MCP 経由のコマンドはリスクに関係なく承認キューに入ります。実行されるのは、人間が GUI で承認したときか、特定エージェントに明示的に「承認省略」を与えたときだけです。後者は人間が意図的に付与した場合のみ有効です。",
+      "faq.q2.a": "はい。MCP 経由のコマンドはリスクに関係なく承認キューに入ります。実行されるのは、人間が GUI で承認したときか、特定エージェントに明示的に「承認省略」を与えたときだけです。後者は人間が意図的に付与した場合のみ有効です。<br /><small>v1（未リリース）では、承認省略は Bearer 認証を有効にしたときだけ付与でき、High リスクのコマンドは承認省略があっても必ず承認キューに入ります。</small>",
       "faq.q3.s": "リスク分類（High/Medium/Low）はどこまで信用できますか？",
       "faq.q3.a": "コマンド文字列のヒューリスティックなので、クオートやエイリアスで回避され得ます。あくまで人間の判断を助ける<strong>目安</strong>で、これ自体が実行可否を決めるわけではありません。実行可否は承認とポリシーが決めます。",
       "faq.q4.s": "外部に公開されますか？",
-      "faq.q4.a": "既定の待受は <code>127.0.0.1:8787</code>。ローカルのエージェントとだけ通信する前提です。必要に応じて Bearer 認証・ボディサイズ上限・CORS 制限を設定できます。",
+      "faq.q4.a": "既定の待受は <code>127.0.0.1:8787</code>。ローカルのエージェントとだけ通信する前提です。必要に応じて Bearer 認証・ボディサイズ上限・CORS 制限を設定できます。<br /><small>v1（未リリース）では、<code>Origin</code> ヘッダ付きの要求を既定で拒否し、127.0.0.1 以外で待ち受けるには Bearer 認証が必須になります。</small>",
       "faq.q5.s": "シリアルポートにも使えますか？",
       "faq.q5.a": "使えます。接続先の種別を「シリアル」にすると、ターミナル画面でシリアルコンソールが開きます。SSH と同じ操作感です。なお、シリアルは対話 GUI 専用で、MCP（エージェント）からは実行できません。",
       "faq.q6.s": "資格情報はどこに保存されますか？",
-      "faq.q6.a": "接続先の鍵パス／パスワードと Bearer トークンは SQLite に保存されます。一方、<strong>SSH 鍵のパスフレーズは保存せず</strong>、アプリ起動中のメモリにのみ保持します。DB ファイルは <code>0700</code> のディレクトリに置かれます。",
+      "faq.q6.a": "接続先の鍵パス／パスワードと Bearer トークンは SQLite に保存されます。一方、<strong>SSH 鍵のパスフレーズは保存せず</strong>、アプリ起動中のメモリにのみ保持します。DB ファイルは <code>0700</code> のディレクトリに置かれます。<br /><small>v1（未リリース）では、DB ファイル自体も <code>0600</code> で作成し、保存したパスワードは画面に返しません。</small>",
       "faq.q7.s": "保証はありますか？",
       "faq.q7.a": "<strong>ありません。</strong>本ソフトウェアは MIT ライセンスに基づき「<strong>現状有姿（AS IS）</strong>」で提供され、明示・黙示を問わず一切の保証（商品性・特定目的適合性・非侵害など）はありません。利用によって生じたいかなる損害についても、作者・配布者は責任を負いません。本番環境で使う場合は、必ずご自身の責任で検証してください。",
 
@@ -595,7 +683,7 @@
       "dl.mac.btn": "ダウンロード（5.1MB）",
       "dl.win.meta": "x64 · .exe (zip)",
       "dl.win.btn": "ダウンロード（8.5MB）",
-      "dl.note": "初回起動の注意（macOS）：未署名アプリのため、初回は <code>.app</code> を右クリック →「開く」で許可してください。<br />\n        初回起動の注意（Windows）：未署名のため SmartScreen が出る場合は「詳細情報」→「実行」で起動できます。<br />\n        ソースからビルド：<code>wails build</code>（Go 1.25 / Node が必要）。詳細は GitHub の README を参照。<br />\n        ライセンスは <strong>MIT</strong>（商用利用・改変・再配布OK）。<br />\n        <strong>無保証（AS IS）</strong>：本ソフトウェアは現状有姿で提供され、明示・黙示を問わず一切の保証はありません。生じた損害について作者・配布者は責任を負いません。<strong>利用は自己責任</strong>でお願いします。",
+      "dl.note": "配布中のバージョンは <strong>v0.1.0</strong> です。「v1 の変更」節の内容は、まだ含まれていません。<br />\n        初回起動の注意（macOS）：未署名アプリのため、初回は <code>.app</code> を右クリック →「開く」で許可してください。<br />\n        初回起動の注意（Windows）：未署名のため SmartScreen が出る場合は「詳細情報」→「実行」で起動できます。<br />\n        ソースからビルド：<code>wails build</code>（Go 1.25 / Node が必要）。詳細は GitHub の README を参照。<br />\n        ライセンスは <strong>MIT</strong>（商用利用・改変・再配布OK）。<br />\n        <strong>無保証（AS IS）</strong>：本ソフトウェアは現状有姿で提供され、明示・黙示を問わず一切の保証はありません。生じた損害について作者・配布者は責任を負いません。<strong>利用は自己責任</strong>でお願いします。",
 
       "foot.license": "MIT License",
       "foot.article": "紹介記事",
@@ -607,6 +695,7 @@
 
       "nav.why": "Why",
       "nav.features": "Features",
+      "nav.v1": "What's new in v1",
       "nav.oss": "Open Source",
       "nav.faq": "FAQ",
       "nav.download": "Download",
@@ -680,6 +769,43 @@
       "sec.s4.h": "Minimal credential retention",
       "sec.s4.p": "SSH key passphrases live in memory only (never stored in the DB). Tokens are shown masked and never returned in plaintext.",
 
+      "v1.label": "What's new in v1",
+      "v1.title": "One more layer of safety.",
+      "v1.note": "This section describes the next version (v1). <strong>None of it is in v0.1.0, the version distributed today.</strong> \"Implemented\" means the code and tests are in place; \"In development\" means it is still being integrated and is not finished, including its screens.",
+      "v1.done.pill": "Implemented",
+      "v1.done.h": "Not yet released",
+      "v1.d1.h": "Blocking attacks through the browser",
+      "v1.d1.p": "Closes the path by which a malicious web page pushes requests into the MCP server on localhost. Requests with an <code>Origin</code> header are rejected by default (403), <code>Host</code> is checked down to the port number (against DNS rebinding), and POST bodies other than <code>application/json</code> are refused. Listening on anything other than 127.0.0.1 requires Bearer authentication.",
+      "v1.d2.h": "Approved once, run once",
+      "v1.d2.p": "Approve and reject advance the request state with a compare-and-swap in the DB. Even with a double click, or approve and reject racing each other, the command runs only once. A request that was running when the app quit is recorded as \"Interrupted\" on the next launch and cannot be approved again.",
+      "v1.d3.h": "Approval-skip needs Bearer; High always queues",
+      "v1.d3.p": "Declaring an agent name is not enough to use approval-skip. It can be granted only once Bearer authentication is enabled, and even then <strong>High-risk commands always go to the approval queue</strong>. By default, commands containing <code>sudo</code>, hosts with a production tag (such as <code>prod</code>), and any command that is not Low risk also require approval.",
+      "v1.d4.h": "Editing at approval time, and its record",
+      "v1.d4.p": "You can fix the command on the approval screen before running it. The edited command is re-classified, and if its risk went up you are asked to confirm again. The requested command and the command actually executed are kept separately in the history.",
+      "v1.d5.h": "Protected audit API",
+      "v1.d5.p": "The audit endpoint <code>/audit/events</code> accepts GET only and requires the token when Bearer authentication is enabled. The number of entries it returns is capped (100 by default, 500 at most).",
+      "v1.d6.h": "Host management and the edit screen",
+      "v1.d6.p": "Hosts are tracked by an immutable ID rather than by name, so history and tabs follow a rename. Passwords are never sent back to the screen after saving (saving with the field left blank keeps the stored value). \"Test connection\" works on unsaved input and does not overwrite the saved state. The edit screen shows \"Saved / Unsaved changes\" and asks before you leave with unsaved changes.",
+      "v1.d7.h": "Multiple terminal tabs and a new sidebar",
+      "v1.d7.p": "Open as many shells as you like on one host. Tabs stay open when you move to another screen, and closing one leaves the others running. The sidebar shows connected sessions, the number of shells, running commands, the MCP listener status, and how many requests await approval.",
+      "v1.d8.h": "MCP: fetching results, retries, exit codes",
+      "v1.d8.p": "<code>get_request_status</code> returns the state and result of a request in the approval queue (<code>wait_seconds</code> lets it wait up to 60 seconds). With a <code>client_request_id</code>, a retry within 24 hours does not run again and returns the same <code>request_id</code>. Results include <code>exit_code</code>, and failures can be detected with <code>isError</code>.",
+      "v1.d9.h": "CI and dependencies",
+      "v1.d9.p": "Tests run with <code>-race</code> on three OSes — macOS, Windows, and Linux — and <code>govulncheck</code> and <code>npm audit</code> (failing at high or above) run every time. GitHub Actions are pinned to commit SHAs and kept up to date with Dependabot. The release workflow attaches <code>SHA256SUMS.txt</code> to its artifacts.",
+      "v1.wip.pill": "In development",
+      "v1.wip.h": "Still being integrated; screens not finished",
+      "v1.wip.note": "Details and names may change.",
+      "v1.w1.h": "Host key verification (TOFU)",
+      "v1.w1.p": "Records the key of a host on first connection in a dedicated known_hosts file, and from then on refuses to connect if the key does not match.",
+      "v1.w2.h": "Per-agent tokens",
+      "v1.w2.p": "The shared token alone will no longer unlock approval-skip; each agent gets its own token with an expiry, a maximum risk, and the hosts it applies to.",
+      "v1.w3.h": "Stronger risk classification",
+      "v1.w3.p": "Also recognizes commands chained with <code>;</code> or <code>&amp;&amp;</code>, <code>sudo</code> given by full path, and execution through <code>env</code> / <code>xargs</code>.",
+      "v1.w4.h": "Stop approval if the target changed",
+      "v1.w4.p": "If the host's user@host:port changed after the request was made, approving it will not run the command.",
+      "v1.w5.h": "Server tabs at the top, and shortcuts",
+      "v1.w5.p": "Per-host tabs across the top of the screen filter the approval queue and history to that host. Keyboard shortcuts are added too.",
+
       "oss.label": "Open source",
       "oss.title": "Because SSH and serial matter, you can see what's inside.",
       "oss.p": "Is there a back door that runs around the approval? Is it quietly sending your credentials somewhere?\n        —— A tool you entrust with your servers' keys and consoles is <strong>meaningless as a black box</strong>.\n        SSH GATE <strong>publishes its entire source</strong> (<strong>MIT License</strong> — commercial use, modification, and redistribution OK).\n        It runs <strong>fully locally</strong> and sends nothing externally. Any behavior you wonder about, you can verify right in the code.",
@@ -690,15 +816,15 @@
       "faq.q1.s": "Where can I read a fuller introduction and background?",
       "faq.q1.a": 'We have summarized the development background and use cases in an article on Qiita →\n          <a href="https://qiita.com/yoshiyakato/private/7987aa7a671f089f06ea" target="_blank" rel="noopener">SSH GATE introduction (Qiita)</a>.\n          <br /><small>* This is a limited-share link.</small>',
       "faq.q2.s": "Will it really never run on its own from an agent?",
-      "faq.q2.a": "Correct. Commands via MCP go into the approval queue regardless of risk. They run only when a human approves them in the GUI, or when a specific agent has been explicitly granted \"approval-skip.\" The latter takes effect only when a human intentionally granted it.",
+      "faq.q2.a": "Correct. Commands via MCP go into the approval queue regardless of risk. They run only when a human approves them in the GUI, or when a specific agent has been explicitly granted \"approval-skip.\" The latter takes effect only when a human intentionally granted it.<br /><small>In v1 (unreleased), approval-skip can be granted only when Bearer authentication is enabled, and High-risk commands always go to the approval queue even with approval-skip.</small>",
       "faq.q3.s": "How far can I trust the risk classification (High/Medium/Low)?",
       "faq.q3.a": "It's a heuristic on the command string, so it can be evaded with quoting or aliases. It's a <strong>guide</strong> to aid human judgment only and does not itself decide whether a command runs. Approval and policy decide that.",
       "faq.q4.s": "Will it be exposed externally?",
-      "faq.q4.a": "It listens on <code>127.0.0.1:8787</code> by default, on the assumption that it talks only to local agents. You can configure Bearer authentication, a body-size cap, and CORS restrictions as needed.",
+      "faq.q4.a": "It listens on <code>127.0.0.1:8787</code> by default, on the assumption that it talks only to local agents. You can configure Bearer authentication, a body-size cap, and CORS restrictions as needed.<br /><small>In v1 (unreleased), requests carrying an <code>Origin</code> header are rejected by default, and listening on anything other than 127.0.0.1 requires Bearer authentication.</small>",
       "faq.q5.s": "Can I use it for serial ports?",
       "faq.q5.a": "Yes. Set the host's type to \"serial\" and a serial console opens in the terminal screen, with the same feel as SSH. Note that serial is interactive-GUI only and cannot be executed from MCP (agents).",
       "faq.q6.s": "Where are credentials stored?",
-      "faq.q6.a": "A host's key path / password and the Bearer token are stored in SQLite. On the other hand, <strong>SSH key passphrases are not stored</strong> — they are kept only in memory while the app is running. The DB file is placed in a <code>0700</code> directory.",
+      "faq.q6.a": "A host's key path / password and the Bearer token are stored in SQLite. On the other hand, <strong>SSH key passphrases are not stored</strong> — they are kept only in memory while the app is running. The DB file is placed in a <code>0700</code> directory.<br /><small>In v1 (unreleased), the DB file itself is created as <code>0600</code>, and saved passwords are never sent back to the screen.</small>",
       "faq.q7.s": "Is there a warranty?",
       "faq.q7.a": "<strong>No.</strong> This software is provided under the MIT License <strong>\"AS IS\"</strong>, without warranty of any kind, express or implied, including but not limited to merchantability, fitness for a particular purpose, and non-infringement. In no event shall the authors or distributors be liable for any damage arising from its use. If you use it in production, be sure to validate it at your own risk.",
 
@@ -714,7 +840,7 @@
       "dl.mac.btn": "Download (5.1MB)",
       "dl.win.meta": "x64 · .exe (zip)",
       "dl.win.btn": "Download (8.5MB)",
-      "dl.note": "First-launch note (macOS): Since the app is unsigned, on first launch right-click the <code>.app</code> → \"Open\" to allow it.<br />\n        First-launch note (Windows): Since it is unsigned, if SmartScreen appears, click \"More info\" → \"Run anyway\" to start it.<br />\n        Build from source: <code>wails build</code> (requires Go 1.25 / Node). See the README on GitHub for details.<br />\n        Licensed under <strong>MIT</strong> (commercial use, modification, and redistribution OK).<br />\n        <strong>No warranty (AS IS)</strong>: This software is provided as-is, without warranty of any kind, express or implied. The authors and distributors are not liable for any damage that may arise. <strong>Use is at your own risk.</strong>",
+      "dl.note": "The version currently distributed is <strong>v0.1.0</strong>. It does not yet include anything in the \"What's new in v1\" section.<br />\n        First-launch note (macOS): Since the app is unsigned, on first launch right-click the <code>.app</code> → \"Open\" to allow it.<br />\n        First-launch note (Windows): Since it is unsigned, if SmartScreen appears, click \"More info\" → \"Run anyway\" to start it.<br />\n        Build from source: <code>wails build</code> (requires Go 1.25 / Node). See the README on GitHub for details.<br />\n        Licensed under <strong>MIT</strong> (commercial use, modification, and redistribution OK).<br />\n        <strong>No warranty (AS IS)</strong>: This software is provided as-is, without warranty of any kind, express or implied. The authors and distributors are not liable for any damage that may arise. <strong>Use is at your own risk.</strong>",
 
       "foot.license": "MIT License",
       "foot.article": "Article",
