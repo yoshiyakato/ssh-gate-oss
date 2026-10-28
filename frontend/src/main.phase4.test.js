@@ -1,4 +1,7 @@
-import { describe, it, expect, vi, beforeAll } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
+vi.mock('./dialog.js', () => ({ askConfirm: vi.fn() }));
+import { askConfirm } from './dialog.js';
+beforeEach(() => vi.mocked(askConfirm).mockReset());
 import { phase4Dashboard, TERMINALS } from './__fixtures__/phase4.js';
 
 // Phase 4 wiring of main.js (phase4-ui-integration.md §5.2): the server tabs
@@ -350,7 +353,7 @@ describe('phase 4 terminal toolbar, closeTab and the sidebar', () => {
     await click(tabButton(''));
     await click('.ssh-list [data-select-request="R1"]');
     await typeInto('#approval-command', 'echo edited');
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    const confirm = vi.mocked(askConfirm).mockResolvedValue(false);
     await click('[data-action="side-open-conn"][data-conn-id="c-db"]');
     expect(confirm).toHaveBeenCalled();
     confirm.mockRestore();

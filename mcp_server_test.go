@@ -546,11 +546,11 @@ func bypassExec(t *testing.T, app *App, token string, args map[string]any) map[s
 	return out
 }
 
-// TestHighAlwaysQueuesWithRulesOff (#55): "High always needs approval" holds
-// on its own. With every RequireApproval* switch off, a High command from an
-// agent with a bypass grant stays pending and never reaches SSH. Under the
-// default settings RequireApprovalWriteOp alone would queue it, hiding a
-// broken High check.
+// TestHighAlwaysQueuesWithRulesOff (#55): an ordinary (not forced) grant
+// never covers High on its own. With every RequireApproval* switch off, a
+// High command from an agent with a bypass grant stays pending and never
+// reaches SSH. Under the default settings RequireApprovalWriteOp alone would
+// queue it, hiding a broken High check.
 func TestHighAlwaysQueuesWithRulesOff(t *testing.T) {
 	app := newTestApp(t)
 	srv, token := bypassAgent(t, app)
@@ -573,16 +573,54 @@ func TestHighAlwaysQueuesWithRulesOff(t *testing.T) {
 	}
 }
 
-// TestPolicyNeverAllowsHigh (#55): the grant itself never covers High,
-// whatever max_risk was stored, scoped or not.
-func TestPolicyNeverAllowsHigh(t *testing.T) {
+// TestForcedBypassRunsHighAndSkipsRules: once the human raises the grant to
+// High, High commands auto-run and the sudo / write-op rules no longer queue
+// this agent's commands; a fresh grant starts again at Medium.
+func TestForcedBypassRunsHighAndSkipsRules(t *testing.T) {
+	app := newTestApp(t)
+	srv, token := bypassAgent(t, app)
+	setApprovalRules(app, true, true, true)
+
+	if r := app.SetAgentBypassMaxRisk("trusted", "Critical"); r.OK || r.Code != "invalid" {
+		t.Fatalf("unknown risk accepted: %+v", r)
+	}
+	if r := app.SetAgentBypassMaxRisk("nobody", "High"); r.OK || r.Code != "not_found" {
+		t.Fatalf("agent without a grant accepted: %+v", r)
+	}
+	if r := app.SetAgentBypassMaxRisk("trusted", "High"); !r.OK {
+		t.Fatalf("SetAgentBypassMaxRisk: %+v", r)
+	}
+	for _, command := range []string{"rm -rf /tmp/x", "sudo echo x", "echo 'quoted'"} {
+		out := bypassExec(t, app, token, map[string]any{"command": command})
+		if out["state"] == statePending || out["auto_executed"] != true {
+			t.Fatalf("%q must auto-run under a forced grant: %v", command, out)
+		}
+	}
+	if execs := srv.Execs(); len(execs) != 3 {
+		t.Fatalf("forced commands did not reach SSH: %v", execs)
+	}
+	if out := bypassExec(t, app, token, map[string]any{"command": "rm -rf /tmp/x", "force_queue": true}); out["state"] != statePending {
+		t.Fatalf("force_queue must still queue: %v", out)
+	}
+
+	app.setAgentApprovalBypass("trusted", false)
+	app.setAgentApprovalBypass("trusted", true)
+	out := bypassExec(t, app, token, map[string]any{"command": "rm -rf /tmp/x"})
+	if out["state"] != statePending {
+		t.Fatalf("a new grant must not inherit the forced max_risk: %v", out)
+	}
+}
+
+// TestPolicyAllowsHighOnlyWhenForced (#55): only a grant whose max_risk is
+// High (the forced bypass) covers High, scoped or not.
+func TestPolicyAllowsHighOnlyWhenForced(t *testing.T) {
 	now := time.Now()
 	for _, maxRisk := range []string{"", "Low", "Medium", "High", "bogus"} {
 		for _, scope := range [][]string{nil, {"c1"}} {
 			p := fillPolicyDefaults(AgentPolicy{AgentName: "a", ApprovalBypass: true, ScopeConnIDs: scope}, now)
 			p.MaxRisk = maxRisk // as if stored without normalisation
-			if policyAllows(p, "High", "c1", now) {
-				t.Fatalf("policy max_risk=%q scope=%v allowed High", maxRisk, scope)
+			if got := policyAllows(p, "High", "c1", now); got != (maxRisk == "High") {
+				t.Fatalf("policy max_risk=%q scope=%v allowed High = %v", maxRisk, scope, got)
 			}
 			if !policyAllows(p, "Low", "c1", now) {
 				t.Fatalf("policy max_risk=%q scope=%v refused Low (fixture broken)", maxRisk, scope)
@@ -1475,7 +1513,7 @@ func TestSwitchToSerialDropsSSHAndBlocksMCP(t *testing.T) {
 
 // TestClassifyRiskSeesChainedAndPathCommands: shell separators, full paths
 // and wrappers must not hide a High command from the classifier, since
-// approval bypass relies on High always being queued.
+// an ordinary (not forced) approval bypass relies on High being queued.
 func TestClassifyRiskSeesChainedAndPathCommands(t *testing.T) {
 	cases := []struct {
 		command string

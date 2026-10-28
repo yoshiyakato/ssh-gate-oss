@@ -1195,9 +1195,10 @@ func policyActiveAt(p AgentPolicy, now time.Time) bool {
 }
 
 // policyAllows reports whether an active grant covers risk on connID. An
-// empty scope means every connection. High risk is never covered.
+// empty scope means every connection. High is covered only by a forced grant
+// (max_risk High, raised by the human in the GUI).
 func policyAllows(p AgentPolicy, risk string, connID string, now time.Time) bool {
-	if !policyActiveAt(p, now) || risk == "High" {
+	if !policyActiveAt(p, now) {
 		return false
 	}
 	rank, ok := riskRank[risk]
@@ -1215,10 +1216,10 @@ func policyAllows(p AgentPolicy, risk string, connID string, now time.Time) bool
 	return false
 }
 
-// normalizeBypassMaxRisk clamps max_risk to Low or Medium.
+// normalizeBypassMaxRisk clamps max_risk to Low, Medium or High (forced).
 func normalizeBypassMaxRisk(risk string) string {
-	if risk == "Low" {
-		return "Low"
+	if risk == "Low" || risk == forcedBypassMaxRisk {
+		return risk
 	}
 	return defaultBypassMaxRisk
 }

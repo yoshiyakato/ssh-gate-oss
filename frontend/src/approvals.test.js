@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+vi.mock('./dialog.js', () => ({ askConfirm: vi.fn() }));
+import { askConfirm } from './dialog.js';
+beforeEach(() => vi.mocked(askConfirm).mockReset());
 
 const backend = vi.hoisted(() => ({
   calls: [],
@@ -42,6 +45,7 @@ import { BASE_I18N } from './i18n.js';
 import { RESULT_I18N, resultMessage } from './result-message.js';
 import {
   APPROVALS_I18N,
+  LIST_COMMAND_MAX,
   APPROVAL_CODES,
   approvalBlock,
   approvalCommandToSend,
@@ -277,6 +281,23 @@ describe('renderCommandsPage', () => {
     expect(root.querySelector('#approval-target').textContent).toContain(evil);
   });
 
+  it('draws only the head of a long command in the lists, the full text in the detail', async () => {
+    const long = `cat <<'EOF'\n${'x'.repeat(50000)}\nEOF`;
+    state.data.requests = [
+      request('R1', { command: long }),
+      request('R2', { command: long, status: 'succeeded' }),
+    ];
+    state.selectedRequestId = 'R2';
+    await render();
+    const queueCode = root.querySelector('.list-group-item code');
+    const historyCode = root.querySelector('tbody code');
+    for (const code of [queueCode, historyCode]) {
+      expect(code.textContent.length).toBeLessThan(LIST_COMMAND_MAX + 20);
+      expect(code.textContent.endsWith('…')).toBe(true);
+    }
+    expect(root.textContent).toContain('x'.repeat(50000));
+  });
+
   it('shows the resolved target, both user@host:port values and the host key', async () => {
     state.data.requests = [request('R1')];
     await render();
@@ -485,7 +506,7 @@ describe('approve / reject handlers', () => {
   it('approves an unedited CR command as requested', async () => {
     state.data.requests = [request('R1', { command: 'echo hi\rrm -rf ~', risk: 'High' })];
     await render();
-    const confirm = vi.spyOn(window, 'confirm');
+    const confirm = vi.mocked(askConfirm);
     await click('[data-action="approve-command"]');
     expect(confirm).not.toHaveBeenCalled();
     confirm.mockRestore();
@@ -497,7 +518,7 @@ describe('approve / reject handlers', () => {
     state.data.requests = [request('R1')];
     await render();
     backend.approve = () => ({ ok: false, code: 'risk_increased', message: '修正したコマンドのリスクが Low → High に上がりました' });
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const confirm = vi.mocked(askConfirm).mockResolvedValue(true);
     root.querySelector('#approval-command').value = 'rm -rf /tmp/x';
     await click('[data-action="approve-command"]');
     expect(confirm.mock.calls[0][0]).toContain('Low → High');
@@ -510,7 +531,7 @@ describe('approve / reject handlers', () => {
     state.data.requests = [request('R1')];
     await render();
     backend.approve = () => ({ ok: false, code: 'risk_increased', message: 'JA message' });
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    const confirm = vi.mocked(askConfirm).mockResolvedValue(false);
     root.querySelector('#approval-command').value = 'rm -rf /tmp/x';
     await click('[data-action="approve-command"]');
     expect(confirm.mock.calls[0][0]).toContain(I18N.en['appr.code.risk_increased']);
@@ -538,7 +559,7 @@ describe('approve / reject handlers', () => {
   it('confirms the bypass grant (8h, Medium, token) before calling the backend', async () => {
     state.data.requests = [request('R1')];
     await render();
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    const confirm = vi.mocked(askConfirm).mockResolvedValue(false);
     await click('[data-action="approve-bypass-agent"]');
     expect(confirm).toHaveBeenCalledTimes(1);
     expect(confirm.mock.calls[0][0]).toContain('8時間');
@@ -553,7 +574,7 @@ describe('approve / reject handlers', () => {
   it('keeps the request pending and the edit on bearer_required', async () => {
     state.data.requests = [request('R1')];
     await render();
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.mocked(askConfirm).mockResolvedValue(true);
     backend.bypass = () => ({ ok: false, code: 'bearer_required', message: 'x' });
     await click('[data-action="approve-bypass-agent"]');
     expect(ctx.toast).toHaveBeenCalledWith(I18N.ja['appr.code.bearer_required']);
@@ -564,7 +585,7 @@ describe('approve / reject handlers', () => {
   it('does not approve with bypass when the edit raised the risk', async () => {
     state.data.requests = [request('R1')];
     await render();
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.mocked(askConfirm).mockResolvedValue(true);
     backend.bypass = () => ({ ok: false, code: 'risk_increased', message: 'x' });
     await click('[data-action="approve-bypass-agent"]');
     expect(backend.calls.some(([name]) => name === 'ApproveCommandConfirmed')).toBe(false);

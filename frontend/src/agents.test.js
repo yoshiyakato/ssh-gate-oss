@@ -7,6 +7,7 @@ vi.mock('../wailsjs/go/main/App', () => ({
   RevokeAgentApprovalBypass: vi.fn(),
   RevokeAgentToken: vi.fn(),
   RevokeAllAgentApprovalBypasses: vi.fn(),
+  SetAgentBypassMaxRisk: vi.fn(),
 }));
 
 import * as App from '../wailsjs/go/main/App';
@@ -20,6 +21,7 @@ import {
   forgetIssuedAgentToken,
   formatRemaining,
   getAgentsState,
+  handleAgentsChange,
   handleAgentsClick,
   handleAgentsInput,
   handleAgentsSubmit,
@@ -375,6 +377,43 @@ describe('revoking', () => {
     expect(App.RevokeAgentApprovalBypass).toHaveBeenCalledWith('claude-code');
     expect(document.querySelectorAll('[data-bypass-row]')).toHaveLength(1);
     expect(ctx.refresh).toHaveBeenCalled();
+  });
+
+  it('lowers the max risk without asking', async () => {
+    const ctx = makeCtx('ja');
+    await mount(ctx, { bypasses: [policy('codex')] });
+    App.SetAgentBypassMaxRisk.mockResolvedValue({ ok: true, message: 'ok' });
+    const select = document.querySelector('[data-agents-max-risk="codex"]');
+    expect(select.value).toBe('Medium');
+    select.value = 'Low';
+    await handleAgentsChange({ target: select }, ctx);
+    expect(App.SetAgentBypassMaxRisk).toHaveBeenCalledWith('codex', 'Low');
+    expect(document.querySelector('#agents-modal-root .modal')).toBeNull();
+  });
+
+  it('forces High only after confirmation', async () => {
+    const ctx = makeCtx('ja');
+    await mount(ctx, { bypasses: [policy('codex')] });
+    App.SetAgentBypassMaxRisk.mockResolvedValue({ ok: true, message: 'ok' });
+    let select = document.querySelector('[data-agents-max-risk="codex"]');
+    select.value = 'High';
+    let pending = handleAgentsChange({ target: select }, ctx);
+    await flush();
+    expect(document.querySelector('#agents-modal-root .modal-body').textContent).toContain('「codex」のコマンドは');
+    await answerDialog(false);
+    await pending;
+    expect(App.SetAgentBypassMaxRisk).not.toHaveBeenCalled();
+    expect(document.querySelector('[data-agents-max-risk="codex"]').value).toBe('Medium');
+
+    App.ListAgentApprovalBypasses.mockResolvedValue([policy('codex', { maxRisk: 'High' })]);
+    select = document.querySelector('[data-agents-max-risk="codex"]');
+    select.value = 'High';
+    pending = handleAgentsChange({ target: select }, ctx);
+    await answerDialog(true);
+    await pending;
+    await flush();
+    expect(App.SetAgentBypassMaxRisk).toHaveBeenCalledWith('codex', 'High');
+    expect(document.querySelector('[data-agents-max-risk="codex"]').value).toBe('High');
   });
 
   it('revokes every bypass after confirmation with the count', async () => {

@@ -1,4 +1,7 @@
-import { describe, it, expect, vi, beforeAll } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
+vi.mock('./dialog.js', () => ({ askConfirm: vi.fn() }));
+import { askConfirm } from './dialog.js';
+beforeEach(() => vi.mocked(askConfirm).mockReset());
 
 // End-to-end wiring of main.js against mocked bindings: the phase 2
 // acceptance points that live in the integration (not in one module).
@@ -373,7 +376,7 @@ describe('main.js integration', () => {
   it('labels the shared-Bearer example and localizes its placeholder', async () => {
     backend.data = { ...backend.data, mcp: { status: '停止中', port: 8790, bearerEnabled: true }, sessionsSeq: 60 };
     // Drops the unsaved form of the previous case, then reloads.
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const confirm = vi.mocked(askConfirm).mockResolvedValue(true);
     await click('[data-action="delete-mcp"]');
     confirm.mockRestore();
     await click('[data-lang="en"]');

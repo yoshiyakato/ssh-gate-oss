@@ -34,9 +34,12 @@ const (
 	maxMCPAgents     = 256
 	// defaultBypassTTL is how long an approval-bypass grant lasts (§5.5).
 	defaultBypassTTL = 8 * time.Hour
-	// defaultBypassMaxRisk is the highest risk a bypass grant covers; High is
-	// always queued regardless.
+	// defaultBypassMaxRisk is the highest risk a new bypass grant covers.
 	defaultBypassMaxRisk = "Medium"
+	// forcedBypassMaxRisk marks a forced grant: the human raised max_risk to
+	// High, so High commands auto-run too and the sudo / prod / write-op
+	// approval rules no longer apply to that agent.
+	forcedBypassMaxRisk = "High"
 	// agentTokenPrefix marks per-agent tokens so they are distinguishable
 	// from the shared MCP token.
 	agentTokenPrefix = "sga_"
@@ -247,8 +250,8 @@ type AgentPolicy struct {
 	AgentName      string `json:"agentName"`
 	ApprovalBypass bool   `json:"approvalBypass"`
 	UpdatedAt      string `json:"updatedAt"`
-	// MaxRisk is the highest risk auto-executed (Low or Medium; default
-	// Medium). High is always queued.
+	// MaxRisk is the highest risk auto-executed (Low, Medium or High;
+	// default Medium). High is the forced bypass (forcedBypassMaxRisk).
 	MaxRisk string `json:"maxRisk"`
 	// ScopeConnIDs limits the grant to these connections; empty means all.
 	ScopeConnIDs []string `json:"scopeConnIds"`
@@ -1707,6 +1710,40 @@ func (a *App) saveAgentPolicy(policy AgentPolicy) error {
 	a.agentPolicies[policy.AgentName] = policy
 	a.mu.Unlock()
 	return nil
+}
+
+// SetAgentBypassMaxRisk changes the highest risk agentName's active grant
+// auto-executes. High makes it a forced grant (forcedBypassMaxRisk).
+func (a *App) SetAgentBypassMaxRisk(agentName string, risk string) ActionResult {
+	a.policyMu.Lock()
+	defer a.policyMu.Unlock()
+	agentName = strings.TrimSpace(agentName)
+	if _, ok := riskRank[risk]; !ok {
+		return ActionResult{OK: false, Code: "invalid", Message: fmt.Sprintf("リスク上限 %q は指定できません（Low / Medium / High）", risk)}
+	}
+	now := a.clock()
+	a.mu.RLock()
+	policy, ok := a.agentPolicies[agentName]
+	a.mu.RUnlock()
+	if !ok || !policyActiveAt(policy, now) {
+		return ActionResult{OK: false, Code: "not_found", Message: fmt.Sprintf("%s には有効な承認省略がありません", agentName)}
+	}
+	policy.MaxRisk = risk
+	policy.UpdatedAt = now.Format(time.RFC3339)
+	if err := a.saveAgentPolicy(policy); err != nil {
+		return ActionResult{OK: false, Code: "storage", Message: fmt.Sprintf("%s のリスク上限を保存できません: %v", agentName, err)}
+	}
+	if risk == forcedBypassMaxRisk {
+		return ActionResult{OK: true, Message: fmt.Sprintf("%s は High を含むすべてのコマンドを承認なしで実行します（%s まで）", agentName, policy.ExpiresAt)}
+	}
+	return ActionResult{OK: true, Message: fmt.Sprintf("%s のリスク上限を %s にしました", agentName, risk)}
+}
+
+// agentForcedBypass reports whether agentName's grant is a forced one.
+func (a *App) agentForcedBypass(agentName string) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.agentPolicies[agentName].MaxRisk == forcedBypassMaxRisk
 }
 
 // RevokeAgentApprovalBypass turns approval bypass off for an agent.

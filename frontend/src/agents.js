@@ -18,6 +18,7 @@ import {
   RevokeAgentApprovalBypass,
   RevokeAgentToken,
   RevokeAllAgentApprovalBypasses,
+  SetAgentBypassMaxRisk,
 } from '../wailsjs/go/main/App';
 
 export const AGENTS_I18N = {
@@ -67,7 +68,10 @@ export const AGENTS_I18N = {
     'agents.bypass.revokeAll': 'すべて取り消す',
     'agents.risk.Low': 'Low まで',
     'agents.risk.Medium': 'Medium まで',
-    'agents.risk.High': 'High まで',
+    'agents.risk.High': 'High まで（強制）',
+    'agents.confirm.forceHigh.title': 'High も承認なしで実行しますか？',
+    'agents.confirm.forceHigh.body': '「{name}」のコマンドは、削除や再起動を含む High のものまで承認なしで実行されます。sudo・本番・書き込みの承認必須設定も、このエージェントには効かなくなります。期限と対象の接続先はそのままです。',
+    'agents.confirm.forceHigh.ok': 'High まで許可する',
     'agents.config.title': '~/.claude.json の設定例',
     'agents.config.help': 'mcpServers に追加します。トークンは発行直後の表示中だけ、例に入ります。',
     'agents.config.placeholder': '<エージェント用トークン>',
@@ -136,7 +140,10 @@ export const AGENTS_I18N = {
     'agents.bypass.revokeAll': 'Revoke all',
     'agents.risk.Low': 'Up to Low',
     'agents.risk.Medium': 'Up to Medium',
-    'agents.risk.High': 'Up to High',
+    'agents.risk.High': 'Up to High (forced)',
+    'agents.confirm.forceHigh.title': 'Run High commands without approval?',
+    'agents.confirm.forceHigh.body': 'Commands from "{name}" will run without approval, High ones (deletes, reboots, ...) included. The sudo, production and write approval rules no longer apply to this agent. The expiry and connection scope stay as they are.',
+    'agents.confirm.forceHigh.ok': 'Allow up to High',
     'agents.config.title': '~/.claude.json example',
     'agents.config.help': 'Add this under mcpServers. The token is filled in only while it is being shown right after issuing.',
     'agents.config.placeholder': '<agent token>',
@@ -404,7 +411,7 @@ function renderBypasses(ctx, now) {
         return el('tr', { 'data-bypass-row': policy.agentName },
           el('td', { className: 'fw-bold' }, policy.agentName),
           el('td', {}, el('span', { className: `badge ${STATUS_BADGE[status]} agents-bypass-status`, 'data-status': status }, t(`agents.bypass.${status}`))),
-          el('td', {}, KNOWN_RISKS.has(risk) ? t(`agents.risk.${risk}`) : risk),
+          el('td', {}, maxRiskSelect(policy.agentName, risk, t)),
           el('td', {}, el('ul', { className: 'list-unstyled mb-0 agents-scope' },
             scopeLabels(policy.scopeConnIds, connections, t).map((label) => el('li', {}, label)))),
           el('td', { className: 'text-nowrap' }, formatTimestamp(policy.grantedAt)),
@@ -417,6 +424,19 @@ function renderBypasses(ctx, now) {
       })),
     ),
   );
+}
+
+// maxRiskSelect lets the human change the grant's max risk; High is the
+// forced bypass and asks for confirmation (setMaxRisk).
+function maxRiskSelect(agentName, risk, t) {
+  const options = [...KNOWN_RISKS].map((value) => el('option', { value, selected: value === risk }, t(`agents.risk.${value}`)));
+  if (!KNOWN_RISKS.has(risk)) options.push(el('option', { value: risk, selected: true }, risk));
+  return el('select', {
+    className: `form-select form-select-sm agents-max-risk${risk === 'High' ? ' border-danger text-danger' : ''}`,
+    'data-agents-max-risk': agentName,
+    'aria-label': t('agents.bypass.maxRisk'),
+    disabled: Boolean(agents.busy),
+  }, ...options);
 }
 
 function renderConfig(ctx) {
@@ -673,6 +693,23 @@ async function revokeBypass(ctx, agentName) {
   return Boolean(result.ok);
 }
 
+async function setMaxRisk(ctx, agentName, risk) {
+  const { t } = ctx;
+  if (risk === 'High') {
+    const ok = await confirmDialog(ctx, {
+      title: t('agents.confirm.forceHigh.title'),
+      body: t('agents.confirm.forceHigh.body', { name: agentName }),
+      okLabel: t('agents.confirm.forceHigh.ok'),
+    });
+    if (!ok) {
+      rerender(); // put the select back to the stored value
+      return false;
+    }
+  }
+  const result = await runAction(ctx, 'agents-max-risk', () => SetAgentBypassMaxRisk(agentName, risk));
+  return Boolean(result.ok);
+}
+
 async function revokeAllBypasses(ctx) {
   const { t } = ctx;
   const ok = await confirmDialog(ctx, {
@@ -754,6 +791,14 @@ export async function handleAgentsSubmit(event, ctx) {
   const name = form.querySelector('#agents-issue-name')?.value ?? agents.draftName;
   agents.draftName = name;
   await issueToken(ctx, name);
+  return true;
+}
+
+export async function handleAgentsChange(event, ctx) {
+  const select = event?.target?.closest?.('[data-agents-max-risk]');
+  if (!select) return false;
+  if (agents.busy) return true;
+  await setMaxRisk(ctx, select.dataset.agentsMaxRisk, select.value);
   return true;
 }
 

@@ -104,6 +104,7 @@ var webCallable = map[string]callSpec{
 	"IssueAgentTokenWithBypass":      {Audit: true, Target: webArgStr(0), Detail: webArgBoolDetail(1, "bypass")},
 	"RevokeAgentToken":               {Audit: true, Target: webArgStr(0)},
 	"RevokeAgentApprovalBypass":      {Audit: true, Target: webArgStr(0)},
+	"SetAgentBypassMaxRisk":          {Audit: true, Target: webArgStr(0), Detail: webArgStrDetail(1, "maxRisk")},
 	"RevokeAllAgentApprovalBypasses": {Audit: true},
 	"DeletePlaintextBackups":         {Audit: true, Detail: webArgCount(0, "paths")},
 

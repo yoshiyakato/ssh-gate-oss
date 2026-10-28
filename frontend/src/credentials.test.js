@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+vi.mock('./dialog.js', () => ({ askConfirm: vi.fn() }));
+import { askConfirm } from './dialog.js';
+beforeEach(() => vi.mocked(askConfirm).mockReset());
 
 const calls = vi.hoisted(() => ({ save: [], session: [], deleted: [], saveResult: null, backups: [] }));
 
@@ -189,7 +192,7 @@ describe('keychain notices on the settings page', () => {
     expect(root.textContent).toContain('パスワード 3 件');
     expect(root.textContent).toContain('中身を確認できません');
 
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const confirm = vi.mocked(askConfirm).mockResolvedValue(true);
     calls.backups = [];
     const handled = await handleCredentialsClick({ target: root.querySelector('[data-action="cred-delete-backups"]') }, ctx);
     confirm.mockRestore();
@@ -208,7 +211,7 @@ describe('keychain notices on the settings page', () => {
     const root = document.querySelector('#keychain-notices');
     mountKeychainNotices(root, ctx);
     await flush();
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const confirm = vi.mocked(askConfirm).mockResolvedValue(true);
     calls.backups = [];
     await handleCredentialsClick({ target: root.querySelector('[data-action="cred-delete-backups"]') }, ctx);
     confirm.mockRestore();

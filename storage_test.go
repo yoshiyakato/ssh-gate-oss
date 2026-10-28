@@ -203,6 +203,17 @@ func TestOpenStoreRejectsNewerSchema(t *testing.T) {
 	}
 }
 
+// TestForcedMaxRiskRoundTrip: a forced grant (max_risk High) is stored as is.
+func TestForcedMaxRiskRoundTrip(t *testing.T) {
+	store := newTestStore(t)
+	if err := store.saveAgentPolicy(AgentPolicy{AgentName: "forced", ApprovalBypass: true, MaxRisk: "High"}); err != nil {
+		t.Fatal(err)
+	}
+	if g, _, _ := store.loadAgentPolicy("forced"); g.MaxRisk != "High" {
+		t.Fatalf("forced max_risk not kept: %+v", g)
+	}
+}
+
 func TestAgentPolicyLifecycle(t *testing.T) {
 	store := newTestStore(t)
 	now := time.Now().Truncate(time.Second)
@@ -220,17 +231,17 @@ func TestAgentPolicyLifecycle(t *testing.T) {
 		codex.ExpiresAt != now.Add(defaultBypassTTL).Format(time.RFC3339) || codex.ScopeConnIDs == nil {
 		t.Fatalf("defaults not applied: %+v", codex)
 	}
-	// Explicit fields are kept as given (High is clamped to Medium).
+	// Explicit fields are kept as given (an unknown max_risk becomes Medium).
 	scoped := AgentPolicy{AgentName: "scoped", ApprovalBypass: true, MaxRisk: "Low", ScopeConnIDs: []string{"c1"},
 		GrantedAt: now.Format(time.RFC3339), ExpiresAt: now.Add(time.Hour).Format(time.RFC3339)}
 	if err := store.saveAgentPolicy(scoped); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.saveAgentPolicy(AgentPolicy{AgentName: "greedy", ApprovalBypass: true, MaxRisk: "High"}); err != nil {
+	if err := store.saveAgentPolicy(AgentPolicy{AgentName: "greedy", ApprovalBypass: true, MaxRisk: "Critical"}); err != nil {
 		t.Fatal(err)
 	}
 	if g, _, _ := store.loadAgentPolicy("greedy"); g.MaxRisk != "Medium" {
-		t.Fatalf("High max_risk stored: %+v", g)
+		t.Fatalf("unknown max_risk stored: %+v", g)
 	}
 	if got, _, _ := store.loadAgentPolicy("scoped"); got.MaxRisk != "Low" || len(got.ScopeConnIDs) != 1 || got.ScopeConnIDs[0] != "c1" {
 		t.Fatalf("scoped round trip: %+v", got)
@@ -302,7 +313,9 @@ func TestPolicyAllows(t *testing.T) {
 		{"medium allows low", on("Medium"), "Low", "c1", true},
 		{"medium allows medium", on("Medium"), "Medium", "c1", true},
 		{"empty max risk is medium", on(""), "Medium", "c1", true},
-		{"high never", on("High"), "High", "c1", false},
+		{"medium rejects high", on("Medium"), "High", "c1", false},
+		{"forced allows high", on("High"), "High", "c1", true},
+		{"forced keeps scope", on("High", "c1"), "High", "c3", false},
 		{"low cap rejects medium", on("Low"), "Medium", "c1", false},
 		{"unknown risk", on("Medium"), "", "c1", false},
 		{"expired", AgentPolicy{ApprovalBypass: true, ExpiresAt: past}, "Low", "c1", false},

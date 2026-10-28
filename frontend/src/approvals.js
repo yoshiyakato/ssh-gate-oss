@@ -4,7 +4,7 @@
 // approval-bypass confirmation; phase 4 adds the serverFilter view.
 //
 // Contract with main.js (phase2-contract §2.1/§2.2):
-// - Only model.js is imported; everything else comes through ctx.
+// - Only model.js and dialog.js are imported; everything else comes through ctx.
 // - state.selectedRequestId and state.dirty.approval keep their phase 2
 //   meaning. state.approvals (createApprovalsState) is owned by this module.
 // - `view` is deriveServerView(...)'s result (phase4-ui-integration §2.1):
@@ -25,6 +25,7 @@ import {
   RevokeAgentApprovalBypass,
 } from '../wailsjs/go/main/App';
 
+import { askConfirm } from './dialog.js';
 import { requestStateLabelKey } from './model.js';
 
 // Strings already in BASE_I18N (cmd.*, hist.*, common.*) are reused as they
@@ -69,7 +70,7 @@ export const APPROVALS_I18N = {
     'appr.riskCanceled': '承認を取りやめました。修正したコマンドはそのまま残しています',
     'appr.bypassRiskIncreased': '修正でリスクが上がったため、承認省略つきでは承認できません。修正したコマンドは残しています。内容を確認して「承認して実行」を使ってください',
     'appr.bypass.needsAgent': 'エージェント名の無い要求には承認省略を使えません',
-    'appr.bypass.confirm': '{agent} の承認省略を有効にして、このコマンドを承認・実行します。\n\n・有効期間: 8時間（過ぎると自動で無効になります）\n・対象: リスク Medium まで（High は常に承認キューに入ります）\n・{agent} が専用のエージェントトークンで MCP を呼び出したときだけ効きます（名乗りや共有トークンでは効きません）\n・設定の承認必須ルール（sudo・本番・書き込み）に当たるコマンドは、引き続き承認が必要です\n・この画面の「承認省略を取り消す」でいつでも取り消せます',
+    'appr.bypass.confirm': '{agent} の承認省略を有効にして、このコマンドを承認・実行します。\n\n・有効期間: 8時間（過ぎると自動で無効になります）\n・対象: リスク Medium まで（High は承認キューに入ります。設定のエージェント欄でリスク上限を High にした場合を除く）\n・{agent} が専用のエージェントトークンで MCP を呼び出したときだけ効きます（名乗りや共有トークンでは効きません）\n・設定の承認必須ルール（sudo・本番・書き込み）に当たるコマンドは、引き続き承認が必要です\n・この画面の「承認省略を取り消す」でいつでも取り消せます',
     'appr.bypass.noTokenYet': '{agent} 専用のエージェントトークンはまだありません。MCP設定で発行するまで承認省略は効きません',
     'appr.bypass.ask': 'よろしいですか？',
     'appr.bypass.until': '{time} まで',
@@ -122,7 +123,7 @@ export const APPROVALS_I18N = {
     'appr.riskCanceled': 'Approval canceled. Your edited command is kept',
     'appr.bypassRiskIncreased': 'The edit raised the risk, so it cannot be approved with bypass. Your edit is kept; review it and use “Approve & Execute”',
     'appr.bypass.needsAgent': 'Approval bypass needs a request with an agent name',
-    'appr.bypass.confirm': 'Turn on approval bypass for {agent}, and approve and run this command.\n\n- Lasts 8 hours (then turns off by itself)\n- Covers risk up to Medium (High always goes to the approval queue)\n- Works only when {agent} calls MCP with its own agent token (not a declared name or the shared token)\n- Commands matched by the approval rules in settings (sudo, production, write) still need approval\n- You can revoke it any time with “Revoke approval bypass” on this screen',
+    'appr.bypass.confirm': 'Turn on approval bypass for {agent}, and approve and run this command.\n\n- Lasts 8 hours (then turns off by itself)\n- Covers risk up to Medium (High goes to the approval queue unless you raise the max risk to High in the Agents section)\n- Works only when {agent} calls MCP with its own agent token (not a declared name or the shared token)\n- Commands matched by the approval rules in settings (sudo, production, write) still need approval\n- You can revoke it any time with “Revoke approval bypass” on this screen',
     'appr.bypass.noTokenYet': '{agent} has no agent token yet. The bypass does nothing until you issue one in MCP settings',
     'appr.bypass.ask': 'Continue?',
     'appr.bypass.until': 'until {time}',
@@ -355,6 +356,17 @@ export function markedText(value, options) {
   return nodes;
 }
 
+// Lists draw only the head of a command: a table cell holding a 100 KB
+// heredoc makes WebKit's table layout take seconds on every poll redraw.
+// The detail panel still shows the full text.
+export const LIST_COMMAND_MAX = 200;
+
+export function markedPreview(value, max = LIST_COMMAND_MAX) {
+  const chars = Array.from(String(value ?? ''));
+  if (chars.length <= max) return markedText(chars.join(''));
+  return [...markedText(chars.slice(0, max).join('')), document.createTextNode('…')];
+}
+
 // Isolates the text from the surrounding direction so any bidi character
 // that is drawn raw (the editable textarea) cannot reorder its neighbours.
 const LTR_STYLE = 'unicode-bidi: plaintext; direction: ltr';
@@ -478,7 +490,7 @@ export function requestRow(request, selectedId, { unknown = false, t }) {
         unknown ? unknownBadge(t) : null,
         markedText(`${request.host || '-'} / ${request.requestedBy || t('cmd.unknownAgent')} / ${formatTimestamp(request.requestedAt)}`))),
     statusBadge(request.status, t)),
-  el('code', { class: 'd-block mt-2 small text-truncate', dir: 'ltr', style: LTR_STYLE }, markedText(request.command ?? '')));
+  el('code', { class: 'd-block mt-2 small text-truncate', dir: 'ltr', style: LTR_STYLE }, markedPreview(request.command)));
 }
 
 export function historyTable(requests, selectedId, unknownIds, t) {
@@ -501,7 +513,7 @@ export function historyTable(requests, selectedId, unknownIds, t) {
     el('br'),
     el('small', { class: 'text-secondary' }, markedText(request.requestedBy || t('cmd.unknownAgent')))),
   el('td', {}, statusBadge(request.status, t)),
-  el('td', {}, el('code', { dir: 'ltr', style: LTR_STYLE }, markedText(request.executedCommand || request.command || ''))),
+  el('td', {}, el('code', { dir: 'ltr', style: LTR_STYLE }, markedPreview(request.executedCommand || request.command))),
   el('td', {}, markedText(request.reason || '-', { newline: true })),
   el('td', { class: 'text-end' },
     el('button', {
@@ -812,7 +824,7 @@ async function approve(ctx, view, button, { bypass }) {
   const id = selected.id ?? '';
   const command = approvalCommandToSend(selected.command, document.querySelector('#approval-command')?.value);
   if (command !== String(selected.command ?? '') && /\r/.test(String(selected.command ?? ''))
-    && !window.confirm(t('appr.crNormalized'))) {
+    && !(await askConfirm(t('appr.crNormalized'), { lang: ctx.lang?.() }))) {
     return;
   }
   if (button) button.disabled = true;
@@ -842,7 +854,7 @@ async function approve(ctx, view, button, { bypass }) {
       if (button) button.disabled = false;
       return;
     }
-    if (!window.confirm(bypassConfirmText(state, selected, t))) {
+    if (!(await askConfirm(bypassConfirmText(state, selected, t), { title: t('cmd.approveBypass'), okLabel: t('cmd.approveBypass'), lang: ctx.lang?.() }))) {
       if (button) button.disabled = false;
       return;
     }
@@ -858,7 +870,7 @@ async function approve(ctx, view, button, { bypass }) {
       ctx.toast(t('appr.bypassRiskIncreased'));
       return;
     }
-    if (!window.confirm(riskConfirmText(result, t, ctx.lang?.()))) {
+    if (!(await askConfirm(riskConfirmText(result, t, ctx.lang?.()), { lang: ctx.lang?.() }))) {
       keepEdit(ctx, button);
       ctx.toast(t('appr.riskCanceled'));
       return;

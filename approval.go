@@ -632,11 +632,16 @@ func (a *App) DeleteCommandRequest(id string) ActionResult {
 // identity), the grant is unexpired and covers the risk and connection, and
 // never to High risk or to commands covered by the RequireApproval* switches.
 func (a *App) needsHumanApproval(conn Connection, risk string, command string, caller mcpCaller, agentName string, forceQueue bool) bool {
-	if forceQueue || risk == "High" || !caller.mayBypassAs(agentName) {
+	if forceQueue || !caller.mayBypassAs(agentName) {
 		return true
 	}
 	if !a.agentBypassCovers(caller.Agent, caller.TokenHash, conn, risk) {
 		return true
+	}
+	// The human raised this grant to High on purpose: the rules below are
+	// for ordinary grants only.
+	if a.agentForcedBypass(caller.Agent) {
+		return false
 	}
 	settings := a.GetMCPSettings()
 	if settings.RequireApprovalWriteOp && risk != "Low" {

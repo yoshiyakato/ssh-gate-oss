@@ -64,6 +64,7 @@ import {
   forgetIssuedAgentToken,
   mcpConfigJSON,
   mcpEndpoint,
+  handleAgentsChange,
   handleAgentsClick,
   handleAgentsInput,
   handleAgentsSubmit,
@@ -73,6 +74,7 @@ import { ALL_SERVERS, normalizeServerFilter, renderServerTabs, renderShellSubtab
 import { createShortcutHandler, cycleIndex, cycleServer, resolveTabIndex, shortcutPlatformFor } from './shortcuts.js';
 import { deriveServerView, loadServerFilter, saveServerFilter } from './serverview.js';
 import { handleCredentialsClick, mountKeychainNotices, recoverCredential } from './credentials.js';
+import { askConfirm } from './dialog.js';
 import {
   aiSessionsBusy, disposeAISessionViewer, handleAISessionsClick, onAISessionData, onAISessionsChanged,
   renderAILineContext, renderAISessionsPage,
@@ -599,7 +601,7 @@ async function setServerFilter(connId, { source = 'tab', render = true } = {}) {
   }
   if (state.active === 'commands' && state.dirty.approval) {
     // The filter can take the edited request off the screen.
-    if (!window.confirm(t('cmd.discardEditOnFilter'))) {
+    if (!(await askConfirm(t('cmd.discardEditOnFilter'), { lang: state.lang }))) {
       renderServerTabsBar();
       return false;
     }
@@ -1229,7 +1231,7 @@ async function handleCommonClick(event) {
   }
 
   if (action === 'delete-mcp') {
-    if (!window.confirm(t('mcp.deleteConfirm'))) {
+    if (!(await askConfirm(t('mcp.deleteConfirm'), { danger: true, lang: state.lang }))) {
       return;
     }
     ctx.bumpGen();
@@ -1298,6 +1300,7 @@ app.addEventListener('input', (event) => {
 app.addEventListener('change', async (event) => {
   if (state.active === 'connections' && await handleEditorChange(event, ctx)) return;
   if (state.active === 'terminal' && handleTerminalChange(event, ctx)) return;
+  if (state.active === 'settings' && await handleAgentsChange(event, ctx)) return;
   if (event.target.closest('#mcp-form')) state.dirty.settings = true;
 });
 

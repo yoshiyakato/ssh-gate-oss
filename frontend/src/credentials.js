@@ -18,6 +18,7 @@ import {
   SaveConnection,
   UseCredentialForSession,
 } from '../wailsjs/go/main/App';
+import { askConfirm } from './dialog.js';
 
 export const CREDENTIALS_I18N = {
   ja: {
@@ -318,7 +319,7 @@ export async function handleCredentialsClick(event, ctx) {
   if (!button) return false;
   if (backups.busy || !backups.list.length) return true;
   const paths = backups.list.map((b) => b.path);
-  if (!window.confirm(ctx.t('cred.backups.confirm', { n: paths.length, paths: paths.join('\n') }))) return true;
+  if (!(await askConfirm(ctx.t('cred.backups.confirm', { n: paths.length, paths: paths.join('\n') }), { danger: true, lang: ctx.lang?.() }))) return true;
   backups.busy = true;
   if (mounted?.root?.isConnected) drawNotices(mounted.root, ctx);
   let result;

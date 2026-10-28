@@ -1007,7 +1007,7 @@ func mcpTools() []map[string]any {
 		{
 			"name":         "execute_command",
 			"title":        "コマンド実行を要求",
-			"description":  "SSH コマンドの実行を要求します。原則として人間の承認キューに入り state=pending と request_id を返します。結果は get_request_status で待って取得してください。エージェント用トークンで認証し承認省略を許可されたエージェントの Low/Medium リスク コマンドのみ即時実行されます（High は常に承認必須）。即時実行が RequestTimeout を超えると state=running を返し、実行は続きます。同時実行の上限を超えると server_busy と retry_after_ms を返します。",
+			"description":  "SSH コマンドの実行を要求します。原則として人間の承認キューに入り state=pending と request_id を返します。結果は get_request_status で待って取得してください。エージェント用トークンで認証し承認省略を許可されたエージェントのコマンドは、許可されたリスク上限（既定 Medium）まで即時実行されます（High は人が GUI でリスク上限を High にした場合だけ）。即時実行が RequestTimeout を超えると state=running を返し、実行は続きます。同時実行の上限を超えると server_busy と retry_after_ms を返します。",
 			"annotations":  map[string]any{"title": "コマンド実行を要求", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true},
 			"inputSchema":  executeSchema,
 			"outputSchema": object(executeProps),
