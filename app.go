@@ -1105,6 +1105,24 @@ func (a *App) recordConnectionTest(tested Connection, result string, message str
 		}
 	}
 	a.mu.Unlock()
+	// A passing SSH test shows the connection works again, so a terminal
+	// error left from an earlier tab no longer describes it ("接続エラー").
+	// Serial errors stay: they follow the device (serial_mode.go).
+	if result == "ok" && tested.connectionType() != "Serial" && a.clearTerminalError(tested.ID) {
+		a.sessionsChanged()
+	}
+}
+
+// clearTerminalError drops the last terminal error of connID and reports
+// whether there was one.
+func (a *App) clearTerminalError(connID string) bool {
+	a.termMu.Lock()
+	defer a.termMu.Unlock()
+	if _, ok := a.lastErr[connID]; !ok {
+		return false
+	}
+	delete(a.lastErr, connID)
+	return true
 }
 
 // sameEndpoint reports whether x and y reach the same account: transport,
@@ -2090,6 +2108,10 @@ func explainSSHError(conn Connection, err error) string {
 	var missing *passphraseMissingError
 	if errors.As(err, &missing) {
 		return "SSH鍵がパスフレーズで保護されています。パスフレーズを入力するか、ssh-agent に鍵を登録してください。"
+	}
+	var skMissing *securityKeyNotInAgentError
+	if errors.As(err, &skMissing) {
+		return fmt.Sprintf("%s はセキュリティキー（Secure Enclave / FIDO）の鍵で、署名は ssh-agent 経由でしか行えません。ターミナルで ssh-add %s を実行して agent に登録してから、もう一度お試しください（Secure Enclave の鍵は SSH_SK_PROVIDER=/usr/lib/ssh-keychain.dylib を付けて ssh-add します）。", skMissing.keyPath, skMissing.keyPath)
 	}
 	if strings.Contains(lower, "no such file") || strings.Contains(lower, "read ssh key") {
 		return fmt.Sprintf("SSH鍵ファイルを読めません。鍵ファイルパスを確認してください。詳細: %v", err)

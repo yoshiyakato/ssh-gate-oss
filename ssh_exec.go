@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -62,6 +64,18 @@ type passphraseMissingError struct {
 
 func (e *passphraseMissingError) Error() string {
 	return fmt.Sprintf("ssh key %s is passphrase protected", e.keyPath)
+}
+
+// securityKeyNotInAgentError reports a security-key private key (FIDO or
+// the Secure Enclave: sk-ecdsa / sk-ed25519) that the ssh-agent does not
+// hold. Such a key signs on the device, so it can only be used through the
+// agent.
+type securityKeyNotInAgentError struct {
+	keyPath string
+}
+
+func (e *securityKeyNotInAgentError) Error() string {
+	return fmt.Sprintf("ssh key %s is a security key (sk-*) and is not loaded in ssh-agent", e.keyPath)
 }
 
 // testSSHConnection is the GUI "接続テスト": an unknown host key is recorded
@@ -310,6 +324,21 @@ func sshAuthMethods(ctx context.Context, conn Connection, deadline time.Time) ([
 	}
 	var missing *ssh.PassphraseMissingError
 	if !errors.As(err, &missing) {
+		// x/crypto/ssh cannot load security keys; the agent signs with them.
+		if pub := securityKeyPublicKey(key, keyPath); pub != nil {
+			if agentClient != nil {
+				filtered := agentSignersFor(agentClient, pub, &securityKeyNotInAgentError{keyPath: keyPath})
+				if signers, err := filtered(); err == nil && len(signers) > 0 {
+					return []ssh.AuthMethod{ssh.PublicKeysCallback(filtered)}, closeAgent, nil
+				}
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					closeAgent()
+					return nil, noop, ctxErr
+				}
+			}
+			closeAgent()
+			return nil, noop, &securityKeyNotInAgentError{keyPath: keyPath}
+		}
 		closeAgent()
 		return nil, noop, fmt.Errorf("parse ssh key %s: %w", keyPath, err)
 	}
@@ -324,19 +353,7 @@ func sshAuthMethods(ctx context.Context, conn Connection, deadline time.Time) ([
 	// Encrypted key without passphrase: use the agent, offering only the
 	// matching identity so unrelated keys do not exhaust MaxAuthTries.
 	if agentClient != nil && missing.PublicKey != nil {
-		want := missing.PublicKey.Marshal()
-		filtered := func() ([]ssh.Signer, error) {
-			signers, err := agentClient.Signers()
-			if err != nil {
-				return nil, err
-			}
-			for _, s := range signers {
-				if bytes.Equal(s.PublicKey().Marshal(), want) {
-					return []ssh.Signer{s}, nil
-				}
-			}
-			return nil, &passphraseMissingError{keyPath: keyPath}
-		}
+		filtered := agentSignersFor(agentClient, missing.PublicKey, &passphraseMissingError{keyPath: keyPath})
 		signers, err := filtered()
 		if err == nil && len(signers) > 0 {
 			return []ssh.AuthMethod{ssh.PublicKeysCallback(filtered)}, closeAgent, nil
@@ -348,6 +365,83 @@ func sshAuthMethods(ctx context.Context, conn Connection, deadline time.Time) ([
 	}
 	closeAgent()
 	return nil, noop, &passphraseMissingError{keyPath: keyPath}
+}
+
+// agentSignersFor returns a signers callback that offers only the agent
+// identity matching pub, so unrelated keys do not exhaust MaxAuthTries. It
+// returns notFound when the agent does not hold pub.
+func agentSignersFor(agentClient sshagent.ExtendedAgent, pub ssh.PublicKey, notFound error) func() ([]ssh.Signer, error) {
+	want := pub.Marshal()
+	return func() ([]ssh.Signer, error) {
+		signers, err := agentClient.Signers()
+		if err != nil {
+			return nil, err
+		}
+		for _, s := range signers {
+			if bytes.Equal(s.PublicKey().Marshal(), want) {
+				return []ssh.Signer{s}, nil
+			}
+		}
+		return nil, notFound
+	}
+}
+
+// securityKeyPublicKey returns the public key of a security-key private key
+// (sk-ecdsa-sha2-nistp256@openssh.com / sk-ssh-ed25519@openssh.com), or nil
+// for any other key. The public half is stored unencrypted in the
+// openssh-key-v1 envelope; keyPath+".pub" is the fallback.
+func securityKeyPublicKey(pemBytes []byte, keyPath string) ssh.PublicKey {
+	isSK := func(pub ssh.PublicKey) bool {
+		t := pub.Type()
+		return t == ssh.KeyAlgoSKECDSA256 || t == ssh.KeyAlgoSKED25519
+	}
+	if block, _ := pem.Decode(pemBytes); block != nil && block.Type == "OPENSSH PRIVATE KEY" {
+		if pub, err := openSSHEnvelopePublicKey(block.Bytes); err == nil && isSK(pub) {
+			return pub
+		}
+	}
+	if data, err := os.ReadFile(keyPath + ".pub"); err == nil {
+		if pub, _, _, _, err := ssh.ParseAuthorizedKey(data); err == nil && isSK(pub) {
+			return pub
+		}
+	}
+	return nil
+}
+
+// openSSHEnvelopePublicKey reads the first public key of an openssh-key-v1
+// blob: magic, cipher name, KDF name, KDF options, key count, public key.
+func openSSHEnvelopePublicKey(blob []byte) (ssh.PublicKey, error) {
+	const magic = "openssh-key-v1\x00"
+	if !bytes.HasPrefix(blob, []byte(magic)) {
+		return nil, errors.New("not an openssh-key-v1 key")
+	}
+	rest := blob[len(magic):]
+	next := func() ([]byte, bool) {
+		if len(rest) < 4 {
+			return nil, false
+		}
+		n := binary.BigEndian.Uint32(rest)
+		if uint64(len(rest)-4) < uint64(n) {
+			return nil, false
+		}
+		field := rest[4 : 4+n]
+		rest = rest[4+n:]
+		return field, true
+	}
+	for i := 0; i < 3; i++ { // cipher name, KDF name, KDF options
+		if _, ok := next(); !ok {
+			return nil, errors.New("truncated openssh key")
+		}
+	}
+	if len(rest) < 4 || binary.BigEndian.Uint32(rest) < 1 {
+		return nil, errors.New("openssh key holds no keys")
+	}
+	rest = rest[4:]
+	pubBlob, ok := next()
+	if !ok {
+		return nil, errors.New("truncated openssh key")
+	}
+	return ssh.ParsePublicKey(pubBlob)
 }
 
 // agentDialTimeout caps connecting to the ssh-agent socket or pipe; the
