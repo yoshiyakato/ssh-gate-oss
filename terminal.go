@@ -486,7 +486,7 @@ func (a *App) openSSHTerminal(ctx context.Context, ts *terminalSession, conn Con
 		return prefix + err.Error(), err
 	}
 
-	session, err := client.NewSession()
+	session, err := newSessionContext(ctx, client, connectTimeout(conn))
 	if err != nil {
 		return fail("セッションを開けません: ", err)
 	}
