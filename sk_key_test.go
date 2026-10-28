@@ -118,3 +118,32 @@ func TestSecurityKeyWithoutAgent(t *testing.T) {
 		t.Fatalf("message does not explain ssh-add: %s", msg)
 	}
 }
+
+// A passing connection test clears a terminal error left by an earlier tab,
+// so the sidebar stops showing "接続エラー" for a connection that works.
+func TestPassingConnectionTestClearsTerminalError(t *testing.T) {
+	app := newTestApp(t)
+	conn := app.conns[0]
+	app.termMu.Lock()
+	app.ensureMaps()
+	app.lastErr[conn.ID] = "connection lost"
+	app.termMu.Unlock()
+	notified := 0
+	app.onSessionsChanged = func() { notified++ }
+
+	app.recordConnectionTest(conn, "failed", "still down")
+	if app.terminalRuntime()[conn.ID].LastError == "" {
+		t.Fatal("a failed test must keep the terminal error")
+	}
+	app.recordConnectionTest(conn, "ok", "fine")
+	if got := app.terminalRuntime()[conn.ID].LastError; got != "" {
+		t.Fatalf("terminal error not cleared: %q", got)
+	}
+	if notified != 1 {
+		t.Fatalf("sessions:changed sent %d times, want 1", notified)
+	}
+	app.recordConnectionTest(conn, "ok", "fine")
+	if notified != 1 {
+		t.Fatalf("nothing to clear, but sessions:changed sent again (%d)", notified)
+	}
+}

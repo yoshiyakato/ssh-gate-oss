@@ -1105,6 +1105,24 @@ func (a *App) recordConnectionTest(tested Connection, result string, message str
 		}
 	}
 	a.mu.Unlock()
+	// A passing SSH test shows the connection works again, so a terminal
+	// error left from an earlier tab no longer describes it ("接続エラー").
+	// Serial errors stay: they follow the device (serial_mode.go).
+	if result == "ok" && tested.connectionType() != "Serial" && a.clearTerminalError(tested.ID) {
+		a.sessionsChanged()
+	}
+}
+
+// clearTerminalError drops the last terminal error of connID and reports
+// whether there was one.
+func (a *App) clearTerminalError(connID string) bool {
+	a.termMu.Lock()
+	defer a.termMu.Unlock()
+	if _, ok := a.lastErr[connID]; !ok {
+		return false
+	}
+	delete(a.lastErr, connID)
+	return true
 }
 
 // sameEndpoint reports whether x and y reach the same account: transport,
