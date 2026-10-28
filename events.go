@@ -1,7 +1,5 @@
 package main
 
-import wruntime "github.com/wailsapp/wails/v2/pkg/runtime"
-
 const (
 	terminalDataEvent    = "terminal:data"
 	terminalExitEvent    = "terminal:exit"
@@ -21,14 +19,15 @@ type terminalExitPayload struct {
 	Message  string `json:"message"`
 }
 
-// emitEvent sends a Wails event, or hands it to the test hook a.emit.
+// emitEvent hands the event to the test hook a.emit, or to platformEmit
+// (the Web event hub when startup got withWebHub, else the Wails runtime).
 func (a *App) emitEvent(name string, payload any) {
 	if a.emit != nil {
 		a.emit(name, payload)
 		return
 	}
 	if a.ctx != nil {
-		wruntime.EventsEmit(a.ctx, name, payload)
+		platformEmit(a.ctx, name, payload)
 	}
 }
 

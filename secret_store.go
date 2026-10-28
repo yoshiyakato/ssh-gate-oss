@@ -57,9 +57,16 @@ func keyringServiceName() string {
 	return defaultKeyringService
 }
 
+// secretBackendFactory, when set (headless: installSecretBackend before
+// NewApp, phase6-headless §7.1), decides what defaultSecretStore returns.
+var secretBackendFactory func() SecretStore
+
 // defaultSecretStore is what NewApp should install: the OS keychain, or the
 // memory store when SSH_GETE_KEYRING=memory.
 func defaultSecretStore() SecretStore {
+	if f := secretBackendFactory; f != nil {
+		return f()
+	}
 	if strings.EqualFold(strings.TrimSpace(os.Getenv(keyringBackendEnv)), "memory") {
 		return newMemorySecretStore()
 	}

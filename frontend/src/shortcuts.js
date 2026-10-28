@@ -1,6 +1,10 @@
 // Keyboard shortcuts for the terminal screen (design-v1 §6.4, phase 4).
 //
 // macOS: Cmd + key.  Windows/Linux: Ctrl+Shift + key.
+// Headless Web UI in a browser ('browser'): Alt+Shift + key on every OS, because
+// the browser keeps Cmd+T / Cmd+W / Ctrl+Shift+T / Ctrl+Shift+W (and tab
+// switching) for itself: the page never sees them and Cmd+W would close the
+// whole admin tab instead of a terminal tab.
 // The returned handler is meant for xterm's attachCustomKeyEventHandler:
 // it returns false for every key event it claims (keydown, keypress and keyup),
 // so the keystroke never reaches the shell. Unclaimed events return true.
@@ -31,7 +35,7 @@ export const SHORTCUTS_I18N = {
   },
 };
 
-/** @typedef {'mac'|'other'} ShortcutPlatform */
+/** @typedef {'mac'|'other'|'browser'} ShortcutPlatform */
 
 /**
  * @typedef {{type:'newShell'} | {type:'closeTab'} | {type:'nextTab'} | {type:'prevTab'}
@@ -48,6 +52,62 @@ export function detectPlatform(nav = typeof navigator !== 'undefined' ? navigato
   if (!nav) return 'other';
   const p = (nav.userAgentData && nav.userAgentData.platform) || nav.platform || nav.userAgent || '';
   return /mac|iphone|ipad|ipod/i.test(p) ? 'mac' : 'other';
+}
+
+/**
+ * The platform for a window: 'browser' when the headless shim is loaded
+ * (webadmin/headless-shim.js defines window.__sshGeteHeadless), otherwise
+ * detectPlatform(navigator).
+ * @param {any} [win]
+ * @returns {ShortcutPlatform}
+ */
+export function shortcutPlatformFor(win = typeof window !== 'undefined' ? window : undefined) {
+  if (win && win.__sshGeteHeadless) return 'browser';
+  return detectPlatform(win && win.navigator);
+}
+
+// browserKeyId is keyId for Alt+Shift chords. On macOS Option+Shift turns
+// event.key into another character ("T" -> "ˇ", "[" -> "”"), so the key
+// position (event.code) is used, except that a printed "[" / "]" (or "{" / "}")
+// in event.key still wins (JIS layout, see keyId).
+function browserKeyId(ev) {
+  const code = ev.code || '';
+  const key = ev.key || '';
+  if (/^Digit[0-9]$/.test(code)) return code.slice(5);
+  if (/^Numpad[0-9]$/.test(code)) return code.slice(6);
+  if (/^Key[A-Z]$/.test(code)) return code.slice(3).toLowerCase();
+  if (key === '[' || key === '{') return '[';
+  if (key === ']' || key === '}') return ']';
+  switch (code) {
+    case 'BracketLeft': return '[';
+    case 'BracketRight': return ']';
+    case 'ArrowLeft': return 'left';
+    case 'ArrowRight': return 'right';
+    case 'PageUp': return 'pageup';
+    case 'PageDown': return 'pagedown';
+    default: return '';
+  }
+}
+
+// matchBrowserShortcut: Alt+Shift + key, no Ctrl / Cmd (see the table below).
+function matchBrowserShortcut(ev) {
+  if (!ev.altKey || !ev.shiftKey || ev.ctrlKey || ev.metaKey) return null;
+  const k = browserKeyId(ev);
+  switch (k) {
+    case 'right': return { type: 'nextServer' };
+    case 'left': return { type: 'prevServer' };
+    case '0': return { type: 'allServers' };
+    case ']': case 'pagedown': return { type: 'nextTab' };
+    case '[': case 'pageup': return { type: 'prevTab' };
+    case 't': return { type: 'newShell' };
+    case 'w': return { type: 'closeTab' };
+    default: break;
+  }
+  if (/^[1-9]$/.test(k)) {
+    const n = Number(k);
+    return { type: 'selectTab', index: n === 9 ? -1 : n - 1 };
+  }
+  return null;
 }
 
 // Digits, letters, arrows and PageUp/Down come from the physical key (event.code)
@@ -104,6 +164,9 @@ function keyId(ev) {
  *   prevServer    Cmd+Alt+Left        Ctrl+Shift+Alt+Left
  *   allServers    Cmd+Alt+0           Ctrl+Shift+Alt+0
  *
+ *   'browser' (headless Web UI, every OS): Alt+Shift + T / W / ] or PageDown /
+ *   [ or PageUp / 1..9 / Right / Left / 0, for the same actions in the same order.
+ *
  * @param {{key?:string, code?:string, metaKey?:boolean, ctrlKey?:boolean,
  *          shiftKey?:boolean, altKey?:boolean, isComposing?:boolean, keyCode?:number}} ev
  * @param {ShortcutPlatform} platform
@@ -113,6 +176,7 @@ export function matchShortcut(ev, platform) {
   if (!ev) return null;
   // IME composition (Japanese input etc.) is never a shortcut.
   if (ev.isComposing || ev.keyCode === 229) return null;
+  if (platform === 'browser') return matchBrowserShortcut(ev);
   const meta = !!ev.metaKey;
   const ctrl = !!ev.ctrlKey;
   const shift = !!ev.shiftKey;
@@ -209,6 +273,7 @@ export function shortcutLabel(type, platform, n = 1) {
     allServers: '0',
   }[type];
   if (!key) return '';
+  if (platform === 'browser') return 'Alt+Shift+' + key;
   const server = type === 'nextServer' || type === 'prevServer' || type === 'allServers';
   const tabMove = type === 'nextTab' || type === 'prevTab';
   if (mac) return '⌘' + (server ? '⌥' : '') + (tabMove ? '⇧' : '') + key;

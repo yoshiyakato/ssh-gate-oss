@@ -60,9 +60,14 @@ type App struct {
 	mcpToken          string
 	// mcpEnvToken comes from SSH_GETE_TOKEN. It overrides mcpToken at runtime
 	// and is never written to SQLite.
-	mcpEnvToken   string
-	mcpAgents     map[string]time.Time
-	agentPolicies map[string]AgentPolicy
+	mcpEnvToken string
+	// adminCredential reports whether a value is the Web admin token or admin
+	// password (set by headless_wire.go; nil in the GUI). A candidate MCP
+	// Bearer must not be one, or every MCP client could log in as admin.
+	// Called without a.mu held (it may run argon2id).
+	adminCredential func(string) bool
+	mcpAgents       map[string]time.Time
+	agentPolicies   map[string]AgentPolicy
 	// agentTokens maps agent name to its per-agent token (hash only). A
 	// request authenticated with one may use that agent's approval bypass.
 	agentTokens map[string]AgentToken
@@ -608,6 +613,27 @@ func (a *App) drainMCPCommands(grace time.Duration) bool {
 	case <-done:
 	case <-timer.C:
 		log.Printf("shutdown: commands still running %s after cancelling them", grace)
+	}
+	return false
+}
+
+// isMCPSecret reports whether v is the effective MCP Bearer or a live
+// per-agent token. The Web admin refuses such a value as the admin password.
+func (a *App) isMCPSecret(v string) bool {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return false
+	}
+	hash := hashAgentToken(v)
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if bearer := a.effectiveTokenLocked(); bearer != "" && subtle.ConstantTimeCompare([]byte(v), []byte(bearer)) == 1 {
+		return true
+	}
+	for _, token := range a.agentTokens {
+		if subtle.ConstantTimeCompare([]byte(hash), []byte(token.TokenHash)) == 1 {
+			return true
+		}
 	}
 	return false
 }
@@ -1259,6 +1285,12 @@ func (a *App) SaveMCPSettings(settings MCPSettings) ActionResult {
 		return ActionResult{OK: false, Message: errStoreUnavailable.Error()}
 	}
 	settings.ConfigPath = a.dbPath
+	a.mu.RLock()
+	isAdmin := a.adminCredential
+	a.mu.RUnlock()
+	if input := strings.TrimSpace(settings.TokenInput); input != "" && isAdmin != nil && isAdmin(input) {
+		return ActionResult{OK: false, Message: "管理トークンや管理パスワードを MCP の Bearer トークンにしないでください。別の値にしてください"}
+	}
 
 	a.mu.Lock()
 	token := a.mcpToken

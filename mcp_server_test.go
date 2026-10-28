@@ -36,7 +36,10 @@ func isolateEnv(t *testing.T) string {
 	t.Setenv("USERPROFILE", t.TempDir())
 	t.Setenv("SSH_AUTH_SOCK", "")
 	t.Setenv("SSH_GETE_TOKEN", "")
-	t.Setenv("SSH_GETE_MCP_ADDR", "")
+	// Never bind the default MCP port 8787: another ssh-gete (or an older
+	// build) may already own it. Tests that check the env-less defaults
+	// clear this themselves.
+	t.Setenv("SSH_GETE_MCP_ADDR", freeLoopbackAddr(t))
 	t.Setenv("SSH_GETE_STRICT_HOSTKEY", "")
 	t.Setenv("SSH_GETE_NO_SEED", "")
 	// Never touch the real keychain from tests.

@@ -46,6 +46,90 @@ jobs:
           go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
           govulncheck ./...
 
+  # phase6-headless.md §2 / §10: the headless-only build (no Wails, no cgo)
+  # and the Web admin's shim and login page.
+  headless:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '20'
+      - name: Stub frontend dist
+        run: mkdir -p frontend/dist && touch frontend/dist/.keep
+      - name: No Wails in the headless build
+        run: |
+          if go list -deps -tags headless . | grep -q '^github.com/wailsapp/'; then
+            echo "wailsapp is a dependency of the headless build" >&2
+            exit 1
+          fi
+      - name: Vet (no cgo)
+        run: CGO_ENABLED=0 go vet -tags headless ./...
+      # The headless build must work without a C toolchain (REQ-015).
+      - name: Test (no cgo)
+        run: CGO_ENABLED=0 go test -count=1 -tags headless ./...
+      # -race needs cgo, so only this step runs with it.
+      - name: Test (race)
+        run: CGO_ENABLED=1 go test -race -count=1 -tags headless ./...
+      # GOOS=linux CGO_ENABLED=0 must give a static binary that starts on a
+      # machine without GTK / WebKit (the runner has none installed here).
+      - name: Linux static build
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags headless -trimpath -o ssh-gete-headless .
+          ldd ssh-gete-headless 2>&1 | grep -q 'not a dynamic executable' || { echo "::error::not statically linked"; ldd ssh-gete-headless; exit 1; }
+          ./ssh-gete-headless --version
+          rm -f ssh-gete-headless
+      - name: Cross-build headless
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            echo "== ${target}"
+            GOOS="${target%/*}" GOARCH="${target#*/}" CGO_ENABLED=0 go build -tags headless -trimpath -o /dev/null .
+            GOOS="${target%/*}" GOARCH="${target#*/}" CGO_ENABLED=0 go vet -tags headless .
+          done
+      - run: node --test webadmin/headless-shim.test.mjs webadmin/login.test.mjs
+
+  # deploy/docker/Dockerfile and docs/headless.md §8: build the image from a
+  # linux/amd64 headless binary and start it on a fresh named volume, so a
+  # data dir the nonroot user cannot write is caught here (review of REQ-015).
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      - name: Build the headless binary
+        run: |
+          mkdir -p frontend/dist && touch frontend/dist/.keep
+          mkdir -p dist/linux-amd64
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags headless -trimpath -o dist/linux-amd64/ssh-gete .
+      - name: Build the image
+        run: DOCKER_BUILDKIT=1 docker build --platform linux/amd64 -f deploy/docker/Dockerfile -t ssh-gete:smoke .
+      - name: Smoke run on a fresh named volume
+        run: |
+          set -eu
+          docker volume create ssh-gete-smoke
+          docker run --rm -v ssh-gete-smoke:/data --entrypoint /usr/local/bin/ssh-gete ssh-gete:smoke --version
+          tok="$(docker run --rm -v ssh-gete-smoke:/data ssh-gete:smoke --print-admin-token)"
+          case "${tok}" in sgadm_*) ;; *) echo "::error::--print-admin-token did not print a token"; exit 1 ;; esac
+          docker run -d --name ssh-gete-smoke -p 127.0.0.1:18788:8788 -v ssh-gete-smoke:/data ssh-gete:smoke
+          ok=""
+          for i in $(seq 1 30); do
+            if curl -fsSk -o /dev/null https://127.0.0.1:18788/login; then ok=1; break; fi
+            sleep 1
+          done
+          docker logs ssh-gete-smoke 2>&1 | grep -v "${tok}" || true
+          [ -n "${ok}" ] || { echo "::error::the container did not serve /login"; exit 1; }
+          [ "$(docker inspect -f '{{.State.Running}}' ssh-gete-smoke)" = true ] || { echo "::error::the container exited"; exit 1; }
+          docker rm -f ssh-gete-smoke
+
   frontend:
     runs-on: ubuntu-latest
     defaults:
@@ -79,6 +163,12 @@ jobs:
       # optional) ships a prebuilt fsevents.node (#44).
       - run: npm ci --ignore-scripts
       - run: npm test
+      # The shim's coverage tests compare window.runtime / window.go.main.App
+      # with the generated frontend/wailsjs; they are skipped where it is absent
+      # (the headless job), so run them here, after `wails generate module`.
+      - name: Web admin shim against the generated bindings
+        working-directory: .
+        run: node --test webadmin/headless-shim.test.mjs webadmin/login.test.mjs
       - run: npm run build
       # npm dependency audit (#54).
       - name: npm audit
