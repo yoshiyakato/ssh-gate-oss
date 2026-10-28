@@ -14,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 // newTestApp isolates the app from the developer's machine: config dir, home
@@ -52,6 +54,52 @@ func addTestConnection(t *testing.T, app *App, conn Connection) Connection {
 		t.Fatalf("saved connection %s not found", result.ID)
 	}
 	return saved
+}
+
+// addTrustedConnection saves conn and runs the GUI connection test once, so
+// TOFU records the host key the way a human first connect would. MCP-origin
+// executions against an unrecorded host fail with hostkey_unknown.
+func addTrustedConnection(t *testing.T, app *App, conn Connection) Connection {
+	t.Helper()
+	saved := addTestConnection(t, app, conn)
+	if result := app.TestConnection(saved.ID); !result.OK {
+		t.Fatalf("trust %s: %s", saved.Name, result.Message)
+	}
+	return saved
+}
+
+// issueAgentToken issues a per-agent token (agent_tokens). It calls the API
+// directly so a signature change fails to compile instead of skipping tests.
+func issueAgentToken(t *testing.T, app *App, agentName string) string {
+	t.Helper()
+	result := app.IssueAgentToken(agentName)
+	if !result.OK || result.Token == "" {
+		t.Fatalf("agent token for %s not issued: %+v", agentName, result)
+	}
+	return result.Token
+}
+
+// callToolAuth is callTool with an Authorization: Bearer header.
+func callToolAuth(t *testing.T, app *App, token string, name string, args string) (map[string]any, bool) {
+	t.Helper()
+	rec := app.serveTest(t, mcpCall{auth: "Bearer " + token, body: toolCall(name, args)})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Result struct {
+			StructuredContent map[string]any `json:"structuredContent"`
+			IsError           bool           `json:"isError"`
+		} `json:"result"`
+		Error *rpcError `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("rpc error: %+v", resp.Error)
+	}
+	return resp.Result.StructuredContent, resp.Result.IsError
 }
 
 type mcpCall struct {
@@ -335,7 +383,7 @@ func queueOn(t *testing.T, app *App, conn Connection, command string, agent stri
 func TestConcurrentApprovalExecutesOnce(t *testing.T) {
 	app := newTestApp(t)
 	srv := newSSHTestServer(t)
-	conn := addTestConnection(t, app, srv.Connection("lab"))
+	conn := addTrustedConnection(t, app, srv.Connection("lab"))
 	req := queueOn(t, app, conn, "echo hello", "agent")
 
 	var wg sync.WaitGroup
@@ -368,7 +416,7 @@ func TestConcurrentApprovalExecutesOnce(t *testing.T) {
 func TestRejectAndApproveAreExclusive(t *testing.T) {
 	app := newTestApp(t)
 	srv := newSSHTestServer(t)
-	conn := addTestConnection(t, app, srv.Connection("lab"))
+	conn := addTrustedConnection(t, app, srv.Connection("lab"))
 
 	rejected := queueOn(t, app, conn, "echo a", "agent")
 	if !app.RejectCommand(rejected.ID).OK {
@@ -430,24 +478,19 @@ func TestBypassRequiresBearer(t *testing.T) {
 
 func TestBypassPolicyLimits(t *testing.T) {
 	app := newTestApp(t)
-	token := enableBearer(t, app)
+	enableBearer(t, app)
 	srv := newSSHTestServer(t)
-	addTestConnection(t, app, srv.Connection("lab"))
+	addTrustedConnection(t, app, srv.Connection("lab"))
 	prod := srv.Connection("prod-db")
 	prod.Tags = []string{"prod"}
-	addTestConnection(t, app, prod)
+	addTrustedConnection(t, app, prod)
 	app.setAgentApprovalBypass("trusted", true)
+	token := issueAgentToken(t, app, "trusted")
 
 	call := func(host string, command string) map[string]any {
-		rec := app.serveTest(t, mcpCall{auth: "Bearer " + token, body: toolCall("execute_command",
-			`{"host":"`+host+`","command":"`+command+`","agent_name":"trusted"}`)})
-		var resp struct {
-			Result struct {
-				StructuredContent map[string]any `json:"structuredContent"`
-			} `json:"result"`
-		}
-		_ = json.Unmarshal(rec.Body.Bytes(), &resp)
-		return resp.Result.StructuredContent
+		out, _ := callToolAuth(t, app, token, "execute_command",
+			`{"host":"`+host+`","command":"`+command+`","agent_name":"trusted"}`)
+		return out
 	}
 	if out := call("lab", "echo ok"); out["state"] != stateAutoSucceeded || out["exit_code"] != float64(0) {
 		t.Fatalf("low risk should auto-run: %v", out)
@@ -466,38 +509,314 @@ func TestBypassPolicyLimits(t *testing.T) {
 	}
 }
 
+// statusOf runs get_request_status for one id and returns its entry.
+func statusOf(t *testing.T, app *App, id string, waitSeconds int) map[string]any {
+	t.Helper()
+	out, isErr := callTool(t, app, "get_request_status",
+		`{"request_ids":["`+id+`"],"wait_seconds":`+strconv.Itoa(waitSeconds)+`}`)
+	if isErr {
+		t.Fatalf("get_request_status error: %v", out)
+	}
+	items, _ := out["requests"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("get_request_status returned %d entries: %v", len(items), out)
+	}
+	return items[0].(map[string]any)
+}
+
+// TestRequestStatusLongPoll: a request queued through MCP is returned by
+// get_request_status within wait_seconds once a human approves it.
 func TestRequestStatusLongPoll(t *testing.T) {
 	app := newTestApp(t)
 	srv := newSSHTestServer(t)
-	conn := addTestConnection(t, app, srv.Connection("lab"))
-	req := queueOn(t, app, conn, "echo polled", "agent")
+	addTrustedConnection(t, app, srv.Connection("lab"))
+	queued, isErr := callTool(t, app, "execute_command", `{"host":"lab","command":"echo polled","agent_name":"agent"}`)
+	if isErr || queued["state"] != statePending || queued["requires_approval"] != true {
+		t.Fatalf("expected a queued request: %v", queued)
+	}
+	id := queued["request_id"].(string)
 
 	go func() {
 		time.Sleep(200 * time.Millisecond)
-		app.ApproveCommand(req.ID, "")
+		app.ApproveCommand(id, "")
 	}()
+	const wait = 10
 	start := time.Now()
-	out, _ := callTool(t, app, "get_request_status", `{"request_ids":["`+req.ID+`"],"wait_seconds":10}`)
-	items := out["requests"].([]any)
-	got := items[0].(map[string]any)
+	got := statusOf(t, app, id, wait)
 	if got["state"] != stateSucceeded || !strings.Contains(got["stdout"].(string), "polled") {
 		t.Fatalf("unexpected status: %v", got)
 	}
-	if time.Since(start) > 8*time.Second {
-		t.Fatalf("long-poll did not wake on change")
+	if elapsed := time.Since(start); elapsed >= wait*time.Second {
+		t.Fatalf("long-poll did not wake on change (took %s)", elapsed)
 	}
 }
 
+// TestRequestStatusLongPollTimeout: with nothing changing, the long-poll
+// returns the still-pending state once wait_seconds elapses.
+func TestRequestStatusLongPollTimeout(t *testing.T) {
+	app := newTestApp(t)
+	srv := newSSHTestServer(t)
+	conn := addTrustedConnection(t, app, srv.Connection("lab"))
+	req := queueOn(t, app, conn, "echo never", "agent")
+
+	start := time.Now()
+	got := statusOf(t, app, req.ID, 1)
+	elapsed := time.Since(start)
+	if got["state"] != statePending {
+		t.Fatalf("unexpected status: %v", got)
+	}
+	if elapsed < 900*time.Millisecond {
+		t.Fatalf("long-poll returned before wait_seconds (%s)", elapsed)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("long-poll overran wait_seconds (%s)", elapsed)
+	}
+	if n := len(srv.Execs()); n != 0 {
+		t.Fatalf("pending request executed: %d", n)
+	}
+}
+
+// TestClientRequestIDIsIdempotent: resending the same client_request_id,
+// before and after approval, never creates or runs a second request.
 func TestClientRequestIDIsIdempotent(t *testing.T) {
 	app := newTestApp(t)
-	args := `{"host":"ローカル確認用","command":"whoami","agent_name":"a","client_request_id":"k1"}`
+	srv := newSSHTestServer(t)
+	addTrustedConnection(t, app, srv.Connection("lab"))
+	args := `{"host":"lab","command":"echo once","agent_name":"a","client_request_id":"k1"}`
 	first, _ := callTool(t, app, "execute_command", args)
 	second, _ := callTool(t, app, "execute_command", args)
-	if first["request_id"] != second["request_id"] || second["deduplicated"] != true {
+	if first["request_id"] == nil || first["request_id"] != second["request_id"] || second["deduplicated"] != true {
 		t.Fatalf("retry created a new request: %v / %v", first, second)
+	}
+	id := first["request_id"].(string)
+	if r := app.ApproveCommand(id, ""); !r.OK {
+		t.Fatalf("approve: %+v", r)
+	}
+	third, _ := callTool(t, app, "execute_command", args)
+	if third["request_id"] != id || third["state"] != stateSucceeded {
+		t.Fatalf("retry after execution: %v", third)
 	}
 	if n := len(app.GetInitialData().Requests); n != 1 {
 		t.Fatalf("requests=%d", n)
+	}
+	if execs := srv.Execs(); len(execs) != 1 {
+		t.Fatalf("execLog=%v, want exactly one exec", execs)
+	}
+	// Another agent may reuse the same key independently.
+	other, _ := callTool(t, app, "execute_command", `{"host":"lab","command":"echo once","agent_name":"b","client_request_id":"k1"}`)
+	if other["request_id"] == id {
+		t.Fatalf("client_request_id must be scoped to agent_name")
+	}
+}
+
+// TestMCPUnknownHostKeyFails: TOFU never trusts a key on an MCP-origin run.
+// A host the GUI has not connected to yet fails with hostkey_unknown, and
+// nothing is recorded, so a retry fails the same way.
+func TestMCPUnknownHostKeyFails(t *testing.T) {
+	app := newTestApp(t)
+	srv := newSSHTestServer(t)
+	addTestConnection(t, app, srv.Connection("lab"))
+
+	for attempt := 0; attempt < 2; attempt++ {
+		queued, _ := callTool(t, app, "execute_command", `{"host":"lab","command":"echo x","agent_name":"agent"}`)
+		id, _ := queued["request_id"].(string)
+		if id == "" {
+			t.Fatalf("expected a queued request: %v", queued)
+		}
+		app.ApproveCommand(id, "")
+		got := statusOf(t, app, id, 5)
+		if got["state"] != stateFailed || got["error_kind"] != "hostkey_unknown" {
+			t.Fatalf("attempt %d: want failed/hostkey_unknown, got %v", attempt, got)
+		}
+	}
+	if execs := srv.Execs(); len(execs) != 0 {
+		t.Fatalf("command reached an unverified host: %v", execs)
+	}
+}
+
+// TestHostKeyMismatchAlwaysRejected: once a key is trusted, a changed key is
+// refused for MCP runs and GUI tests alike, with or without StrictHostKey,
+// and the stored key is not silently replaced.
+func TestHostKeyMismatchAlwaysRejected(t *testing.T) {
+	for _, strict := range []bool{false, true} {
+		t.Run("strict="+strconv.FormatBool(strict), func(t *testing.T) {
+			configDir := isolateEnv(t)
+			app := NewApp()
+			t.Cleanup(func() { app.shutdown(context.Background()) })
+			app.mu.Lock()
+			app.mcp.StrictHostKey = strict
+			app.mu.Unlock()
+			srv := newSSHTestServer(t)
+			var conn Connection
+			if strict {
+				// Strict mode never records; trust comes from ~/.ssh/known_hosts.
+				conn = addTestConnection(t, app, srv.Connection("lab"))
+				home, _ := os.UserHomeDir()
+				if err := os.MkdirAll(filepath.Join(home, ".ssh"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				line := knownhosts.Line([]string{knownhosts.Normalize(hostKeyAddress(conn))}, srv.HostKey()) + "\n"
+				if err := os.WriteFile(filepath.Join(home, ".ssh", "known_hosts"), []byte(line), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				conn = addTrustedConnection(t, app, srv.Connection("lab"))
+				// The trusted key lives in ssh-gete's own known_hosts (0600),
+				// not in the user's ~/.ssh/known_hosts.
+				path := filepath.Join(configDir, "known_hosts")
+				info, err := os.Stat(path)
+				if err != nil {
+					t.Fatalf("no dedicated known_hosts: %v", err)
+				}
+				if os.PathSeparator == '/' && info.Mode().Perm() != 0o600 {
+					t.Fatalf("known_hosts mode %v, want 0600", info.Mode().Perm())
+				}
+				if home, err := os.UserHomeDir(); err == nil && fileExists(filepath.Join(home, ".ssh", "known_hosts")) {
+					t.Fatalf("TOFU wrote to the user's ~/.ssh/known_hosts")
+				}
+			}
+
+			before := queueOn(t, app, conn, "echo trusted", "agent")
+			if r := app.ApproveCommand(before.ID, ""); !r.OK {
+				t.Fatalf("approve on trusted key: %+v", r)
+			}
+			if got, _ := app.findRequest(before.ID); got.Status != stateSucceeded {
+				t.Fatalf("trusted key run: %+v", got)
+			}
+
+			srv.RotateHostKey(t)
+			after := queueOn(t, app, conn, "echo spoofed", "agent")
+			app.ApproveCommand(after.ID, "")
+			got, _ := app.findRequest(after.ID)
+			if got.Status != stateFailed || got.ErrorKind != "hostkey" {
+				t.Fatalf("mismatched key must fail with hostkey: %+v", got)
+			}
+			if r := app.TestConnection(conn.ID); r.OK {
+				t.Fatalf("GUI test accepted a changed host key")
+			}
+			// The GUI test above must not have re-recorded the new key.
+			again := queueOn(t, app, conn, "echo spoofed2", "agent")
+			app.ApproveCommand(again.ID, "")
+			if got, _ := app.findRequest(again.ID); got.Status != stateFailed || got.ErrorKind != "hostkey" {
+				t.Fatalf("mismatch accepted after GUI retry: %+v", got)
+			}
+			if execs := srv.Execs(); len(execs) != 1 || execs[0] != "echo trusted" {
+				t.Fatalf("command reached a host with a changed key: %v", execs)
+			}
+		})
+	}
+}
+
+// TestHostKeyResetRetrusts: after the human resets the fingerprint, the next
+// GUI connection records the new key and MCP runs work again.
+func TestHostKeyResetRetrusts(t *testing.T) {
+	app := newTestApp(t)
+	srv := newSSHTestServer(t)
+	conn := addTrustedConnection(t, app, srv.Connection("lab"))
+	srv.RotateHostKey(t)
+	if r := app.TestConnection(conn.ID); r.OK {
+		t.Fatalf("changed key accepted before reset")
+	}
+	if n, err := app.resetHostKey(conn.ID); err != nil || n == 0 {
+		t.Fatalf("reset: removed=%d err=%v", n, err)
+	}
+	if r := app.TestConnection(conn.ID); !r.OK {
+		t.Fatalf("GUI test after reset: %s", r.Message)
+	}
+	req := queueOn(t, app, conn, "echo again", "agent")
+	app.ApproveCommand(req.ID, "")
+	if got, _ := app.findRequest(req.ID); got.Status != stateSucceeded {
+		t.Fatalf("run after re-trust: %+v", got)
+	}
+}
+
+// TestSharedTokenCannotClaimBypass: the shared Bearer token proves only
+// "some client of this gateway", so an agent_name with a bypass policy is
+// still queued. Only that agent's own token unlocks bypass, and it does not
+// work under another agent_name.
+func TestSharedTokenCannotClaimBypass(t *testing.T) {
+	app := newTestApp(t)
+	shared := enableBearer(t, app)
+	srv := newSSHTestServer(t)
+	addTrustedConnection(t, app, srv.Connection("lab"))
+	app.setAgentApprovalBypass("trusted", true)
+	app.setAgentApprovalBypass("other", true)
+
+	out, _ := callToolAuth(t, app, shared, "execute_command", `{"host":"lab","command":"echo shared","agent_name":"trusted"}`)
+	if out["state"] != statePending && out["error_kind"] != "unauthorized_bypass" {
+		t.Fatalf("shared token claimed bypass: %v", out)
+	}
+	if out["auto_executed"] == true {
+		t.Fatalf("shared token auto-executed: %v", out)
+	}
+	if execs := srv.Execs(); len(execs) != 0 {
+		t.Fatalf("command ran on the shared token: %v", execs)
+	}
+
+	token := issueAgentToken(t, app, "trusted")
+	// Now "trusted" holds a token with bypass on and an active grant: the
+	// shared token naming it must still be queued.
+	out, _ = callToolAuth(t, app, shared, "execute_command", `{"host":"lab","command":"echo shared","agent_name":"trusted"}`)
+	if out["state"] != statePending || out["auto_executed"] == true {
+		t.Fatalf("shared token claimed bypass of an agent that has a token: %v", out)
+	}
+	if execs := srv.Execs(); len(execs) != 0 {
+		t.Fatalf("command ran on the shared token after the agent token was issued: %v", execs)
+	}
+	out, _ = callToolAuth(t, app, token, "execute_command", `{"host":"lab","command":"echo own","agent_name":"other"}`)
+	if out["auto_executed"] == true || (out["state"] != statePending && out["error_kind"] != "unauthorized_bypass") {
+		t.Fatalf("agent token was accepted for a different agent_name: %v", out)
+	}
+	out, _ = callToolAuth(t, app, token, "execute_command", `{"host":"lab","command":"echo own","agent_name":"trusted"}`)
+	if out["state"] != stateAutoSucceeded || out["auto_executed"] != true {
+		t.Fatalf("agent token with bypass policy should auto-run: %v", out)
+	}
+	if execs := srv.Execs(); len(execs) != 1 || execs[0] != "echo own" {
+		t.Fatalf("execLog=%v", execs)
+	}
+}
+
+// TestListHostsSerialRowsHideSecrets: serial rows carry only name, type,
+// executable=false and in_use; SSH details never leak through them.
+func TestListHostsSerialRowsHideSecrets(t *testing.T) {
+	app := newTestApp(t)
+	addTestConnection(t, app, Connection{
+		Name: "uart", Type: "Serial", SerialPort: "/dev/cu.usbserial-SECRET", BaudRate: 115200,
+		Host: "10.9.9.9", User: "leak-user", AuthMethod: "パスワード保管", Credential: "leak-password",
+		Description: "leak-description", Tags: []string{"bench"},
+	})
+	rec := app.serveTest(t, mcpCall{body: toolCall("list_hosts", `{}`)})
+	raw := rec.Body.String()
+	for _, secret := range []string{"/dev/cu.usbserial-SECRET", "10.9.9.9", "leak-user", "leak-password", "leak-description"} {
+		if strings.Contains(raw, secret) {
+			t.Fatalf("list_hosts leaked %q: %s", secret, raw)
+		}
+	}
+	out, isErr := callTool(t, app, "list_hosts", `{}`)
+	if isErr {
+		t.Fatalf("list_hosts error: %v", out)
+	}
+	hosts, _ := out["hosts"].([]any)
+	var serial map[string]any
+	for _, h := range hosts {
+		if row := h.(map[string]any); row["name"] == "uart" {
+			serial = row
+		}
+	}
+	if serial == nil {
+		t.Fatalf("serial row missing: %v", out)
+	}
+	allowed := map[string]bool{"name": true, "type": true, "executable": true, "in_use": true}
+	for key := range serial {
+		if !allowed[key] {
+			t.Fatalf("serial row carries %q: %v", key, serial)
+		}
+	}
+	if serial["type"] != "serial" || serial["executable"] != false {
+		t.Fatalf("serial row: %v", serial)
+	}
+	if _, ok := serial["in_use"].(bool); !ok {
+		t.Fatalf("serial row needs in_use bool: %v", serial)
 	}
 }
 
@@ -520,7 +839,7 @@ func TestCommandTimeoutWithStreamingOutput(t *testing.T) {
 	srv := newSSHTestServer(t)
 	conn := srv.Connection("lab")
 	conn.CommandTimeout = 1
-	conn = addTestConnection(t, app, conn)
+	conn = addTrustedConnection(t, app, conn)
 	result, err := app.executeSSH(context.Background(), conn, "yes", 0)
 	if err == nil || classifyExecError(err) != "timeout" {
 		t.Fatalf("expected timeout, got %v", err)
@@ -777,17 +1096,24 @@ func TestNonLoopbackListenRequiresBearer(t *testing.T) {
 	}
 }
 
-func TestEnvTokenIsNotPersisted(t *testing.T) {
-	isolateEnv(t)
-	t.Setenv("SSH_GETE_TOKEN", "from-env-token")
-	// A free port, so the test does not depend on 8787 being unused (an
-	// installed ssh-gete may be listening there).
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+// freeLoopbackAddr returns a 127.0.0.1 address with a port free right now.
+func freeLoopbackAddr(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("SSH_GETE_MCP_ADDR", listener.Addr().String())
-	_ = listener.Close()
+	addr := l.Addr().String()
+	_ = l.Close()
+	return addr
+}
+
+func TestEnvTokenIsNotPersisted(t *testing.T) {
+	isolateEnv(t)
+	t.Setenv("SSH_GETE_TOKEN", "from-env-token")
+	// SaveMCPSettings starts the listener; keep it off the default port,
+	// which a running ssh-gete (or another test binary) may hold.
+	t.Setenv("SSH_GETE_MCP_ADDR", freeLoopbackAddr(t))
 	app := NewApp()
 	if r := app.SaveMCPSettings(app.GetMCPSettings()); !r.OK {
 		t.Fatal(r.Message)
@@ -835,5 +1161,491 @@ func TestAgentApprovalBypassPersists(t *testing.T) {
 	}
 	if r := reloaded.RevokeAgentApprovalBypass("codex-local"); !r.OK || reloaded.agentApprovalBypassEnabled("codex-local") {
 		t.Fatalf("revoke failed")
+	}
+}
+
+func TestApprovalTargetShowsResolvedConnectionAndFPChange(t *testing.T) {
+	isolateEnv(t)
+	app := NewApp()
+	srv := newSSHTestServer(t)
+	conn := addTrustedConnection(t, app, srv.Connection("lab"))
+	req := queueOn(t, app, conn, "echo a", "agent")
+	wantFP := conn.User + "@" + hostKeyAddress(conn)
+	if req.TargetFP != wantFP {
+		t.Fatalf("target fp=%q want %q", req.TargetFP, wantFP)
+	}
+	target := app.GetApprovalTarget(req.ID)
+	if !target.Found || target.ResolvedBy != "id" || target.ConnID != conn.ID || target.FPChanged || !target.Executable {
+		t.Fatalf("unexpected target: %+v", target)
+	}
+	if !target.HostKey.Known || len(target.HostKey.Keys) == 0 {
+		t.Fatalf("recorded host key not shown: %+v", target.HostKey)
+	}
+
+	// target_fp survives a restart.
+	app.shutdown(context.Background())
+	app = NewApp()
+	t.Cleanup(func() { app.shutdown(context.Background()) })
+	reloaded, ok := app.findRequest(req.ID)
+	if !ok || reloaded.TargetFP != wantFP {
+		t.Fatalf("target fp not persisted: %+v", reloaded)
+	}
+
+	// Re-pointing the connection after the request shows as a change.
+	moved, _ := app.connectionByID(conn.ID)
+	moved.User = "someone-else"
+	if r := app.SaveConnection(moved); !r.OK {
+		t.Fatalf("save: %s", r.Message)
+	}
+	target = app.GetApprovalTarget(req.ID)
+	if !target.FPChanged || target.RequestedFP != wantFP || !strings.HasPrefix(target.CurrentFP, "someone-else@") {
+		t.Fatalf("fp change not reported: %+v", target)
+	}
+	// ...and approval is refused, for every approve path.
+	execsBefore := len(srv.Execs())
+	for name, approve := range map[string]func(string, string) ActionResult{
+		"plain": app.ApproveCommand, "confirmed": app.ApproveCommandConfirmed, "bypass": app.ApproveCommandAndBypassAgent,
+	} {
+		if r := approve(req.ID, ""); r.OK || r.Code != "target_changed" {
+			t.Fatalf("%s approve after target change: %+v", name, r)
+		}
+	}
+	if n := len(srv.Execs()); n != execsBefore {
+		t.Fatalf("execs=%d after refused approve, want %d", n, execsBefore)
+	}
+	if got, _ := app.findRequest(req.ID); got.Status != statePending {
+		t.Fatalf("refused approve changed state to %s", got.Status)
+	}
+
+	// A deleted connection is not replaced by a new one with the same name.
+	if r := app.DeleteConnection(conn.ID); !r.OK {
+		t.Fatalf("delete: %s", r.Message)
+	}
+	addTestConnection(t, app, srv.Connection("lab"))
+	if target := app.GetApprovalTarget(req.ID); target.Found {
+		t.Fatalf("deleted connection resolved by name: %+v", target)
+	}
+	before := len(srv.Execs())
+	if r := app.ApproveCommand(req.ID, ""); r.OK {
+		t.Fatalf("approve ran on a replacement connection: %+v", r)
+	}
+	if n := len(srv.Execs()); n != before {
+		t.Fatalf("execs=%d, want %d", n, before)
+	}
+}
+
+// TestSwitchToSerialDropsSSHAndBlocksMCP: phase 4. Turning an SSH connection
+// into a serial one clears host/user/password (in memory and in SQLite),
+// removes it from Host matching, and stops MCP execution and approval.
+func TestSwitchToSerialDropsSSHAndBlocksMCP(t *testing.T) {
+	isolateEnv(t)
+	t.Setenv("SSH_GETE_NO_SEED", "1") // the seeded connection is also 127.0.0.1
+	app := NewApp()
+	srv := newSSHTestServer(t)
+	conn := addTrustedConnection(t, app, srv.Connection("lab"))
+	pending := queueOn(t, app, conn, "echo a", "agent")
+
+	serial := conn
+	serial.Type = "Serial"
+	serial.SerialPort = "/dev/cu.usbserial-1"
+	if r := app.SaveConnection(serial); !r.OK {
+		t.Fatalf("switch to serial: %s", r.Message)
+	}
+	check := func(c Connection) {
+		t.Helper()
+		if c.Host != "" || c.User != "" || c.Credential != "" || c.MCPFirstTrust {
+			t.Fatalf("SSH leftovers on serial connection: %+v", c)
+		}
+		if c.DataBits != 8 || c.Parity != "none" || c.StopBits != "1" || c.BaudRate != 115200 {
+			t.Fatalf("serial defaults not applied: %+v", c)
+		}
+	}
+	saved, _ := app.connectionByID(conn.ID)
+	check(saved)
+
+	out, isErr := callTool(t, app, "execute_command", `{"host":"127.0.0.1","command":"whoami","agent_name":"x"}`)
+	if !isErr || out["error_kind"] != "host_not_found" {
+		t.Fatalf("serial connection matched by host: %v", out)
+	}
+	out, isErr = callTool(t, app, "execute_command", `{"host":"lab","command":"whoami","agent_name":"x"}`)
+	if !isErr || out["error_kind"] != "serial_not_supported" {
+		t.Fatalf("serial executable via MCP: %v", out)
+	}
+	if target := app.GetApprovalTarget(pending.ID); target.Executable || !target.FPChanged {
+		t.Fatalf("approval target for serial: %+v", target)
+	}
+	if r := app.ApproveCommand(pending.ID, ""); r.OK {
+		t.Fatalf("approval ran on a serial connection: %+v", r)
+	}
+	if n := len(srv.Execs()); n != 0 {
+		t.Fatalf("execs=%d", n)
+	}
+
+	app.shutdown(context.Background())
+	app = NewApp()
+	t.Cleanup(func() { app.shutdown(context.Background()) })
+	reloaded, _ := app.connectionByID(conn.ID)
+	check(reloaded)
+}
+
+// TestClassifyRiskSeesChainedAndPathCommands: shell separators, full paths
+// and wrappers must not hide a High command from the classifier, since
+// approval bypass relies on High always being queued.
+func TestClassifyRiskSeesChainedAndPathCommands(t *testing.T) {
+	cases := []struct {
+		command string
+		want    string
+	}{
+		{"true;rm x", "High"},
+		{"a&&rm x", "High"},
+		{"/bin/rm x", "High"},
+		{"true;rm /etc/passwd", "High"},
+		{"true&&rm -f /var/lib/x", "High"},
+		{"echo ok|xargs rm", "High"},
+		{"sh -c 'rm x'", "High"},
+		{"$(rm x)", "High"},
+		{"`rm x`", "High"},
+		{"sudo -u root /usr/bin/rm x", "High"},
+		{"x;passwd root", "High"},
+		{"find / -delete", "High"},
+		{"find . -name '*.log' -exec rm {} ;", "High"},
+		{"FOO=1 /sbin/reboot", "High"},
+		{"mkfs.ext4 /dev/sdb1", "High"},
+		{"true;systemctl restart nginx", "High"},
+		{"chown -R root /", "High"},
+		{"rm -rf /tmp/x", "High"},
+		{"true;sudo ls", "Medium"},
+		{"true&&mv a b", "Medium"},
+		{"docker stop x", "Medium"},
+		{"echo ok", "Low"},
+		{"cat /etc/passwd", "Low"},
+		{"ls /usr/bin/", "Low"},
+		{"uptime; df -h", "Low"},
+		{"grep -r form .", "Low"},
+	}
+	for _, c := range cases {
+		if got := classifyRisk(c.command); got != c.want {
+			t.Errorf("classifyRisk(%q) = %s, want %s", c.command, got, c.want)
+		}
+	}
+}
+
+// bypassAgent sets up a connection "lab" and agent "trusted" with its own
+// token and an active bypass grant (default max_risk Medium).
+func bypassAgent(t *testing.T, app *App) (*sshTestServer, string) {
+	t.Helper()
+	enableBearer(t, app)
+	srv := newSSHTestServer(t)
+	addTrustedConnection(t, app, srv.Connection("lab"))
+	app.setAgentApprovalBypass("trusted", true)
+	return srv, issueAgentToken(t, app, "trusted")
+}
+
+// TestBypassQueuesChainedHighRisk: a High command hidden behind ; && or a
+// full path is queued even for an agent with a bypass grant.
+func TestBypassQueuesChainedHighRisk(t *testing.T) {
+	app := newTestApp(t)
+	srv, token := bypassAgent(t, app)
+	for _, command := range []string{"true;rm x", "a&&rm x", "/bin/rm x"} {
+		args, _ := json.Marshal(map[string]any{"host": "lab", "command": command, "agent_name": "trusted"})
+		out, _ := callToolAuth(t, app, token, "execute_command", string(args))
+		if out["state"] != statePending || out["risk"] != "High" || out["auto_executed"] == true {
+			t.Fatalf("%q must queue as High: %v", command, out)
+		}
+	}
+	if execs := srv.Execs(); len(execs) != 0 {
+		t.Fatalf("High command ran without approval: %v", execs)
+	}
+}
+
+// TestConcurrentClientRequestIDRunsOnce: concurrent resends of the same
+// client_request_id create one request and run at most once, both when the
+// agent's command auto-runs and when it is queued.
+func TestConcurrentClientRequestIDRunsOnce(t *testing.T) {
+	app := newTestApp(t)
+	srv, token := bypassAgent(t, app)
+	app.setAgentApprovalBypass("queued", true) // no token: always queued
+	shared := app.effectiveTokenLocked()
+
+	for _, c := range []struct{ agent, token string }{{"trusted", token}, {"queued", shared}} {
+		args := `{"host":"lab","command":"echo once","agent_name":"` + c.agent + `","client_request_id":"k-concurrent"}`
+		const n = 8
+		var wg sync.WaitGroup
+		ids := make(chan any, n)
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				out, _ := callToolAuth(t, app, c.token, "execute_command", args)
+				ids <- out["request_id"]
+			}()
+		}
+		wg.Wait()
+		close(ids)
+		var first any
+		for id := range ids {
+			if id == nil || (first != nil && id != first) {
+				t.Fatalf("%s: concurrent resends got different requests: %v vs %v", c.agent, first, id)
+			}
+			first = id
+		}
+		rows := 0
+		for _, req := range app.GetInitialData().Requests {
+			if req.RequestedBy == c.agent && req.ClientRequestID == "k-concurrent" {
+				rows++
+			}
+		}
+		if rows != 1 {
+			t.Fatalf("%s: %d requests for one client_request_id", c.agent, rows)
+		}
+	}
+	if execs := srv.Execs(); len(execs) > 1 {
+		t.Fatalf("same client_request_id ran %d times: %v", len(execs), execs)
+	}
+}
+
+// TestDeduplicatedFailureKeepsIsError: a retry of a failed bypassed run
+// reports the same isError as the original answer.
+func TestDeduplicatedFailureKeepsIsError(t *testing.T) {
+	app := newTestApp(t)
+	_, token := bypassAgent(t, app)
+	args := `{"host":"lab","command":"exit 3","agent_name":"trusted","client_request_id":"k-fail"}`
+	first, firstErr := callToolAuth(t, app, token, "execute_command", args)
+	if first["state"] != stateAutoFailed || !firstErr {
+		t.Fatalf("original: isError=%v %v", firstErr, first)
+	}
+	retry, retryErr := callToolAuth(t, app, token, "execute_command", args)
+	if retry["deduplicated"] != true || retry["request_id"] != first["request_id"] || !retryErr {
+		t.Fatalf("retry: isError=%v %v", retryErr, retry)
+	}
+	ok, okErr := callToolAuth(t, app, token, "execute_command", `{"host":"lab","command":"echo fine","agent_name":"trusted","client_request_id":"k-ok"}`)
+	again, againErr := callToolAuth(t, app, token, "execute_command", `{"host":"lab","command":"echo fine","agent_name":"trusted","client_request_id":"k-ok"}`)
+	if okErr || againErr || ok["state"] != stateAutoSucceeded || again["deduplicated"] != true {
+		t.Fatalf("successful retry: %v/%v %v %v", okErr, againErr, ok, again)
+	}
+}
+
+// TestHostCandidatesDoNotRankByAddress: the host_not_found candidates must
+// not reveal which connection's hidden address contains the probe.
+func TestHostCandidatesDoNotRankByAddress(t *testing.T) {
+	app := newTestApp(t)
+	alpha := Connection{Name: "alpha", Type: "SSH", Host: "10.0.3.1", Port: 22, User: "u", Tags: []string{}}
+	beta := Connection{Name: "beta", Type: "SSH", Host: "192.168.7.9", Port: 22, User: "u", Tags: []string{}}
+	addTestConnection(t, app, alpha)
+	addTestConnection(t, app, beta)
+	baseline := app.hostCandidates("no-such-name", maxCandidates)
+	for _, probe := range []string{"10.0.", "10.0.3", "192.168", "192.168.7.9"} {
+		out, isErr := callTool(t, app, "execute_command", `{"host":"`+probe+`.x","command":"echo","agent_name":"a"}`)
+		if !isErr || out["error_kind"] != "host_not_found" {
+			t.Fatalf("probe %s: %v", probe, out)
+		}
+		if got := app.hostCandidates(probe, maxCandidates); strings.Join(got, ",") != strings.Join(baseline, ",") {
+			t.Fatalf("probe %q reordered candidates by address: %v (baseline %v)", probe, got, baseline)
+		}
+	}
+	if got := app.hostCandidates("bet", maxCandidates); len(got) == 0 || got[0] != "beta" {
+		t.Fatalf("name match should rank first: %v", got)
+	}
+}
+
+// TestAgentViewsHideLocalErrorDetail: a failed run's local error (address,
+// fingerprint) stays in the GUI/DB record but not in what agents read
+// through get_request_status, execute_command or the audit endpoint.
+func TestAgentViewsHideLocalErrorDetail(t *testing.T) {
+	app := newTestApp(t)
+	srv := newSSHTestServer(t)
+	conn := addTestConnection(t, app, srv.Connection("lab")) // never trusted
+	req := queueOn(t, app, conn, "echo x", "agent")
+	app.ApproveCommand(req.ID, "")
+	stored, _ := app.findRequest(req.ID)
+	port := strconv.Itoa(srv.Port())
+	if stored.ErrorKind != "hostkey_unknown" || !strings.Contains(stored.Stderr, port) || !strings.Contains(stored.Stderr, "SHA256:") {
+		t.Fatalf("GUI record should keep the detail: %+v", stored)
+	}
+	got := statusOf(t, app, req.ID, 0)
+	stderr, _ := got["stderr"].(string)
+	if got["error_kind"] != "hostkey_unknown" || stderr == "" {
+		t.Fatalf("status: %v", got)
+	}
+	audit := app.serveTest(t, mcpCall{method: http.MethodGet, path: app.mcp.AuditPath, contentType: "-"}).Body.String()
+	for _, leaked := range []string{port, "SHA256:", "127.0.0.1"} {
+		if strings.Contains(stderr, leaked) {
+			t.Fatalf("get_request_status stderr leaked %q: %q", leaked, stderr)
+		}
+		if strings.Contains(audit, leaked) {
+			t.Fatalf("audit leaked %q: %s", leaked, audit)
+		}
+	}
+	if agentStderr("remote said no\n"+execErrorMarker+"dial tcp 10.1.2.3:22: refused", "connect") != "remote said no\n"+execErrorMarker+"could not connect to the host" {
+		t.Fatalf("remote stderr before the marker must be kept")
+	}
+}
+
+// TestDeleteRefusesRunningRequest: the delete is a CAS on the status, in
+// memory and in SQLite, so a request that is running keeps its audit row.
+func TestDeleteRefusesRunningRequest(t *testing.T) {
+	app := newTestApp(t)
+	srv := newSSHTestServer(t)
+	conn := addTrustedConnection(t, app, srv.Connection("lab"))
+	req := queueOn(t, app, conn, "echo x", "agent")
+	if _, err := app.transitionRequest(req.ID, []string{statePending}, func(r *CommandRequest) { r.Status = stateRunning }); err != nil {
+		t.Fatal(err)
+	}
+	if r := app.DeleteCommandRequest(req.ID); r.OK {
+		t.Fatalf("running request deleted: %+v", r)
+	}
+	if err := app.store.deleteCommandRequestUnlessRunning(req.ID); err != errStateConflict {
+		t.Fatalf("store delete of a running row: %v", err)
+	}
+	if _, found, err := app.store.loadCommandRequest(req.ID); err != nil || !found {
+		t.Fatalf("running row gone: found=%v err=%v", found, err)
+	}
+	app.finishRequest(func() CommandRequest { r, _ := app.findRequest(req.ID); return r }(), stateSucceeded, commandResult{}, nil)
+	if r := app.DeleteCommandRequest(req.ID); !r.OK {
+		t.Fatalf("finished request not deleted: %+v", r)
+	}
+	if _, found, _ := app.store.loadCommandRequest(req.ID); found {
+		t.Fatalf("finished row still in SQLite")
+	}
+}
+
+// TestShutdownDrainsGUIApprovedRun: a queued command approved in the GUI is
+// waited for by drain, then cancelled and persisted as interrupted before
+// the store closes.
+func TestShutdownDrainsGUIApprovedRun(t *testing.T) {
+	app := newTestApp(t)
+	srv := newSSHTestServer(t)
+	conn := addTrustedConnection(t, app, srv.Connection("lab"))
+	req := queueOn(t, app, conn, "sleep 30", "agent")
+	done := make(chan ActionResult, 1)
+	go func() { done <- app.ApproveCommand(req.ID, "") }()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(srv.Execs()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("approved command did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if finished := app.drainMCPCommands(100 * time.Millisecond); finished {
+		t.Fatalf("drain did not wait for the GUI-approved run")
+	}
+	got, _ := app.findRequest(req.ID)
+	if got.Status != stateInterrupted || got.ErrorKind != "canceled" {
+		t.Fatalf("after drain: %+v", got)
+	}
+	if row, _, _ := app.store.loadCommandRequest(req.ID); row.Status != stateInterrupted {
+		t.Fatalf("interrupted state not persisted: %+v", row)
+	}
+	if r := <-done; r.OK {
+		t.Fatalf("approve reported success for an interrupted run: %+v", r)
+	}
+	// Once draining, new approvals are refused rather than run untracked.
+	late := queueOn(t, app, conn, "echo late", "agent")
+	if r := app.ApproveCommand(late.ID, ""); r.OK {
+		t.Fatalf("approval during shutdown ran: %+v", r)
+	}
+}
+
+// TestListenerRestartDetachesBypassedRun: restarting the MCP listener while
+// an agent waits on a bypassed run answers state=auto_running and lets the
+// command finish; it is not cancelled as if the client had disconnected.
+func TestListenerRestartDetachesBypassedRun(t *testing.T) {
+	app := newTestApp(t)
+	_, token := bypassAgent(t, app)
+	host, portText, _ := net.SplitHostPort(freeLoopbackAddr(t))
+	port, _ := strconv.Atoi(portText)
+	app.mu.Lock()
+	app.mcp.ListenAddress, app.mcp.Port, app.mcp.Enabled, app.mcp.RequestTimeout = host, port, true, 30
+	path := app.mcp.MCPPath
+	app.mu.Unlock()
+	if err := app.restartMCPServer(); err != nil {
+		t.Fatal(err)
+	}
+
+	answer := make(chan map[string]any, 1)
+	go func() {
+		httpReq, _ := http.NewRequest(http.MethodPost, "http://"+net.JoinHostPort(host, portText)+path,
+			strings.NewReader(toolCall("execute_command", `{"host":"lab","command":"sleep 3","agent_name":"trusted"}`)))
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(httpReq)
+		if err != nil {
+			answer <- map[string]any{"transport_error": err.Error()}
+			return
+		}
+		defer resp.Body.Close()
+		var body struct {
+			Result struct {
+				StructuredContent map[string]any `json:"structuredContent"`
+			} `json:"result"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&body)
+		answer <- body.Result.StructuredContent
+	}()
+
+	var id string
+	deadline := time.Now().Add(5 * time.Second)
+	for id == "" {
+		for _, req := range app.GetInitialData().Requests {
+			if req.Status == stateAutoRunning {
+				id = req.ID
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("bypassed run did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	start := time.Now()
+	if err := app.restartMCPServer(); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+		t.Fatalf("restart waited %s for the synchronous handler", elapsed)
+	}
+	select {
+	case out := <-answer:
+		if out["request_id"] != id || out["state"] != stateAutoRunning {
+			t.Fatalf("answer on restart: %v", out)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("no answer after restart")
+	}
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		got, _ := app.findRequest(id)
+		if requestIsFinal(got.Status) {
+			if got.Status != stateAutoSucceeded {
+				t.Fatalf("run was cut by the restart: %+v", got)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("run did not finish: %+v", got)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestBypassGrantRevokeStayConsistent: concurrent grant and revoke for the
+// same agent end in the same state in memory and in SQLite.
+func TestBypassGrantRevokeStayConsistent(t *testing.T) {
+	app := newTestApp(t)
+	for i := 0; i < 50; i++ {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); app.setAgentApprovalBypass("racer", true) }()
+		go func() { defer wg.Done(); app.RevokeAgentApprovalBypass("racer") }()
+		wg.Wait()
+		app.mu.RLock()
+		mem := app.agentPolicies["racer"].ApprovalBypass
+		app.mu.RUnlock()
+		stored, _, err := app.store.loadAgentPolicy("racer")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.ApprovalBypass != mem {
+			t.Fatalf("round %d: memory bypass=%v, SQLite bypass=%v", i, mem, stored.ApprovalBypass)
+		}
 	}
 }

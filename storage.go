@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -17,8 +18,10 @@ import (
 )
 
 // schemaVersion is stored in PRAGMA user_version. v2 introduced immutable
-// connection IDs, request state codes and approval/audit columns.
-const schemaVersion = 2
+// connection IDs, request state codes and approval/audit columns. v3 added
+// agent_tokens, bypass expiry/scope on agent_policies and serial line
+// parameters on connections.
+const schemaVersion = 3
 
 var errStoreUnavailable = errors.New("SQLiteストアが初期化されていないため保存できません")
 
@@ -87,6 +90,30 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// backupBeforeMigration writes a complete copy of the database as
+// <path>.bak-v<N>. The copy goes to a temporary name first and is renamed only
+// after VACUUM INTO succeeded, so a crash never leaves a partial file under the
+// backup name. An existing .bak-v<N> (from an earlier upgrade, possibly of
+// older data) is kept and this copy gets a timestamped name instead, so every
+// migration has a copy taken right before it.
+func (s *Store) backupBeforeMigration() (string, error) {
+	backup := fmt.Sprintf("%s.bak-v%d", s.path, s.prevVersion)
+	if fileExists(backup) {
+		backup = fmt.Sprintf("%s.bak-v%d-%d", s.path, s.prevVersion, time.Now().UnixNano())
+	}
+	tmp := fmt.Sprintf("%s.tmp-%d", backup, time.Now().UnixNano())
+	if _, err := s.db.Exec(`VACUUM INTO ?`, tmp); err != nil {
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	_ = os.Chmod(tmp, 0o600)
+	if err := os.Rename(tmp, backup); err != nil {
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	return backup, nil
+}
+
 func (s *Store) migrate() error {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&s.prevVersion); err != nil {
 		return err
@@ -94,8 +121,17 @@ func (s *Store) migrate() error {
 	if s.prevVersion > schemaVersion {
 		return fmt.Errorf("このデータベースは新しいバージョン(v%d)の ssh-gete で作成されています。アプリを更新してください", s.prevVersion)
 	}
+	if _, err := s.db.Exec(`PRAGMA journal_mode=WAL`); err != nil {
+		return err
+	}
+	if s.prevVersion < schemaVersion && !s.fresh {
+		// Keep a copy of the pre-migration database for rollback. This runs
+		// before any DDL so the copy is exactly what the older version wrote.
+		if _, err := s.backupBeforeMigration(); err != nil {
+			return fmt.Errorf("backup before migration: %w", err)
+		}
+	}
 	statements := []string{
-		`PRAGMA journal_mode=WAL`,
 		`CREATE TABLE IF NOT EXISTS connections (
 			name TEXT PRIMARY KEY,
 			host TEXT NOT NULL,
@@ -138,20 +174,19 @@ func (s *Store) migrate() error {
 			approval_bypass INTEGER NOT NULL,
 			updated_at TEXT NOT NULL
 		)`,
+		// agent_tokens binds an agent name to its own Bearer token. Only the
+		// SHA-256 of the token is stored; the plaintext is shown once at issue.
+		`CREATE TABLE IF NOT EXISTS agent_tokens (
+			name TEXT PRIMARY KEY,
+			token_hash TEXT NOT NULL UNIQUE,
+			bypass INTEGER NOT NULL DEFAULT 0,
+			preview TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL
+		)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.Exec(statement); err != nil {
 			return err
-		}
-	}
-	if s.prevVersion < schemaVersion && !s.fresh {
-		// Keep a copy of the pre-migration database for rollback.
-		backup := fmt.Sprintf("%s.bak-v%d", s.path, s.prevVersion)
-		if !fileExists(backup) {
-			if _, err := s.db.Exec(`VACUUM INTO ?`, backup); err != nil {
-				return fmt.Errorf("backup before migration: %w", err)
-			}
-			_ = os.Chmod(backup, 0o600)
 		}
 	}
 
@@ -179,6 +214,16 @@ func (s *Store) migrate() error {
 		{"command_requests", "exit_code", `ALTER TABLE command_requests ADD COLUMN exit_code INTEGER`},
 		{"command_requests", "error_kind", `ALTER TABLE command_requests ADD COLUMN error_kind TEXT NOT NULL DEFAULT ''`},
 		{"command_requests", "client_request_id", `ALTER TABLE command_requests ADD COLUMN client_request_id TEXT NOT NULL DEFAULT ''`},
+		{"command_requests", "expires_at", `ALTER TABLE command_requests ADD COLUMN expires_at TEXT NOT NULL DEFAULT ''`},
+		{"command_requests", "target_fp", `ALTER TABLE command_requests ADD COLUMN target_fp TEXT NOT NULL DEFAULT ''`},
+		{"connections", "data_bits", `ALTER TABLE connections ADD COLUMN data_bits INTEGER NOT NULL DEFAULT 8`},
+		{"connections", "parity", `ALTER TABLE connections ADD COLUMN parity TEXT NOT NULL DEFAULT 'none'`},
+		{"connections", "stop_bits", `ALTER TABLE connections ADD COLUMN stop_bits TEXT NOT NULL DEFAULT '1'`},
+		{"agent_policies", "max_risk", `ALTER TABLE agent_policies ADD COLUMN max_risk TEXT NOT NULL DEFAULT 'Medium'`},
+		{"agent_policies", "scope_conn_ids", `ALTER TABLE agent_policies ADD COLUMN scope_conn_ids TEXT NOT NULL DEFAULT '[]'`},
+		{"agent_policies", "granted_at", `ALTER TABLE agent_policies ADD COLUMN granted_at INTEGER NOT NULL DEFAULT 0`},
+		{"agent_policies", "granted_by", `ALTER TABLE agent_policies ADD COLUMN granted_by TEXT NOT NULL DEFAULT ''`},
+		{"agent_policies", "expires_at", `ALTER TABLE agent_policies ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0`},
 	}
 	for _, col := range columns {
 		if err := addColumnIfMissing(tx, col.table, col.name, col.ddl); err != nil {
@@ -191,10 +236,16 @@ func (s *Store) migrate() error {
 			return err
 		}
 	}
+	if s.prevVersion < 3 {
+		if err := migrateToV3(tx, time.Now()); err != nil {
+			return err
+		}
+	}
 	for _, statement := range []string{
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_connections_id ON connections(id)`,
 		`CREATE INDEX IF NOT EXISTS idx_command_requests_created ON command_requests(created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_command_requests_status ON command_requests(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_command_requests_client ON command_requests(requested_by, client_request_id)`,
 	} {
 		if _, err := tx.Exec(statement); err != nil {
 			return err
@@ -287,6 +338,46 @@ func migrateToV2(tx *sql.Tx) error {
 	return nil
 }
 
+// migrateToV3 gives bypass grants written before v3 (which never expired)
+// the rule AgentPolicy documents for legacy rows: they started at updated_at
+// and end defaultBypassTTL later. A grant older than that is therefore
+// already expired after the upgrade; one with an unreadable updated_at
+// starts at the migration.
+func migrateToV3(tx *sql.Tx, now time.Time) error {
+	type grant struct {
+		name    string
+		updated string
+	}
+	var grants []grant
+	rows, err := tx.Query(`SELECT agent_name, updated_at FROM agent_policies WHERE approval_bypass = 1 AND expires_at = 0`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var g grant
+		if err := rows.Scan(&g.name, &g.updated); err != nil {
+			rows.Close()
+			return err
+		}
+		grants = append(grants, g)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, g := range grants {
+		start := rfc3339Millis(g.updated)
+		if start == 0 {
+			start = now.UnixMilli()
+		}
+		if _, err := tx.Exec(`UPDATE agent_policies SET granted_at = ?, expires_at = ? WHERE agent_name = ?`,
+			start, start+defaultBypassTTL.Milliseconds(), g.name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func addColumnIfMissing(tx *sql.Tx, table string, column string, ddl string) error {
 	rows, err := tx.Query(`SELECT name FROM pragma_table_info(?)`, table)
 	if err != nil {
@@ -324,7 +415,7 @@ func (s *Store) recoverInterruptedRequests() error {
 }
 
 const connectionColumns = `id, name, type, host, port, user, auth_method, credential, serial_port, baud_rate,
-	connect_timeout, command_timeout, tags_json, description, last_test_result, last_test_at, last_test_message, mcp_first_trust`
+	data_bits, parity, stop_bits, connect_timeout, command_timeout, tags_json, description, last_test_result, last_test_at, last_test_message, mcp_first_trust`
 
 func (s *Store) loadConnections() ([]Connection, error) {
 	rows, err := s.db.Query(`SELECT ` + connectionColumns + ` FROM connections ORDER BY name`)
@@ -339,7 +430,7 @@ func (s *Store) loadConnections() ([]Connection, error) {
 		var tagsJSON string
 		var firstTrust int
 		if err := rows.Scan(&conn.ID, &conn.Name, &conn.Type, &conn.Host, &conn.Port, &conn.User, &conn.AuthMethod,
-			&conn.Credential, &conn.SerialPort, &conn.BaudRate, &conn.ConnectTimeout, &conn.CommandTimeout, &tagsJSON,
+			&conn.Credential, &conn.SerialPort, &conn.BaudRate, &conn.DataBits, &conn.Parity, &conn.StopBits, &conn.ConnectTimeout, &conn.CommandTimeout, &tagsJSON,
 			&conn.Description, &conn.LastTestResult, &conn.LastTestAt, &conn.LastTestMessage, &firstTrust); err != nil {
 			return nil, err
 		}
@@ -362,11 +453,11 @@ func (s *Store) insertConnection(conn Connection) error {
 	_, err = s.db.Exec(`
 		INSERT INTO connections (
 			id, name, type, host, port, user, auth_method, credential, serial_port, baud_rate,
-			connect_timeout, command_timeout, tags_json, description, mcp_first_trust,
+			data_bits, parity, stop_bits, connect_timeout, command_timeout, tags_json, description, mcp_first_trust,
 			status, last_checked, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?)`,
 		conn.ID, conn.Name, conn.connectionType(), conn.Host, conn.Port, conn.User, conn.AuthMethod, conn.Credential,
-		conn.SerialPort, conn.BaudRate, conn.ConnectTimeout, conn.CommandTimeout, string(tagsJSON), conn.Description,
+		conn.SerialPort, conn.BaudRate, conn.DataBits, conn.Parity, conn.StopBits, conn.ConnectTimeout, conn.CommandTimeout, string(tagsJSON), conn.Description,
 		boolInt(conn.MCPFirstTrust), nowRFC3339(),
 	)
 	return err
@@ -383,12 +474,12 @@ func (s *Store) updateConnection(conn Connection) (bool, error) {
 	res, err := s.db.Exec(`
 		UPDATE connections SET
 			name = ?, type = ?, host = ?, port = ?, user = ?, auth_method = ?, credential = ?,
-			serial_port = ?, baud_rate = ?, connect_timeout = ?, command_timeout = ?, tags_json = ?,
+			serial_port = ?, baud_rate = ?, data_bits = ?, parity = ?, stop_bits = ?, connect_timeout = ?, command_timeout = ?, tags_json = ?,
 			description = ?, mcp_first_trust = ?, updated_at = ?
 		WHERE id = ?`,
 		conn.Name, conn.connectionType(), conn.Host, conn.Port, conn.User, conn.AuthMethod, conn.Credential,
-		conn.SerialPort, conn.BaudRate, conn.ConnectTimeout, conn.CommandTimeout, string(tagsJSON),
-		conn.Description, boolInt(conn.MCPFirstTrust), nowRFC3339(), conn.ID,
+		conn.SerialPort, conn.BaudRate, conn.DataBits, conn.Parity, conn.StopBits, conn.ConnectTimeout,
+		conn.CommandTimeout, string(tagsJSON), conn.Description, boolInt(conn.MCPFirstTrust), nowRFC3339(), conn.ID,
 	)
 	if err != nil {
 		return false, err
@@ -447,7 +538,7 @@ func (s *Store) saveMCPSettings(settings MCPSettings, token string) error {
 
 const requestColumns = `id, connection_id, host, user, command, executed_command, reason, requested_by, requested_at,
 	risk, approved_risk, status, stdout, stderr, duration, decided_by, decided_at, finished_at, exit_code, error_kind,
-	client_request_id`
+	client_request_id, expires_at, target_fp`
 
 func scanRequest(scanner interface{ Scan(...any) error }) (CommandRequest, error) {
 	var req CommandRequest
@@ -455,7 +546,7 @@ func scanRequest(scanner interface{ Scan(...any) error }) (CommandRequest, error
 	err := scanner.Scan(&req.ID, &req.ConnectionID, &req.Host, &req.User, &req.Command, &req.ExecutedCommand,
 		&req.Reason, &req.RequestedBy, &req.RequestedAt, &req.Risk, &req.ApprovedRisk, &req.Status, &req.Stdout,
 		&req.Stderr, &req.Duration, &req.DecidedBy, &req.DecidedAt, &req.FinishedAt, &exitCode, &req.ErrorKind,
-		&req.ClientRequestID)
+		&req.ClientRequestID, &req.ExpiresAt, &req.TargetFP)
 	if exitCode.Valid {
 		code := int(exitCode.Int64)
 		req.ExitCode = &code
@@ -491,20 +582,27 @@ func (s *Store) loadCommandRequests(limit int) ([]CommandRequest, error) {
 }
 
 func (s *Store) insertCommandRequest(req CommandRequest) error {
+	return execInsertCommandRequest(s.db, req)
+}
+
+// execInsertCommandRequest runs the INSERT on a DB or a transaction.
+func execInsertCommandRequest(db interface {
+	Exec(string, ...any) (sql.Result, error)
+}, req CommandRequest) error {
 	createdAt := time.Now().UnixMilli()
 	if parsed, err := parseRequestIDMillis(req.ID); err == nil {
 		createdAt = parsed
 	}
-	_, err := s.db.Exec(`
+	_, err := db.Exec(`
 		INSERT INTO command_requests (
 			id, connection_id, host, user, command, executed_command, reason, requested_by, requested_at,
 			risk, approved_risk, status, stdout, stderr, duration, decided_by, decided_at, finished_at,
-			exit_code, error_kind, client_request_id, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			exit_code, error_kind, client_request_id, expires_at, target_fp, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		req.ID, req.ConnectionID, req.Host, req.User, req.Command, req.ExecutedCommand, req.Reason, req.RequestedBy,
 		req.RequestedAt, req.Risk, req.ApprovedRisk, req.Status, req.Stdout, req.Stderr, req.Duration, req.DecidedBy,
-		req.DecidedAt, req.FinishedAt, nullableInt(req.ExitCode), req.ErrorKind, req.ClientRequestID, createdAt,
-		nowRFC3339(),
+		req.DecidedAt, req.FinishedAt, nullableInt(req.ExitCode), req.ErrorKind, req.ClientRequestID, req.ExpiresAt, req.TargetFP,
+		createdAt, nowRFC3339(),
 	)
 	return err
 }
@@ -516,11 +614,11 @@ func (s *Store) updateCommandRequestFrom(req CommandRequest, from string) error 
 		UPDATE command_requests SET
 			connection_id = ?, host = ?, executed_command = ?, approved_risk = ?, status = ?, stdout = ?,
 			stderr = ?, duration = ?, decided_by = ?, decided_at = ?, finished_at = ?, exit_code = ?,
-			error_kind = ?, updated_at = ?
+			error_kind = ?, expires_at = ?, updated_at = ?
 		WHERE id = ? AND status = ?`,
 		req.ConnectionID, req.Host, req.ExecutedCommand, req.ApprovedRisk, req.Status, req.Stdout, req.Stderr,
 		req.Duration, req.DecidedBy, req.DecidedAt, req.FinishedAt, nullableInt(req.ExitCode), req.ErrorKind,
-		nowRFC3339(), req.ID, from,
+		req.ExpiresAt, nowRFC3339(), req.ID, from,
 	)
 	if err != nil {
 		return err
@@ -541,44 +639,481 @@ func (s *Store) updatePendingRequestsConnection(oldName string, connID string, n
 	return err
 }
 
-func (s *Store) deleteCommandRequest(id string) error {
-	_, err := s.db.Exec(`DELETE FROM command_requests WHERE id = ?`, id)
-	return err
+// deleteCommandRequestUnlessRunning deletes the request unless it is
+// running. errStateConflict means the row is running (or already gone), so
+// nothing was deleted.
+func (s *Store) deleteCommandRequestUnlessRunning(id string) error {
+	res, err := s.db.Exec(`DELETE FROM command_requests WHERE id = ? AND status NOT IN (?, ?)`, id, stateRunning, stateAutoRunning)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return errStateConflict
+	}
+	return nil
 }
 
-func (s *Store) loadAgentPolicies() ([]AgentPolicy, error) {
-	rows, err := s.db.Query(`SELECT agent_name, approval_bypass, updated_at FROM agent_policies ORDER BY agent_name`)
+// policyActiveAt reports whether p lets the agent skip approval at now.
+// Expiry is read from ExpiresAt; an unparsable or empty value is inactive.
+func policyActiveAt(p AgentPolicy, now time.Time) bool {
+	return p.ApprovalBypass && rfc3339Millis(p.ExpiresAt) > now.UnixMilli()
+}
+
+// policyAllows reports whether an active grant covers risk on connID. An
+// empty scope means every connection. High risk is never covered.
+func policyAllows(p AgentPolicy, risk string, connID string, now time.Time) bool {
+	if !policyActiveAt(p, now) || risk == "High" {
+		return false
+	}
+	rank, ok := riskRank[risk]
+	if !ok || rank > riskRank[normalizeBypassMaxRisk(p.MaxRisk)] {
+		return false
+	}
+	if len(p.ScopeConnIDs) == 0 {
+		return true
+	}
+	for _, id := range p.ScopeConnIDs {
+		if id == connID {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeBypassMaxRisk clamps max_risk to Low or Medium.
+func normalizeBypassMaxRisk(risk string) string {
+	if risk == "Low" {
+		return "Low"
+	}
+	return defaultBypassMaxRisk
+}
+
+// fillPolicyDefaults applies the §5.5 defaults the way AgentPolicy documents
+// them: an enabled grant without GrantedAt starts at UpdatedAt (or now), and
+// one without ExpiresAt ends defaultBypassTTL after it starts.
+func fillPolicyDefaults(p AgentPolicy, now time.Time) AgentPolicy {
+	p.AgentName = strings.TrimSpace(p.AgentName)
+	p.MaxRisk = normalizeBypassMaxRisk(p.MaxRisk)
+	if p.ScopeConnIDs == nil {
+		p.ScopeConnIDs = []string{}
+	}
+	if strings.TrimSpace(p.UpdatedAt) == "" {
+		p.UpdatedAt = now.Format(time.RFC3339)
+	}
+	if p.ApprovalBypass {
+		if rfc3339Millis(p.GrantedAt) == 0 {
+			p.GrantedAt = p.UpdatedAt
+		}
+		if rfc3339Millis(p.ExpiresAt) == 0 {
+			start := rfc3339Millis(p.GrantedAt)
+			if start == 0 {
+				start = now.UnixMilli()
+			}
+			p.ExpiresAt = millisRFC3339(start + defaultBypassTTL.Milliseconds())
+		}
+	}
+	return p
+}
+
+const agentPolicyColumns = `p.agent_name, p.approval_bypass, p.max_risk, p.scope_conn_ids, p.granted_at, p.granted_by,
+	p.expires_at, p.updated_at, EXISTS (SELECT 1 FROM agent_tokens t WHERE t.name = p.agent_name)`
+
+func scanAgentPolicy(scanner interface{ Scan(...any) error }, now time.Time) (AgentPolicy, error) {
+	var p AgentPolicy
+	var bypass, hasToken int
+	var scopeJSON string
+	var grantedAt, expiresAt int64
+	if err := scanner.Scan(&p.AgentName, &bypass, &p.MaxRisk, &scopeJSON, &grantedAt, &p.GrantedBy,
+		&expiresAt, &p.UpdatedAt, &hasToken); err != nil {
+		return p, err
+	}
+	p.ApprovalBypass = bypass != 0
+	p.MaxRisk = normalizeBypassMaxRisk(p.MaxRisk)
+	p.ScopeConnIDs = []string{}
+	if scopeJSON != "" {
+		if err := json.Unmarshal([]byte(scopeJSON), &p.ScopeConnIDs); err != nil {
+			return p, err
+		}
+	}
+	p.GrantedAt = millisRFC3339(grantedAt)
+	p.ExpiresAt = millisRFC3339(expiresAt)
+	p.Active = policyActiveAt(p, now)
+	p.HasToken = hasToken != 0
+	return p, nil
+}
+
+func (s *Store) queryAgentPolicies(now time.Time, where string, args ...any) ([]AgentPolicy, error) {
+	rows, err := s.db.Query(`SELECT `+agentPolicyColumns+` FROM agent_policies p `+where+` ORDER BY p.agent_name`, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
-	var policies []AgentPolicy
+	policies := []AgentPolicy{}
 	for rows.Next() {
-		var policy AgentPolicy
-		var approvalBypass int
-		if err := rows.Scan(&policy.AgentName, &approvalBypass, &policy.UpdatedAt); err != nil {
+		p, err := scanAgentPolicy(rows, now)
+		if err != nil {
 			return nil, err
 		}
-		policy.ApprovalBypass = approvalBypass != 0
-		policies = append(policies, policy)
+		policies = append(policies, p)
 	}
 	return policies, rows.Err()
 }
 
-func (s *Store) saveAgentPolicy(policy AgentPolicy) error {
-	if strings.TrimSpace(policy.UpdatedAt) == "" {
-		policy.UpdatedAt = nowRFC3339()
+// loadAgentPolicies returns every agent_policies row with Active and
+// HasToken derived. Expired grants keep ApprovalBypass as stored but load
+// with Active=false.
+func (s *Store) loadAgentPolicies() ([]AgentPolicy, error) {
+	return s.queryAgentPolicies(time.Now(), ``)
+}
+
+// loadActiveAgentPolicies returns the grants that let an agent skip approval
+// at now (the "承認省略の一覧").
+func (s *Store) loadActiveAgentPolicies(now time.Time) ([]AgentPolicy, error) {
+	return s.queryAgentPolicies(now, `WHERE p.approval_bypass = 1 AND p.expires_at > ?`, now.UnixMilli())
+}
+
+// loadAgentPolicy returns one agent's row; ok is false when none exists.
+func (s *Store) loadAgentPolicy(agentName string) (AgentPolicy, bool, error) {
+	policies, err := s.queryAgentPolicies(time.Now(), `WHERE p.agent_name = ?`, agentName)
+	if err != nil || len(policies) == 0 {
+		return AgentPolicy{}, false, err
 	}
-	_, err := s.db.Exec(`
-		INSERT INTO agent_policies (agent_name, approval_bypass, updated_at)
-		VALUES (?, ?, ?)
+	return policies[0], true, nil
+}
+
+// saveAgentPolicy upserts every persisted field of policy after applying
+// fillPolicyDefaults. Turning bypass off clears expires_at.
+func (s *Store) saveAgentPolicy(policy AgentPolicy) error {
+	policy = fillPolicyDefaults(policy, time.Now())
+	if policy.AgentName == "" {
+		return errors.New("エージェント名が不足しています")
+	}
+	scopeJSON, err := json.Marshal(policy.ScopeConnIDs)
+	if err != nil {
+		return err
+	}
+	expiresAt := rfc3339Millis(policy.ExpiresAt)
+	if !policy.ApprovalBypass {
+		expiresAt = 0
+	}
+	_, err = s.db.Exec(`
+		INSERT INTO agent_policies (agent_name, approval_bypass, max_risk, scope_conn_ids, granted_at, granted_by,
+			expires_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(agent_name) DO UPDATE SET
 			approval_bypass = excluded.approval_bypass,
+			max_risk = excluded.max_risk,
+			scope_conn_ids = excluded.scope_conn_ids,
+			granted_at = excluded.granted_at,
+			granted_by = excluded.granted_by,
+			expires_at = excluded.expires_at,
 			updated_at = excluded.updated_at`,
-		policy.AgentName, boolInt(policy.ApprovalBypass), policy.UpdatedAt,
+		policy.AgentName, boolInt(policy.ApprovalBypass), policy.MaxRisk, string(scopeJSON),
+		rfc3339Millis(policy.GrantedAt), policy.GrantedBy, expiresAt, policy.UpdatedAt,
 	)
 	return err
+}
+
+// revokeAgentPolicy turns bypass off for agentName. It reports whether an
+// active grant was actually revoked (false for unknown or already expired
+// agents, whose row is still switched off).
+func (s *Store) revokeAgentPolicy(agentName string, now time.Time) (bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var active int
+	err = tx.QueryRow(`SELECT COUNT(*) FROM agent_policies WHERE agent_name = ? AND approval_bypass = 1 AND expires_at > ?`,
+		agentName, now.UnixMilli()).Scan(&active)
+	if err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(`UPDATE agent_policies SET approval_bypass = 0, expires_at = 0, updated_at = ?
+		WHERE agent_name = ? AND approval_bypass = 1`, now.Format(time.RFC3339), agentName); err != nil {
+		return false, err
+	}
+	return active == 1, tx.Commit()
+}
+
+// expireAgentPolicies switches off every grant whose expires_at has passed
+// and returns the affected agent names, so the caller can update memory and
+// notify the UI.
+func (s *Store) expireAgentPolicies(now time.Time) ([]string, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT agent_name FROM agent_policies WHERE approval_bypass = 1 AND expires_at <= ? ORDER BY agent_name`,
+		now.UnixMilli())
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(names) == 0 {
+		return nil, nil
+	}
+	if _, err := tx.Exec(`UPDATE agent_policies SET approval_bypass = 0, updated_at = ?
+		WHERE approval_bypass = 1 AND expires_at <= ?`, now.Format(time.RFC3339), now.UnixMilli()); err != nil {
+		return nil, err
+	}
+	return names, tx.Commit()
+}
+
+func hashAgentToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+// agentTokenPreview is the non-secret hint shown in the UI.
+func agentTokenPreview(token string) string {
+	if len(token) <= len(agentTokenPrefix)+4 {
+		return agentTokenPrefix + "…"
+	}
+	return agentTokenPrefix + "…" + token[len(token)-4:]
+}
+
+// newAgentToken generates a token for agentName. The plaintext is returned
+// once; only the AgentToken (hash and preview) is meant to be stored.
+func newAgentToken(agentName string, bypass bool) (string, AgentToken, error) {
+	agentName = strings.TrimSpace(agentName)
+	if agentName == "" {
+		return "", AgentToken{}, errors.New("エージェント名が不足しています")
+	}
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", AgentToken{}, err
+	}
+	token := agentTokenPrefix + hex.EncodeToString(b[:])
+	return token, AgentToken{
+		AgentName: agentName,
+		TokenHash: hashAgentToken(token),
+		Bypass:    bypass,
+		CreatedAt: nowRFC3339(),
+		Preview:   agentTokenPreview(token),
+	}, nil
+}
+
+// saveAgentToken creates or rotates the token row for t.AgentName.
+// Rotating replaces the hash, so the old token stops working.
+func (s *Store) saveAgentToken(t AgentToken) error {
+	t.AgentName = strings.TrimSpace(t.AgentName)
+	if t.AgentName == "" || t.TokenHash == "" {
+		return errors.New("エージェント名またはトークンが不足しています")
+	}
+	if rfc3339Millis(t.CreatedAt) == 0 {
+		t.CreatedAt = nowRFC3339()
+	}
+	_, err := s.db.Exec(`
+		INSERT INTO agent_tokens (name, token_hash, bypass, preview, created_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(name) DO UPDATE SET
+			token_hash = excluded.token_hash,
+			bypass = excluded.bypass,
+			preview = excluded.preview,
+			created_at = excluded.created_at`,
+		t.AgentName, t.TokenHash, boolInt(t.Bypass), t.Preview, rfc3339Millis(t.CreatedAt),
+	)
+	return err
+}
+
+// loadAgentTokens returns every token row including its hash (for the
+// in-memory lookup; the hash is not serialized to the UI).
+func (s *Store) loadAgentTokens() ([]AgentToken, error) {
+	rows, err := s.db.Query(`SELECT name, token_hash, bypass, preview, created_at FROM agent_tokens ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	tokens := []AgentToken{}
+	for rows.Next() {
+		var t AgentToken
+		var bypass int
+		var created int64
+		if err := rows.Scan(&t.AgentName, &t.TokenHash, &bypass, &t.Preview, &created); err != nil {
+			return nil, err
+		}
+		t.Bypass = bypass != 0
+		t.CreatedAt = millisRFC3339(created)
+		tokens = append(tokens, t)
+	}
+	return tokens, rows.Err()
+}
+
+// loadAgentTokenByHash resolves a presented token's hash to its row.
+func (s *Store) loadAgentTokenByHash(hash string) (AgentToken, bool, error) {
+	var t AgentToken
+	var bypass int
+	var created int64
+	err := s.db.QueryRow(`SELECT name, token_hash, bypass, preview, created_at FROM agent_tokens WHERE token_hash = ?`, hash).
+		Scan(&t.AgentName, &t.TokenHash, &bypass, &t.Preview, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AgentToken{}, false, nil
+	}
+	if err != nil {
+		return AgentToken{}, false, err
+	}
+	t.Bypass = bypass != 0
+	t.CreatedAt = millisRFC3339(created)
+	return t, true, nil
+}
+
+// setAgentTokenBypass changes whether the token may use the agent's grant.
+// It reports whether the token exists.
+func (s *Store) setAgentTokenBypass(agentName string, bypass bool) (bool, error) {
+	res, err := s.db.Exec(`UPDATE agent_tokens SET bypass = ? WHERE name = ?`, boolInt(bypass), agentName)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+// deleteAgentToken revokes the token. It reports whether one existed.
+func (s *Store) deleteAgentToken(agentName string) (bool, error) {
+	res, err := s.db.Exec(`DELETE FROM agent_tokens WHERE name = ?`, agentName)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+// clientRequestIDWindow is how long (agent_name, client_request_id) stays
+// deduplicated (§5.3).
+const clientRequestIDWindow = 24 * time.Hour
+
+const requestByClientIDQuery = `SELECT ` + requestColumns + ` FROM command_requests
+	WHERE requested_by = ? AND client_request_id = ? AND created_at >= ?
+	ORDER BY created_at DESC LIMIT 1`
+
+// loadRequestByClientID returns the newest request from agentName carrying
+// clientRequestID created within 24 hours before now.
+func (s *Store) loadRequestByClientID(agentName string, clientRequestID string, now time.Time) (CommandRequest, bool, error) {
+	if clientRequestID == "" {
+		return CommandRequest{}, false, nil
+	}
+	req, err := scanRequest(s.db.QueryRow(requestByClientIDQuery,
+		agentName, clientRequestID, now.Add(-clientRequestIDWindow).UnixMilli()))
+	if errors.Is(err, sql.ErrNoRows) {
+		return CommandRequest{}, false, nil
+	}
+	if err != nil {
+		return CommandRequest{}, false, err
+	}
+	return req, true, nil
+}
+
+// loadCommandRequest returns one request by ID, including its output.
+func (s *Store) loadCommandRequest(id string) (CommandRequest, bool, error) {
+	req, err := scanRequest(s.db.QueryRow(`SELECT `+requestColumns+` FROM command_requests WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return CommandRequest{}, false, nil
+	}
+	if err != nil {
+		return CommandRequest{}, false, err
+	}
+	return req, true, nil
+}
+
+// historyFilter is the get_command_history query. Empty fields do not
+// filter. ConnectionID and HostName match either column, so renamed or
+// deleted connections still find their history.
+type historyFilter struct {
+	ConnectionID string
+	HostName     string
+	State        string
+	RequestedBy  string
+	Limit        int
+}
+
+// historyColumns is requestColumns with stdout/stderr blanked: the history
+// is a summary and must not drag megabytes of output through the query.
+var historyColumns = strings.NewReplacer("stdout,", "'' AS stdout,", "stderr,", "'' AS stderr,").Replace(requestColumns)
+
+// loadCommandHistory returns matching requests newest first, without output.
+// Limit follows get_command_history: default defaultHistoryLimit, capped at
+// maxHistoryLimit (both in mcp_server.go).
+func (s *Store) loadCommandHistory(f historyFilter) ([]CommandRequest, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = defaultHistoryLimit
+	}
+	limit = min(limit, maxHistoryLimit)
+	var where []string
+	var args []any
+	switch {
+	case f.ConnectionID != "" && f.HostName != "":
+		where = append(where, `(connection_id = ? OR host = ?)`)
+		args = append(args, f.ConnectionID, f.HostName)
+	case f.ConnectionID != "":
+		where = append(where, `connection_id = ?`)
+		args = append(args, f.ConnectionID)
+	case f.HostName != "":
+		where = append(where, `host = ?`)
+		args = append(args, f.HostName)
+	}
+	if f.State != "" {
+		where = append(where, `status = ?`)
+		args = append(args, f.State)
+	}
+	if f.RequestedBy != "" {
+		where = append(where, `requested_by = ?`)
+		args = append(args, f.RequestedBy)
+	}
+	query := `SELECT ` + historyColumns + ` FROM command_requests`
+	if len(where) > 0 {
+		query += ` WHERE ` + strings.Join(where, " AND ")
+	}
+	query += ` ORDER BY created_at DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	requests := []CommandRequest{}
+	for rows.Next() {
+		req, err := scanRequest(rows)
+		if err != nil {
+			return nil, err
+		}
+		requests = append(requests, req)
+	}
+	return requests, rows.Err()
+}
+
+func millisRFC3339(ms int64) string {
+	if ms <= 0 {
+		return ""
+	}
+	return time.UnixMilli(ms).Format(time.RFC3339)
+}
+
+// rfc3339Millis parses an RFC3339 timestamp; empty or invalid gives 0.
+func rfc3339Millis(ts string) int64 {
+	t, err := time.Parse(time.RFC3339, strings.TrimSpace(ts))
+	if err != nil {
+		return 0
+	}
+	return t.UnixMilli()
 }
 
 // parseRequestIDMillis extracts the millisecond timestamp from a request ID.

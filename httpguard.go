@@ -197,9 +197,10 @@ func (a *App) startMCPServerLocked() error {
 	}
 	addr := net.JoinHostPort(settings.ListenAddress, strconv.Itoa(settings.Port))
 
+	stop := newMCPListenerStop()
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           a.newMCPHandler(settings, token),
+		Handler:           stop.wrap(a.newMCPHandler(settings, token)),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       time.Duration(settings.RequestTimeout) * time.Second,
 		MaxHeaderBytes:    64 * 1024,
@@ -210,6 +211,7 @@ func (a *App) startMCPServerLocked() error {
 		return err
 	}
 	a.mcpServer = srv
+	a.mcpServerStop = stop
 	a.setMCPStatus("起動中", "")
 	go func() {
 		log.Printf("%s MCP server listening on http://%s%s", appName, addr, settings.MCPPath)
@@ -251,6 +253,11 @@ func (a *App) stopMCPServerLocked(ctx context.Context) {
 	if a.mcpServer == nil {
 		return
 	}
+	// Tell handlers this is a server-side stop before Shutdown/Close cancel
+	// their contexts, so synchronous runs detach instead of being cancelled.
+	if a.mcpServerStop != nil {
+		a.mcpServerStop.signal()
+	}
 	shutdownCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	if err := a.mcpServer.Shutdown(shutdownCtx); err != nil {
@@ -258,6 +265,7 @@ func (a *App) stopMCPServerLocked(ctx context.Context) {
 		_ = a.mcpServer.Close()
 	}
 	a.mcpServer = nil
+	a.mcpServerStop = nil
 }
 
 func (a *App) restartMCPServer() error {

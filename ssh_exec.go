@@ -9,14 +9,12 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 	sshagent "golang.org/x/crypto/ssh/agent"
-	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 // cappedBuffer keeps at most max bytes. It is written by the SSH session's
@@ -66,17 +64,21 @@ func (e *passphraseMissingError) Error() string {
 	return fmt.Sprintf("ssh key %s is passphrase protected", e.keyPath)
 }
 
+// testSSHConnection is the GUI "接続テスト": an unknown host key is recorded
+// (TOFU) unless strictHostKey is set.
 func testSSHConnection(ctx context.Context, conn Connection, strictHostKey bool) error {
-	client, err := openSSHClient(ctx, conn, strictHostKey)
+	client, err := openSSHClientWithPolicy(ctx, conn, hostKeyPolicy{Origin: hostKeyFromGUI, Strict: strictHostKey})
 	if err != nil {
 		return err
 	}
 	return client.Close()
 }
 
+// runSSHCommand serves MCP requests (approved or bypassed), so an unknown host
+// key fails with hostKeyUnknownError instead of being recorded.
 func runSSHCommand(ctx context.Context, conn Connection, command string, outputCap int, strictHostKey bool) (commandResult, error) {
 	start := time.Now()
-	client, err := openSSHClient(ctx, conn, strictHostKey)
+	client, err := openSSHClientWithPolicy(ctx, conn, hostKeyPolicy{Origin: hostKeyFromMCP, Strict: strictHostKey})
 	if err != nil {
 		return commandResult{Duration: time.Since(start)}, err
 	}
@@ -129,7 +131,12 @@ func runSSHCommand(ctx context.Context, conn Connection, command string, outputC
 	return result, runErr
 }
 
+// openSSHClient dials for a GUI terminal tab.
 func openSSHClient(ctx context.Context, conn Connection, strictHostKey bool) (*ssh.Client, error) {
+	return openSSHClientWithPolicy(ctx, conn, hostKeyPolicy{Origin: hostKeyFromGUI, Strict: strictHostKey})
+}
+
+func openSSHClientWithPolicy(ctx context.Context, conn Connection, policy hostKeyPolicy) (*ssh.Client, error) {
 	if conn.Port == 0 {
 		conn.Port = 22
 	}
@@ -142,19 +149,23 @@ func openSSHClient(ctx context.Context, conn Connection, strictHostKey bool) (*s
 	}
 	// The agent is only needed while authenticating.
 	defer closeAgent()
-	hostKeyCallback, err := hostKeyCallback(strictHostKey)
+	if os.Getenv("SSH_GETE_STRICT_HOSTKEY") == "1" {
+		policy.Strict = true
+	}
+	addr := hostKeyAddress(conn)
+	hostKeyCallback, hostKeyAlgorithms, err := newHostKeyVerifier(addr, policy)
 	if err != nil {
 		return nil, err
 	}
 
 	timeout := time.Duration(conn.ConnectTimeout) * time.Second
 	config := &ssh.ClientConfig{
-		User:            conn.User,
-		Auth:            auth,
-		HostKeyCallback: hostKeyCallback,
-		Timeout:         timeout,
+		User:              conn.User,
+		Auth:              auth,
+		HostKeyCallback:   hostKeyCallback,
+		HostKeyAlgorithms: hostKeyAlgorithms,
+		Timeout:           timeout,
 	}
-	addr := net.JoinHostPort(conn.Host, strconv.Itoa(conn.Port))
 	dialer := &net.Dialer{Timeout: timeout, KeepAlive: 15 * time.Second}
 	netConn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
@@ -264,17 +275,6 @@ func dialAgentClient() (sshagent.ExtendedAgent, func()) {
 	}
 	var once sync.Once
 	return sshagent.NewClient(conn), func() { once.Do(func() { _ = conn.Close() }) }
-}
-
-func hostKeyCallback(strict bool) (ssh.HostKeyCallback, error) {
-	if !strict && os.Getenv("SSH_GETE_STRICT_HOSTKEY") != "1" {
-		return ssh.InsecureIgnoreHostKey(), nil
-	}
-	knownHostsPath := expandPath("~/.ssh/known_hosts")
-	if _, err := os.Stat(knownHostsPath); err == nil {
-		return knownhosts.New(knownHostsPath)
-	}
-	return nil, fmt.Errorf("known_hosts not found: %s", knownHostsPath)
 }
 
 func expandPath(path string) string {

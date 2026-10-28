@@ -200,7 +200,8 @@ func TestConnStateErrorAfterConnLost(t *testing.T) {
 func TestRunningCounter(t *testing.T) {
 	app, rec := newSessTestApp(t)
 	srv := newSSHTestServer(t)
-	conn := addTestConnection(t, app, srv.Connection("web-01"))
+	// Approved runs refuse an unrecorded host key (TOFU, phase 3).
+	conn := addTrustedConnection(t, app, srv.Connection("web-01"))
 
 	_, done := sessStartApproved(t, app, conn, "sleep 1")
 	sessWaitFor(t, 3*time.Second, "running=1", func() bool {
@@ -373,16 +374,21 @@ func TestShutdownInterruptsMCPExec(t *testing.T) {
 	_ = listener.Close()
 
 	app, _ := newSessTestApp(t)
-	token := enableBearer(t, app)
-	srv := newSSHTestServer(t)
-	conn := addTestConnection(t, app, srv.Connection("lab"))
-	app.setAgentApprovalBypass("trusted", true)
+	// Set the free port first: GenerateMCPToken (enableBearer) restarts the
+	// listener, which must not bind the default 8787.
 	app.mu.Lock()
 	app.mcp.ListenAddress = "127.0.0.1"
 	app.mcp.Port = port
 	app.mcp.Enabled = true
 	app.mu.Unlock()
-	if err := app.startMCPServer(); err != nil {
+	enableBearer(t, app)
+	srv := newSSHTestServer(t)
+	// Since phase 3 a bypass needs the agent's own token and MCP runs need a
+	// recorded host key.
+	conn := addTrustedConnection(t, app, srv.Connection("lab"))
+	app.setAgentApprovalBypass("trusted", true)
+	token := issueAgentToken(t, app, "trusted")
+	if err := app.restartMCPServer(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -564,4 +570,77 @@ func TestActiveWork(t *testing.T) {
 	if s := sessSummary(t, app, conn.ID); s.Pending != 1 {
 		t.Fatalf("pending=%d", s.Pending)
 	}
+}
+
+// bypassedRequest returns the newest request of agent on conn.
+func bypassedRequest(app *App, connID string, command string) (CommandRequest, bool) {
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+	for _, r := range app.requests {
+		if r.ConnectionID == connID && r.Command == command {
+			return r, true
+		}
+	}
+	return CommandRequest{}, false
+}
+
+// TestDisconnectCancelsBypassedMCPRun: an approval-bypassed run is tracked
+// like a GUI-approved one, so DisconnectConnection cancels it; it is recorded
+// as auto_failed / canceled (a disconnect, not an interruption).
+func TestDisconnectCancelsBypassedMCPRun(t *testing.T) {
+	app, _ := newSessTestApp(t)
+	srv := newSSHTestServer(t)
+	conn := addTrustedConnection(t, app, srv.Connection("lab"))
+	app.setAgentApprovalBypass("trusted", true)
+	issueAgentToken(t, app, "trusted")
+
+	answer := make(chan any, 1)
+	go func() {
+		out, _ := app.executeCommandTool(context.Background(), mcpCaller{Agent: "trusted"},
+			executeCommandArgs{Host: "lab", Command: "sleep 30", AgentName: "trusted"})
+		answer <- out
+	}()
+	sessWaitFor(t, 3*time.Second, "running=1", func() bool { return sessSummary(t, app, conn.ID).Running == 1 })
+	if r := app.DisconnectConnection(conn.ID); !strings.Contains(r.Message, "実行中コマンド 1 件") {
+		t.Fatalf("disconnect: %+v", r)
+	}
+	select {
+	case <-answer:
+	case <-time.After(2 * time.Second):
+		t.Fatal("bypassed run was not cancelled by DisconnectConnection")
+	}
+	got, _ := bypassedRequest(app, conn.ID, "sleep 30")
+	if got.Status != stateAutoFailed || got.ErrorKind != "canceled" {
+		t.Fatalf("request status=%s kind=%s, want auto_failed/canceled", got.Status, got.ErrorKind)
+	}
+	if app.runningTotal.Load() != 0 {
+		t.Fatalf("runningTotal=%d after cancel", app.runningTotal.Load())
+	}
+}
+
+// TestClientGoneInterruptsBypassedRun: while the agent waits synchronously,
+// an HTTP disconnect cancels the run (errClientGone) and it is recorded as
+// interrupted.
+func TestClientGoneInterruptsBypassedRun(t *testing.T) {
+	app, _ := newSessTestApp(t)
+	srv := newSSHTestServer(t)
+	conn := addTrustedConnection(t, app, srv.Connection("lab"))
+	app.setAgentApprovalBypass("trusted", true)
+	issueAgentToken(t, app, "trusted")
+
+	httpCtx, hangUp := context.WithCancel(context.Background())
+	answer := make(chan any, 1)
+	go func() {
+		out, _ := app.executeCommandTool(httpCtx, mcpCaller{Agent: "trusted"},
+			executeCommandArgs{Host: "lab", Command: "sleep 30", AgentName: "trusted"})
+		answer <- out
+	}()
+	sessWaitFor(t, 3*time.Second, "running=1", func() bool { return app.runningTotal.Load() == 1 })
+	hangUp()
+	<-answer
+	sessWaitFor(t, 2*time.Second, "interrupted", func() bool {
+		got, _ := bypassedRequest(app, conn.ID, "sleep 30")
+		return got.Status == stateInterrupted && got.ErrorKind == "canceled"
+	})
+	sessWaitFor(t, time.Second, "running=0", func() bool { return app.runningTotal.Load() == 0 })
 }

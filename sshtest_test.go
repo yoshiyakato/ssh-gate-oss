@@ -30,18 +30,31 @@ const (
 //
 // Every exec is appended to execLog. It also serves interactive shells
 // (pty-req, window-change, shell; see runTestShell), and KillAll drops every
-// client connection while it keeps listening.
+// client connection while it keeps listening. RotateHostKey swaps the host
+// key for later connections, to exercise known_hosts mismatch handling.
 type sshTestServer struct {
 	listener net.Listener
-	config   *ssh.ServerConfig
 
 	mu       sync.Mutex
+	signer   ssh.Signer
 	execLog  []string
 	conns    []net.Conn
 	ptySizes []string // "pty 132x40", "win 100x30"
 }
 
 func newSSHTestServer(t *testing.T) *sshTestServer {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &sshTestServer{listener: listener, signer: newTestHostKey(t)}
+	go s.serve()
+	t.Cleanup(s.Close)
+	return s
+}
+
+func newTestHostKey(t *testing.T) ssh.Signer {
 	t.Helper()
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -51,6 +64,28 @@ func newSSHTestServer(t *testing.T) *sshTestServer {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return signer
+}
+
+// RotateHostKey replaces the host key (same algorithm) for new connections
+// and returns the new public key.
+func (s *sshTestServer) RotateHostKey(t *testing.T) ssh.PublicKey {
+	t.Helper()
+	signer := newTestHostKey(t)
+	s.mu.Lock()
+	s.signer = signer
+	s.mu.Unlock()
+	return signer.PublicKey()
+}
+
+// HostKey is the public key currently presented to clients.
+func (s *sshTestServer) HostKey() ssh.PublicKey {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.signer.PublicKey()
+}
+
+func (s *sshTestServer) serverConfig() *ssh.ServerConfig {
 	config := &ssh.ServerConfig{
 		PasswordCallback: func(meta ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
 			if meta.User() == sshTestUser && string(password) == sshTestPassword {
@@ -59,15 +94,10 @@ func newSSHTestServer(t *testing.T) *sshTestServer {
 			return nil, fmt.Errorf("denied")
 		},
 	}
-	config.AddHostKey(signer)
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := &sshTestServer{listener: listener, config: config}
-	go s.serve()
-	t.Cleanup(s.Close)
-	return s
+	s.mu.Lock()
+	config.AddHostKey(s.signer)
+	s.mu.Unlock()
+	return config
 }
 
 func (s *sshTestServer) Close() {
@@ -148,7 +178,7 @@ func (s *sshTestServer) serve() {
 }
 
 func (s *sshTestServer) handleConn(nc net.Conn) {
-	_, chans, reqs, err := ssh.NewServerConn(nc, s.config)
+	_, chans, reqs, err := ssh.NewServerConn(nc, s.serverConfig())
 	if err != nil {
 		_ = nc.Close()
 		return
