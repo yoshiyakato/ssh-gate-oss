@@ -523,7 +523,10 @@ func TestEventsExitRetention(t *testing.T) {
 // snapshotting, or this deadlocks. Run with -race.
 func TestEventsNoDeadlockWithSessionsLock(t *testing.T) {
 	var sessionsMu sync.Mutex
-	h, srv := newTestHub(t, hubConfig{}, func() sessionsPayload {
+	// The publishers never pause, so with the default queue a reader can be
+	// cut as "slow" (by design) before it reads its events; this test is
+	// about deadlocks, so give the readers room.
+	h, srv := newTestHub(t, hubConfig{ClientQueue: 1 << 20, ClientBytes: 1 << 30}, func() sessionsPayload {
 		sessionsMu.Lock()
 		defer sessionsMu.Unlock()
 		return sessionsPayload{}
