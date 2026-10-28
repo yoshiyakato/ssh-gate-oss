@@ -80,8 +80,6 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm test
       - run: npm run build
-      # npm dependency audit (#54). Non-blocking until vite is bumped to
-      # >= 8.1.6 in package-lock.json; drop continue-on-error after that.
+      # npm dependency audit (#54).
       - name: npm audit
-        continue-on-error: true
         run: npm audit --audit-level=high
