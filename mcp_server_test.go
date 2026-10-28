@@ -512,6 +512,172 @@ func TestBypassPolicyLimits(t *testing.T) {
 	}
 }
 
+// setApprovalRules sets the three RequireApproval* switches in memory, the
+// way a saved MCP setting would apply to the next execute_command.
+func setApprovalRules(app *App, writeOp, sudo, prod bool) {
+	app.mu.Lock()
+	app.mcp.RequireApprovalWriteOp = writeOp
+	app.mcp.RequireApprovalSudo = sudo
+	app.mcp.RequireApprovalProd = prod
+	app.mu.Unlock()
+}
+
+// bypassExec runs execute_command as the bypass agent "trusted" on "lab".
+func bypassExec(t *testing.T, app *App, token string, args map[string]any) map[string]any {
+	t.Helper()
+	args["host"] = "lab"
+	args["agent_name"] = "trusted"
+	body, _ := json.Marshal(args)
+	out, _ := callToolAuth(t, app, token, "execute_command", string(body))
+	return out
+}
+
+// TestHighAlwaysQueuesWithRulesOff (#55): "High always needs approval" holds
+// on its own. With every RequireApproval* switch off, a High command from an
+// agent with a bypass grant stays pending and never reaches SSH. Under the
+// default settings RequireApprovalWriteOp alone would queue it, hiding a
+// broken High check.
+func TestHighAlwaysQueuesWithRulesOff(t *testing.T) {
+	app := newTestApp(t)
+	srv, token := bypassAgent(t, app)
+	setApprovalRules(app, false, false, false)
+
+	if out := bypassExec(t, app, token, map[string]any{"command": "echo ok"}); out["state"] != stateAutoSucceeded {
+		t.Fatalf("low risk should auto-run with the rules off: %v", out)
+	}
+	before := len(srv.Execs())
+	out := bypassExec(t, app, token, map[string]any{"command": "rm -rf /tmp/x"})
+	if out["state"] != statePending || out["risk"] != "High" || out["auto_executed"] == true {
+		t.Fatalf("High must queue even with every rule off: %v", out)
+	}
+	if execs := srv.Execs(); len(execs) != before {
+		t.Fatalf("High command ran without approval: %v", execs)
+	}
+	id, _ := out["request_id"].(string)
+	if req, ok := app.findRequest(id); !ok || req.Status != statePending {
+		t.Fatalf("High request not left pending: %+v", req)
+	}
+}
+
+// TestPolicyNeverAllowsHigh (#55): the grant itself never covers High,
+// whatever max_risk was stored, scoped or not.
+func TestPolicyNeverAllowsHigh(t *testing.T) {
+	now := time.Now()
+	for _, maxRisk := range []string{"", "Low", "Medium", "High", "bogus"} {
+		for _, scope := range [][]string{nil, {"c1"}} {
+			p := fillPolicyDefaults(AgentPolicy{AgentName: "a", ApprovalBypass: true, ScopeConnIDs: scope}, now)
+			p.MaxRisk = maxRisk // as if stored without normalisation
+			if policyAllows(p, "High", "c1", now) {
+				t.Fatalf("policy max_risk=%q scope=%v allowed High", maxRisk, scope)
+			}
+			if !policyAllows(p, "Low", "c1", now) {
+				t.Fatalf("policy max_risk=%q scope=%v refused Low (fixture broken)", maxRisk, scope)
+			}
+		}
+	}
+}
+
+// TestSudoRuleQueuesOnItsOwn (#46): with RequireApprovalWriteOp off, only
+// the sudo rule stands between a bypass agent and `sudo ...`. Under the
+// default settings the WriteOp rule would queue it first and hide the sudo
+// rule.
+func TestSudoRuleQueuesOnItsOwn(t *testing.T) {
+	app := newTestApp(t)
+	srv, token := bypassAgent(t, app)
+	setApprovalRules(app, false, true, false)
+
+	before := len(srv.Execs())
+	for _, command := range []string{"sudo echo x", "echo a; sudo echo b", "true && sudo echo c"} {
+		out := bypassExec(t, app, token, map[string]any{"command": command})
+		if out["state"] != statePending || out["auto_executed"] == true {
+			t.Fatalf("%q must queue under the sudo rule: %v", command, out)
+		}
+	}
+	if execs := srv.Execs(); len(execs) != before {
+		t.Fatalf("sudo command ran without approval: %v", execs)
+	}
+	if out := bypassExec(t, app, token, map[string]any{"command": "echo ok"}); out["state"] != stateAutoSucceeded {
+		t.Fatalf("non-sudo low risk should still auto-run: %v", out)
+	}
+}
+
+// TestForceQueueOverridesBypass (#57): force_queue:true queues a command the
+// agent's grant would otherwise auto-run.
+func TestForceQueueOverridesBypass(t *testing.T) {
+	app := newTestApp(t)
+	srv, token := bypassAgent(t, app)
+	setApprovalRules(app, false, false, false)
+
+	out := bypassExec(t, app, token, map[string]any{"command": "echo ok", "force_queue": true})
+	if out["state"] != statePending || out["auto_executed"] == true {
+		t.Fatalf("force_queue must queue: %v", out)
+	}
+	if execs := srv.Execs(); len(execs) != 0 {
+		t.Fatalf("force_queue command ran without approval: %v", execs)
+	}
+	if out := bypassExec(t, app, token, map[string]any{"command": "echo ok", "force_queue": false}); out["state"] != stateAutoSucceeded {
+		t.Fatalf("force_queue:false should auto-run: %v", out)
+	}
+}
+
+// TestApproveRefusesRiskIncreaseUnlessConfirmed (#56): a human edit that
+// raises the risk is refused by ApproveCommand and
+// ApproveCommandAndBypassAgent (Code=risk_increased, nothing runs, request
+// stays pending, no grant), and runs only through ApproveCommandConfirmed.
+func TestApproveRefusesRiskIncreaseUnlessConfirmed(t *testing.T) {
+	app := newTestApp(t)
+	enableBearer(t, app)
+	srv := newSSHTestServer(t)
+	conn := addTrustedConnection(t, app, srv.Connection("lab"))
+	const edited = "rm -rf /tmp/x"
+	req := queueOn(t, app, conn, "echo hi", "editor-agent")
+	if req.Risk == "High" {
+		t.Fatalf("fixture: %q must not be High", req.Command)
+	}
+
+	if r := app.ApproveCommand(req.ID, edited); r.OK || r.Code != "risk_increased" {
+		t.Fatalf("ApproveCommand with a riskier edit: %+v", r)
+	}
+	if r := app.ApproveCommandAndBypassAgent(req.ID, edited); r.OK || r.Code != "risk_increased" {
+		t.Fatalf("ApproveCommandAndBypassAgent with a riskier edit: %+v", r)
+	}
+	if execs := srv.Execs(); len(execs) != 0 {
+		t.Fatalf("riskier edit ran without confirmation: %v", execs)
+	}
+	if got, _ := app.findRequest(req.ID); got.Status != statePending || got.ExecutedCommand != "" {
+		t.Fatalf("refused approval changed the request: %+v", got)
+	}
+	if app.agentApprovalBypassEnabled("editor-agent") {
+		t.Fatalf("bypass granted although the approval was refused")
+	}
+
+	if r := app.ApproveCommandConfirmed(req.ID, edited); !r.OK {
+		t.Fatalf("confirmed approval failed: %+v", r)
+	}
+	if execs := srv.Execs(); len(execs) != 1 || execs[0] != edited {
+		t.Fatalf("confirmed edit did not run as edited: %v", execs)
+	}
+	got, _ := app.findRequest(req.ID)
+	if got.ExecutedCommand != edited || got.ApprovedRisk != "High" || got.Command != "echo hi" {
+		t.Fatalf("confirmed edit not audited: %+v", got)
+	}
+}
+
+// TestApproveAllowsLowerRiskEdit (#56): an edit that does not raise the risk
+// runs through plain ApproveCommand, as edited.
+func TestApproveAllowsLowerRiskEdit(t *testing.T) {
+	app := newTestApp(t)
+	srv := newSSHTestServer(t)
+	conn := addTrustedConnection(t, app, srv.Connection("lab"))
+	req := queueOn(t, app, conn, "rm -rf /tmp/a", "agent")
+	if r := app.ApproveCommand(req.ID, "echo b"); !r.OK {
+		t.Fatalf("lower-risk edit refused: %+v", r)
+	}
+	if execs := srv.Execs(); len(execs) != 1 || execs[0] != "echo b" {
+		t.Fatalf("edit did not run as edited: %v", execs)
+	}
+}
+
 // statusOf runs get_request_status for one id and returns its entry.
 func statusOf(t *testing.T, app *App, id string, waitSeconds int) map[string]any {
 	t.Helper()
