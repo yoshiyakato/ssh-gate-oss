@@ -526,3 +526,25 @@ describe('approve / reject handlers', () => {
     expect(await click('.card-footer [data-action="delete-command-request"]')).toBe(false);
   });
 });
+
+describe('AI session lines (phase7 §3.7, §8.2)', () => {
+  it('makes the command read-only and asks main.js for the context box', async () => {
+    makeCtx('en');
+    ctx.mountAILineContext = vi.fn((slot) => { slot.textContent = 'ctx-box'; });
+    state.data.requests = [request('REQ-1', { sessionId: 'AIS-AAAAAAAAAAAAAAAAAAAAAAAAAA', sessionSeq: 2 })];
+    await render();
+    const textarea = root.querySelector('#approval-command');
+    expect(textarea.hasAttribute('readonly')).toBe(true);
+    expect(ctx.mountAILineContext).toHaveBeenCalledWith(expect.any(HTMLElement), 'REQ-1');
+    expect(root.querySelector('.ai-line-context-slot').textContent).toBe('ctx-box');
+  });
+
+  it('leaves ordinary requests editable', async () => {
+    makeCtx('en');
+    ctx.mountAILineContext = vi.fn();
+    state.data.requests = [request('REQ-2')];
+    await render();
+    expect(root.querySelector('#approval-command').hasAttribute('readonly')).toBe(false);
+    expect(ctx.mountAILineContext).not.toHaveBeenCalled();
+  });
+});

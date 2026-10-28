@@ -8,12 +8,13 @@
 
 import { escapeHtml } from './model.js';
 
-export const PAGES = ['connections', 'commands', 'terminal', 'settings'];
+export const PAGES = ['connections', 'commands', 'terminal', 'aisessions', 'settings'];
 
 const NAV_ICONS = {
   connections: 'bi-hdd-network',
   commands: 'bi-terminal',
   terminal: 'bi-terminal-fill',
+  aisessions: 'bi-robot',
   settings: 'bi-broadcast-pin',
 };
 
@@ -21,6 +22,7 @@ export function pageTitle(active, t) {
   if (active === 'connections') return t('nav.connections');
   if (active === 'commands') return t('nav.commands');
   if (active === 'terminal') return t('nav.terminal');
+  if (active === 'aisessions') return t('nav.aisessions');
   return t('title.settings');
 }
 

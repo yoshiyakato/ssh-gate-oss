@@ -90,3 +90,21 @@ describe('handleSidebarClick', () => {
     expect(await handleSidebarClick({ target: lang }, ctx)).toBe(false);
   });
 });
+
+describe('AI sessions line (phase7 §8.1)', () => {
+  const T = (key, vars) => interpolate(({ 'side.aiSessions': 'AI sessions {n} ({p} awaiting approval)', 'side.aiSessionsOnly': 'AI sessions {n}' })[key] ?? tFor('en')(key, vars), vars);
+  it('shows the counts and hides the line when off and empty', () => {
+    document.body.innerHTML = renderSidebarStatus(baseData([], { aiSessions: { open: 2, pendingApproval: 1, enabled: true } }), { t: T, lang: 'en', now: NOW });
+    const line = document.querySelector('[data-action="side-aisessions"]');
+    expect(line.textContent).toContain('AI sessions 2 (1 awaiting approval)');
+    document.body.innerHTML = renderSidebarStatus(baseData([], { aiSessions: { open: 0, pendingApproval: 0, enabled: false } }), { t: T, lang: 'en', now: NOW });
+    expect(document.querySelector('[data-action="side-aisessions"]')).toBeNull();
+  });
+  it('navigates to the AI sessions page', async () => {
+    document.body.innerHTML = '<button data-action="side-aisessions">x</button>';
+    const navigate = vi.fn(async () => true);
+    const event = { target: document.querySelector('button') };
+    expect(await handleSidebarClick(event, { navigate })).toBe(true);
+    expect(navigate).toHaveBeenCalledWith('aisessions');
+  });
+});

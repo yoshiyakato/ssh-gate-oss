@@ -4,6 +4,7 @@
 // #page-root or #terminal-dock, so the 5s poll and sessions:changed can redraw
 // it freely while xterm instances stay mounted.
 
+import { renderSidebarAISessions } from './aisessions.js';
 import {
   connStateLabelKey,
   connStateSymbol,
@@ -172,6 +173,7 @@ function renderMCPSection(data, t) {
   <div class="side-section-title">${escapeHtml(t('side.agentsTitle'))}</div>
   <div class="side-mcp-line is-${code}"${title}>MCP <span class="side-symbol" aria-hidden="true">${MCP_SYMBOLS[code]}</span> <span>${escapeHtml(t(`side.mcp.${code}`))}</span>${address ? ` <span class="side-meta">${escapeHtml(address)}</span>` : ''}</div>
   <div class="side-mcp-line">${escapeHtml(t('side.activeAgents', { n: Number(mcp.connectedAgents) || 0 }))}</div>
+  ${renderSidebarAISessions(data?.aiSessions, t)}
   <button type="button" class="side-more side-pending" data-action="side-approvals">${escapeHtml(t('side.pending', { n: pending }))} <span aria-hidden="true">→</span></button>
 </section>`;
 }
@@ -275,6 +277,10 @@ export async function handleSidebarClick(event, ctx) {
   }
   if (action === 'side-approvals') {
     await ctx.navigate('commands');
+    return true;
+  }
+  if (action === 'side-aisessions') {
+    await ctx.navigate('aisessions');
     return true;
   }
   return false;

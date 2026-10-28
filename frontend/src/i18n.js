@@ -13,6 +13,7 @@ import { AGENTS_I18N } from './agents.js';
 import { SERVERTABS_I18N } from './servertabs.js';
 import { SHORTCUTS_I18N } from './shortcuts.js';
 import { CREDENTIALS_I18N } from './credentials.js';
+import { AI_SESSIONS_I18N } from './aisessions.js';
 
 export const BASE_I18N = {
   ja: {
@@ -318,4 +319,5 @@ export const I18N = mergeI18n(
   SERVERTABS_I18N,
   SHORTCUTS_I18N,
   CREDENTIALS_I18N,
+  AI_SESSIONS_I18N,
 );

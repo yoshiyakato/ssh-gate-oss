@@ -320,6 +320,9 @@ func runTestShell(ch ssh.Channel, record func(string)) int {
 }
 
 func (s *sshTestServer) run(ch ssh.Channel, command string) int {
+	if command == aiExecCommand(aiShellSh) { // AI session exec mode (sshtest_aisession_test.go)
+		return runAITestSh(ch)
+	}
 	name, arg, _ := strings.Cut(command, " ")
 	switch name {
 	case "echo":

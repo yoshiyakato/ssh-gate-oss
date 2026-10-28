@@ -433,6 +433,14 @@ function agentLine(selected, ctx) {
     ] : null);
 }
 
+// aiLineContextSlot is the box with the AI session context of a line
+// (phase7 §3.7); main.js fills it through ctx.mountAILineContext.
+function aiLineContextSlot(selected, ctx) {
+  const slot = el('div', { class: 'ai-line-context-slot', dataset: { requestId: selected.id } });
+  ctx.mountAILineContext?.(slot, selected.id);
+  return slot;
+}
+
 function terminalPanel(title, content, error = false) {
   return el('div', { class: 'col-12 col-lg-6' },
     el('div', { class: `terminal-panel${error ? ' terminal-error' : ''}` },
@@ -452,13 +460,15 @@ export function commandDetail(selected, ctx) {
         class: 'form-control font-monospace',
         id: 'approval-command',
         dataset: { requestId: selected.id },
+        // A line of an AI session cannot be edited (phase7 §3.6, §8.2).
+        readonly: selected.sessionId ? true : undefined,
         rows: 3,
         spellcheck: 'false',
         autocapitalize: 'none',
         autocorrect: 'off',
         value: selected.command ?? '',
       }),
-      el('div', { class: 'form-text', text: t('cmd.editHint') }),
+      el('div', { class: 'form-text', text: selected.sessionId ? t('approval.aiReadonly') : t('cmd.editHint') }),
     ]
     : [
       el('pre', { class: 'command-block' }, el('code', { text: executed || selected.command || '' })),
@@ -469,6 +479,7 @@ export function commandDetail(selected, ctx) {
     agentLine(selected, ctx),
     metaLine(selected, t),
     pending ? targetPanel(selected.id, cachedTarget(state, selected.id), t) : null,
+    selected.sessionId ? aiLineContextSlot(selected, ctx) : null,
     el('div', { class: 'mb-3' },
       el('div', { class: 'd-flex justify-content-between align-items-center mb-2' },
         el('h5', { class: 'fw-bold mb-0', text: t('cmd.plannedCommand') }),

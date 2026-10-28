@@ -69,6 +69,10 @@ import { ALL_SERVERS, normalizeServerFilter, renderServerTabs, renderShellSubtab
 import { createShortcutHandler, cycleIndex, cycleServer, detectPlatform, resolveTabIndex } from './shortcuts.js';
 import { deriveServerView, loadServerFilter, saveServerFilter } from './serverview.js';
 import { handleCredentialsClick, mountKeychainNotices, recoverCredential } from './credentials.js';
+import {
+  aiSessionsBusy, disposeAISessionViewer, handleAISessionsClick, onAISessionData, onAISessionsChanged,
+  renderAILineContext, renderAISessionsPage,
+} from './aisessions.js';
 
 document.body.className = 'layout-fixed sidebar-expand-lg bg-body-tertiary';
 
@@ -198,6 +202,8 @@ const ctx = {
   // needs_password / keyring_unavailable (phase5-keychain §8).
   recoverCredential: (conn, result, opts) => recoverCredential(ctx, conn, result, opts),
   startErrorMessage: (result) => startErrorMessage(result),
+  // approvals.js: the context box of a line of an AI session (phase7 §3.7).
+  mountAILineContext: (slot, requestId) => mountAILineContext(slot, requestId),
   terminalKeyHandler: null, // set below, before initTerminalTabs
 };
 
@@ -421,6 +427,7 @@ function renderPage() {
   if (state.active === 'connections') root.innerHTML = renderConnectionsPage(state, ctx);
   else if (state.active === 'commands') renderCommandsPage(root, ctx, view);
   else if (state.active === 'terminal') root.innerHTML = renderTerminalScreen(view);
+  else if (state.active === 'aisessions') renderAISessionsPage(root, ctx);
   else {
     root.innerHTML = renderSettings();
     mountKeychainNotices(root.querySelector('#keychain-notices'), ctx);
@@ -450,7 +457,19 @@ function pageIsBusy() {
   if (state.active === 'connections') return editorHasFocus();
   if (state.active === 'settings') return state.dirty.settings || agentsSectionBusy();
   if (state.active === 'commands') return state.dirty.approval;
+  if (state.active === 'aisessions') return aiSessionsBusy();
   return false;
+}
+
+async function mountAILineContext(slot, requestId) {
+  const fn = globalThis.window?.go?.main?.App?.GetAISessionLineContext;
+  if (typeof fn !== 'function' || !slot) return;
+  try {
+    const lineCtx = await fn(requestId);
+    if (slot.isConnected && lineCtx?.found) slot.replaceChildren(renderAILineContext(lineCtx, t));
+  } catch {
+    // The box is optional; the request itself is still shown.
+  }
 }
 
 // ---------------------------------------------------------- server filter
@@ -614,6 +633,7 @@ function applySessions(next) {
   state.data.sessions = next.sessions ?? [];
   state.data.terminals = next.terminals ?? [];
   state.data.runningTotal = next.runningTotal ?? 0;
+  state.data.aiSessions = next.aiSessions ?? state.data.aiSessions;
   return true;
 }
 
@@ -688,6 +708,17 @@ function pollData() {
   refreshData({ silent: true, poll: true });
 }
 
+// AI sessions (phase7 §8.3): raw output for the read-only viewer and list
+// changes. The sidebar count comes with sessions:changed.
+EventsOn('aisession:data', onAISessionData);
+EventsOn('aisessions:changed', (payload) => {
+  onAISessionsChanged(payload);
+  if (payload?.counts) {
+    state.data.aiSessions = payload.counts;
+    renderSidebar();
+  }
+});
+
 EventsOn('sessions:changed', (payload) => {
   if (!applySessions(payload)) return;
   reconcileServerFilter({ reason: 'sessions' });
@@ -713,6 +744,7 @@ async function navigate(page) {
     forgetIssuedAgentToken();
   }
   if (state.active === 'commands') state.dirty.approval = false;
+  if (state.active === 'aisessions') disposeAISessionViewer();
   state.active = page;
   renderHeader();
   renderNav();
@@ -1118,6 +1150,7 @@ app.addEventListener('click', async (event) => {
   if (state.active === 'connections' && await handleEditorClick(event, ctx)) return;
   if (state.active === 'terminal' && await handleTerminalClick(event, ctx)) return;
   if (state.active === 'commands' && await handleApprovalsClick(event, ctx, currentView())) return;
+  if (state.active === 'aisessions' && await handleAISessionsClick(event, ctx)) return;
   if (state.active === 'settings' && await handleAgentsClick(event, ctx)) return;
   if (state.active === 'settings' && await handleCredentialsClick(event, ctx)) return;
 

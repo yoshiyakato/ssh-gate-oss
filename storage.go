@@ -28,7 +28,7 @@ import (
 // (phase5-keychain.md); the passwords themselves move out of the credential
 // column in migrateCredentialsToKeyring, which needs a SecretStore and so
 // runs after openStore.
-const schemaVersion = 4
+const schemaVersion = aiSessionSchemaVersion // 5: ai_session_* tables (REQ-016)
 
 var errStoreUnavailable = errors.New("SQLiteストアが初期化されていないため保存できません")
 
@@ -281,6 +281,9 @@ func (s *Store) migrate() error {
 		if _, err := tx.Exec(statement); err != nil {
 			return err
 		}
+	}
+	if err := migrateAISessionTables(tx); err != nil { // v5: AI sessions (REQ-016)
+		return err
 	}
 	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
 		return err
@@ -1233,6 +1236,11 @@ type historyFilter struct {
 	State        string
 	RequestedBy  string
 	Limit        int
+	// SessionViewer hides the lines of AI sessions (ai_session_lines) that
+	// another agent sent: only their owner may see them (REQ-016 isolation).
+	// HideSessionLines turns that on; SessionViewer "" then hides them all.
+	HideSessionLines bool
+	SessionViewer    string
 }
 
 // historyColumns is requestColumns with stdout/stderr blanked: the history
@@ -1268,6 +1276,10 @@ func (s *Store) loadCommandHistory(f historyFilter) ([]CommandRequest, error) {
 	if f.RequestedBy != "" {
 		where = append(where, `requested_by = ?`)
 		args = append(args, f.RequestedBy)
+	}
+	if f.HideSessionLines {
+		where = append(where, `(requested_by = ? OR id NOT IN (SELECT request_id FROM ai_session_lines))`)
+		args = append(args, f.SessionViewer)
 	}
 	query := `SELECT ` + historyColumns + ` FROM command_requests`
 	if len(where) > 0 {

@@ -218,6 +218,10 @@ type CommandRequest struct {
 	// TargetFP is user@host:port of the connection when the request was
 	// made, so the approval screen can show whether the target changed since.
 	TargetFP string `json:"targetFp"`
+	// SessionID / SessionSeq tie a line of an AI session to its session
+	// (REQ-016). Memory only: filled from ai_session_lines at startup.
+	SessionID  string `json:"sessionId,omitempty"`
+	SessionSeq int    `json:"sessionSeq,omitempty"`
 }
 
 // AgentPolicy is an approval-bypass grant. It only takes effect for requests
@@ -323,6 +327,7 @@ type DashboardData struct {
 	Terminals       []TerminalInfo   `json:"terminals"`
 	RunningTotal    int              `json:"runningTotal"`
 	SessionsSeq     uint64           `json:"sessionsSeq"`
+	AISessions      AISessionCounts  `json:"aiSessions"`
 }
 
 // SessionSummary is the live runtime state of one saved connection (§5.4
@@ -348,6 +353,7 @@ type sessionsPayload struct {
 	Terminals    []TerminalInfo   `json:"terminals"`
 	RunningTotal int              `json:"runningTotal"`
 	SessionsSeq  uint64           `json:"sessionsSeq"`
+	AISessions   AISessionCounts  `json:"aiSessions"`
 }
 
 // Connection runtime states (§5.4). idle / available / missing belong to
@@ -450,6 +456,7 @@ func NewApp() *App {
 		if err := store.recoverInterruptedRequests(); err != nil {
 			log.Printf("recover interrupted requests: %v", err)
 		}
+		app.initAISessions(store) // REQ-016: app_restart recovery before requests load
 		app.conns, err = store.loadConnections()
 		if err != nil {
 			log.Printf("load connections from sqlite: %v", err)
@@ -488,6 +495,7 @@ func NewApp() *App {
 		if err != nil {
 			log.Printf("load command requests from sqlite: %v", err)
 		}
+		app.loadAISessionLinks(store)
 		policies, err := store.loadAgentPolicies()
 		if err != nil {
 			log.Printf("load agent policies from sqlite: %v", err)
@@ -527,6 +535,7 @@ func NewApp() *App {
 		app.wg.Add(1)
 		go app.runSecretGCLoop(app.appCtx)
 	}
+	app.startAISessionLoops()
 	return app
 }
 
@@ -568,11 +577,13 @@ func (a *App) shutdown(ctx context.Context) {
 	a.cancelExecs(func(runningExec) bool { return true }, errShuttingDown)
 	a.stopMCPServer(ctx)
 	a.drainMCPCommands(shutdownExecGrace)
+	a.closeAllAISessions(aiCloseAppShutdown, 2*time.Second)
 	a.CloseAllTerminals()
 	a.wg.Wait()
 	if err := a.store.Close(); err != nil {
 		log.Printf("close sqlite store: %v", err)
 	}
+	a.forgetAISessions()
 }
 
 // drainMCPCommands is shutdown step 2 (§5.0). It closes execution intake
@@ -640,6 +651,7 @@ func (a *App) GetInitialData() DashboardData {
 	data.Terminals = snapshot.Terminals
 	data.RunningTotal = snapshot.RunningTotal
 	data.SessionsSeq = snapshot.SessionsSeq
+	data.AISessions = snapshot.AISessions
 	return data
 }
 
@@ -661,6 +673,7 @@ func (a *App) sessionsSnapshotLocked() sessionsPayload {
 		Terminals:    terminals,
 		RunningTotal: int(a.runningTotal.Load()),
 		SessionsSeq:  a.sessionsSeq.Add(1),
+		AISessions:   a.aiSessionCounts(),
 	}
 }
 
@@ -1013,11 +1026,12 @@ func (a *App) DisconnectConnection(id string) ActionResult {
 	}
 	k := a.closeTerminalsForConnection(conn.ID)
 	j := a.cancelExecsForConnection(conn.ID, errDisconnected)
+	n := a.closeAISessionsForConnection(conn.ID, aiCloseDisconnected)
 	a.sessionsChanged()
 	return ActionResult{
 		OK:      true,
 		ID:      conn.ID,
-		Message: fmt.Sprintf("%s を切断しました（ターミナル %d 件・実行中コマンド %d 件を終了）", conn.Name, k, j),
+		Message: fmt.Sprintf("%s を切断しました（ターミナル %d 件・実行中コマンド %d 件を終了）", conn.Name, k, j) + aiSessionDisconnectNote(n),
 	}
 }
 
@@ -1237,6 +1251,7 @@ func (a *App) DeleteConnection(id string) ActionResult {
 		a.sessionSecrets.deletePrefix(connSecretPrefix(conn.ID))
 	}
 	a.closeTerminalsForConnection(conn.ID)
+	a.closeAISessionsForConnection(conn.ID, aiCloseConnDeleted)
 
 	a.mu.Lock()
 	next := make([]Connection, 0, len(a.conns))

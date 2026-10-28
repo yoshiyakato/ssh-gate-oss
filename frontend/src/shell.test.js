@@ -52,7 +52,7 @@ describe('renderSkeleton', () => {
   it('renders nav with the active page and a pending badge', () => {
     const html = renderNav('commands', tFor('en'), { commands: 3 });
     document.body.innerHTML = html;
-    expect(document.querySelectorAll('[data-nav]')).toHaveLength(4);
+    expect(document.querySelectorAll('[data-nav]')).toHaveLength(5);
     expect(document.querySelector('[data-nav="commands"]').classList.contains('active')).toBe(true);
     expect(document.querySelector('[data-nav="commands"] .nav-badge').textContent).toBe('3');
     expect(document.querySelector('[data-nav="terminal"] .nav-badge')).toBeNull();

@@ -114,15 +114,49 @@ func (rt *mcpRuntime) lockKey(key string) func() {
 // returns once any reaches a final state or is unknown, when wait elapses, or
 // when the HTTP request ends. The pending → running step alone does not end
 // the wait, so an approved command's output arrives in the same call.
-func (a *App) requestStatus(ctx context.Context, ids []string, wait time.Duration, includeOutput bool) []map[string]any {
+func (a *App) requestStatus(ctx context.Context, caller mcpCaller, ids []string, wait time.Duration, includeOutput bool) []map[string]any {
 	deadline := time.Now().Add(wait)
 	for {
 		remaining := time.Until(deadline)
 		entries := a.waitForRequests(ctx, ids, remaining)
 		if remaining <= 0 || ctx.Err() != nil || lookupsSettled(entries) {
-			return a.lookupViews(entries, includeOutput)
+			return a.lookupViews(caller, entries, includeOutput)
 		}
 	}
+}
+
+// isAISessionLine reports whether req is a line of an AI session: by the
+// field filled in memory, the line registry, or ai_session_lines.
+func (a *App) isAISessionLine(req CommandRequest) bool {
+	if a.isAISessionLineLocked(req) {
+		return true
+	}
+	if a.store != nil {
+		if _, ok, err := a.store.loadAISessionLine(req.ID); err != nil || ok {
+			return true // fail closed on a storage error
+		}
+	}
+	return false
+}
+
+// isAISessionLineLocked is isAISessionLine without SQLite; it takes no App
+// lock, so callers may hold a.mu.
+func (a *App) isAISessionLineLocked(req CommandRequest) bool {
+	if req.SessionID != "" {
+		return true
+	}
+	_, ok := a.aiLineLink(req.ID)
+	return ok
+}
+
+// mayReadRequest applies the AI session owner check (REQ-016 §2.1) to the
+// request read paths: a session line is visible only to the agent token that
+// sent it. Other requests keep their earlier visibility.
+func (a *App) mayReadRequest(caller mcpCaller, req CommandRequest) bool {
+	if caller.Agent != "" && caller.Agent == req.RequestedBy {
+		return true
+	}
+	return !a.isAISessionLine(req)
 }
 
 // lookupsSettled reports whether any entry is unknown or final.
@@ -137,7 +171,7 @@ func lookupsSettled(entries []requestLookup) bool {
 
 // lookupViews renders status entries. IDs no longer held in memory (older
 // than the loaded window) are read from SQLite.
-func (a *App) lookupViews(entries []requestLookup, includeOutput bool) []map[string]any {
+func (a *App) lookupViews(caller mcpCaller, entries []requestLookup, includeOutput bool) []map[string]any {
 	views := make([]map[string]any, 0, len(entries))
 	for _, entry := range entries {
 		if !entry.Found && a.store != nil {
@@ -145,7 +179,9 @@ func (a *App) lookupViews(entries []requestLookup, includeOutput bool) []map[str
 				entry.Found, entry.Request = true, req
 			}
 		}
-		if !entry.Found {
+		// Another agent's AI session line looks like an unknown ID: its
+		// output and session ID belong to its owner alone.
+		if !entry.Found || !a.mayReadRequest(caller, entry.Request) {
 			views = append(views, map[string]any{"request_id": entry.ID, "error_kind": "not_found", "message": "request not found"})
 			continue
 		}
@@ -193,6 +229,9 @@ func (a *App) commandHistory(f historyFilter) ([]CommandRequest, error) {
 			continue
 		}
 		if f.RequestedBy != "" && req.RequestedBy != f.RequestedBy {
+			continue
+		}
+		if f.HideSessionLines && req.RequestedBy != f.SessionViewer && a.isAISessionLineLocked(req) {
 			continue
 		}
 		req.Stdout, req.Stderr = "", ""
