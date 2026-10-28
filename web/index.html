@@ -177,10 +177,9 @@
   h3.v1-group { display: flex; align-items: center; gap: 10px; margin: 26px 0 2px; font-size: 15px; font-weight: 800; color: var(--ink); }
   h3.v1-group .pill { font-size: 11.5px; font-weight: 800; letter-spacing: 0.06em; padding: 2px 10px; border-radius: 999px; }
   .pill.done { color: var(--good); background: rgba(21,145,95,0.08); border: 1px solid rgba(21,145,95,0.35); }
-  .pill.wip { color: var(--gold-ink); background: rgba(201,162,39,0.10); border: 1px solid rgba(201,162,39,0.45); }
+  .pill.new { color: var(--gold-ink); background: rgba(201,162,39,0.10); border: 1px solid rgba(201,162,39,0.45); }
   .feat-list .ft h4 { margin: 4px 0 5px; font-size: 16.5px; }
-  .feat-list .num.wip { background: #fff; color: var(--gold-ink); border: 1px dashed rgba(201,162,39,0.7); box-shadow: none; }
-  .v1-group-note { margin: 0; font-size: 13.5px; color: var(--muted); }
+  .feat-list .ft h4 code { font-family: var(--mono); font-size: 0.9em; }
 
   /* faq */
   .faq details { border-bottom: 1px solid var(--line); }
@@ -210,6 +209,11 @@
   .dl-card .dlbtn:hover { text-decoration: none; filter: brightness(1.04); }
   .dl-card .dlbtn.soon { background: #fff; border: 1px solid var(--line); color: var(--ink-soft); }
   .dl-card .dlbtn svg { width: 16px; height: 16px; }
+  .dl-card.wide { grid-column: 1 / -1; }
+  .dl-links { display: flex; flex-wrap: wrap; gap: 10px; }
+  .dl-card .dlbtn.sub { padding: 9px 14px; font-size: 13.5px; }
+  .dl-extra { margin: 16px 0 0; font-size: 14px; }
+  .dl-extra .sep { color: var(--muted); margin: 0 8px; }
   .dl-note { margin-top: 22px; font-size: 13px; color: var(--muted); line-height: 1.9; }
   .dl-note code { font-family: var(--mono); background: var(--line-soft); border-radius: 5px; padding: 1px 6px; color: var(--ink); }
 
@@ -231,7 +235,7 @@
     <nav class="nav-links">
       <a href="#why" data-i18n="nav.why">なぜ必要か</a>
       <a href="#features" data-i18n="nav.features">機能</a>
-      <a href="#v1" data-i18n="nav.v1">v1 の変更</a>
+      <a href="#v1" data-i18n="nav.v1">v1.0.0 の変更</a>
       <a href="#oss" data-i18n="nav.oss">オープンソース</a>
       <a href="#faq" data-i18n="nav.faq">FAQ</a>
       <span class="lang-switch" aria-label="Language">
@@ -261,7 +265,7 @@
         </a>
         <a class="btn btn-ghost" href="#why" data-i18n="hero.cta.how">仕組みを見る</a>
       </div>
-      <div class="note" data-i18n="hero.note">macOS（Apple Silicon）/ Windows · オープンソース · 通信はローカルだけ</div>
+      <div class="note" data-i18n="hero.note">macOS / Windows / Linux（headless）· オープンソース · 既定の通信はローカルだけ</div>
 
       <!-- TODO: screenshot — v0.1.0 の画面。v1 のサイドバー（SSHセッション／エージェント欄）とターミナルの複数タブが写ったものに差し替える -->
       <img class="shot" src="assets/screenshot-terminal.png" alt="SSH GATE の画面 — 接続先の詳細と xterm のインタラクティブシェル" loading="lazy" />
@@ -301,11 +305,11 @@
       <h2 class="sec-title" data-i18n="feat.title">承認コンソールに必要なもの、ぜんぶ。</h2>
       <ul class="feat-list">
         <li><span class="num">1</span><div class="ft"><h3 data-i18n="feat.f1.h">人間承認ゲートウェイ</h3><p data-i18n="feat.f1.p">エージェントの要求は承認キューへ。GUI で内容を確認し、必要ならコマンドを微修正してから実行できます。</p></div></li>
-        <li><span class="num">2</span><div class="ft"><h3 data-i18n="feat.f2.h">MCP サーバー内蔵</h3><p data-i18n="feat.f2.p">JSON-RPC 2.0 over HTTP で <code>list_hosts</code> / <code>execute_command</code> などを提供。Claude などの MCP クライアントから接続できます。</p></div></li>
+        <li><span class="num">2</span><div class="ft"><h3 data-i18n="feat.f2.h">MCP サーバー内蔵</h3><p data-i18n="feat.f2.p">JSON-RPC 2.0 over HTTP で <code>list_hosts</code> / <code>execute_command</code> / <code>get_request_status</code> などと、AI 専用セッションのツール（<code>open_session</code> ほか）を提供。Claude などの MCP クライアントから接続できます。</p></div></li>
         <li><span class="num">3</span><div class="ft"><h3 data-i18n="feat.f3.h">リスク分類</h3><p data-i18n="feat.f3.p">コマンドを High / Medium / Low に推定して表示。人間の判断を助けます（あくまで目安。実行可否は承認とポリシーが決めます）。</p></div></li>
         <li><span class="num">4</span><div class="ft"><h3 data-i18n="feat.f4.h">監査ログ</h3><p data-i18n="feat.f4.p">すべての要求・実行結果・所要時間を SQLite に記録。接続先を消しても履歴は残します。</p></div></li>
-        <li><span class="num">5</span><div class="ft"><h3 data-i18n="feat.f5.h">ライブターミナル（SSH / シリアル）</h3><p data-i18n="feat.f5.p">承認フローとは別に、人間が直接操作する対話端末を内蔵。SSH の対話シェルとシリアルポートを、同じ画面で扱えます。</p></div></li>
-        <li><span class="num">6</span><div class="ft"><h3 data-i18n="feat.f6.h">ローカル完結 & 最小保持</h3><p data-i18n="feat.f6.p">既定の待受は <code>127.0.0.1:8787</code>。SSH 鍵パスフレーズは保存せずメモリのみ。任意で Bearer 認証も。</p></div></li>
+        <li><span class="num">5</span><div class="ft"><h3 data-i18n="feat.f5.h">ライブターミナル（SSH / シリアル）</h3><p data-i18n="feat.f5.p">承認フローとは別に、人間が直接操作する対話端末を内蔵。SSH の対話シェルとシリアルポートを同じ画面で扱え、1つの接続先にタブをいくつでも開けます。</p></div></li>
+        <li><span class="num">6</span><div class="ft"><h3 data-i18n="feat.f6.h">ローカル完結 & 最小保持</h3><p data-i18n="feat.f6.p">既定の待受は <code>127.0.0.1:8787</code>。パスワードは OS のキーチェーンに置き、SSH 鍵パスフレーズは既定で保存せずメモリのみ。任意で Bearer 認証も。</p></div></li>
       </ul>
     </div>
   </section>
@@ -333,11 +337,10 @@
       <p class="sec-label" data-i18n="term.label">ターミナル</p>
       <h2 class="sec-title" data-i18n="term.title">SSH も シリアルも、ひとつの画面で。</h2>
       <div class="term-flex">
-        <p data-i18n="term.p">
-          承認フローに乗らない「人間の直接操作」も用意しています。接続先に種別（SSH / シリアル）を持たせ、ターミナルはそれに従属。
-          ネットワーク機器のコンソールや USB シリアルも、SSH の対話シェルと同じ操作で開けます。
-          <strong>シリアル接続先は MCP からは実行できません</strong>（対話 GUI 専用）。
-        </p>
+        <p data-i18n="term.p">承認フローに乗らない「人間の直接操作」も用意しています。接続先に種別（SSH / シリアル）を持たせ、ターミナルはそれに従属。
+        ネットワーク機器のコンソールや USB シリアルも、SSH の対話シェルと同じ操作で開けます。
+        ツールバーからは、Ctrl-C などの制御文字、SSH の signal（TERM・KILL・HUP・INT）、シリアルの BREAK を送れます。
+        <strong>シリアル接続先は MCP からは実行できません</strong>（対話 GUI 専用）。</p>
         <img class="cable" src="assets/serial-cable.png" alt="USB–シリアル変換ケーブル（USB-A / D-sub 9pin）" loading="lazy" />
       </div>
       <!-- TODO: screenshot — v1 のターミナル（1つの接続先に複数タブ）の画面に差し替える -->
@@ -352,9 +355,9 @@
       <h2 class="sec-title" data-i18n="sec.title">安全は、1個ではなく層で積む。</h2>
       <ul class="feat-list">
         <li><span class="num">✓</span><div class="ft"><h3 data-i18n="sec.s1.h">デフォルト承認必須</h3><p data-i18n="sec.s1.p">Low リスクでも自動実行しない。<code>AutoExecuteLowRisk</code> はバックエンドとフロントの二重で false に固定。</p></div></li>
-        <li><span class="num">✓</span><div class="ft"><h3 data-i18n="sec.s2.h">エージェント名の必須化</h3><p data-i18n="sec.s2.p">誰の要求かを必ず記録。未申告のエージェントには承認省略を付与できません。</p></div></li>
+        <li><span class="num">✓</span><div class="ft"><h3 data-i18n="sec.s2.h">エージェント名の必須化と専用トークン</h3><p data-i18n="sec.s2.p">誰の要求かを必ず記録。承認省略は、人が付与したエージェントが、そのエージェント専用のトークンで呼んだときにしか効きません。</p></div></li>
         <li><span class="num">✓</span><div class="ft"><h3 data-i18n="sec.s3.h">出力上限とタイムアウト</h3><p data-i18n="sec.s3.p">stdout/stderr を上限で打ち切り、接続・コマンドにタイムアウト。超過時は確実に kill。</p></div></li>
-        <li><span class="num">✓</span><div class="ft"><h3 data-i18n="sec.s4.h">資格情報の最小保持</h3><p data-i18n="sec.s4.p">SSH 鍵パスフレーズはメモリのみ（DB 非保存）。トークンはマスク表示で平文を返しません。</p></div></li>
+        <li><span class="num">✓</span><div class="ft"><h3 data-i18n="sec.s4.h">資格情報の最小保持</h3><p data-i18n="sec.s4.p">パスワードは OS のキーチェーンへ（DB に平文で置かない）。SSH 鍵パスフレーズは既定でメモリのみ。トークンはマスク表示で平文を返さず、エージェント専用トークンはハッシュだけを保存。</p></div></li>
       </ul>
     </div>
   </section>
@@ -364,32 +367,35 @@
   <!-- V1 -->
   <section id="v1" class="band">
     <div class="wrap body">
-      <p class="sec-label" data-i18n="v1.label">v1 の変更</p>
+      <p class="sec-label" data-i18n="v1.label">v1.0.0 の変更</p>
       <h2 class="sec-title" data-i18n="v1.title">安全の層を、もう一段厚く。</h2>
-      <p class="v1-note" data-i18n="v1.note">この節は次の版（v1）の内容です。<strong>いま配布している v0.1.0 には含まれていません。</strong>「実装済み」はコードとテストがそろったもの、「開発中」はまだ組み込みの途中で、画面も含めて完成していないものです。</p>
+      <p class="v1-note" data-i18n="v1.note">v1.0.0 で加わった主な変更です。「新機能」は新しくできるようになったこと、「安全」は承認と実行の守りを固めたものです。</p>
 
-      <h3 class="v1-group"><span class="pill done" data-i18n="v1.done.pill">実装済み</span><span data-i18n="v1.done.h">未リリース</span></h3>
+      <h3 class="v1-group"><span class="pill new" data-i18n="v1.new.pill">新機能</span><span data-i18n="v1.new.h">使い方が広がる</span></h3>
       <ul class="feat-list">
-        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d1.h">ブラウザ経由の攻撃を遮断</h4><p data-i18n="v1.d1.p">悪意ある Web ページから localhost の MCP へ要求を送り込む経路を塞ぎます。<code>Origin</code> ヘッダ付きの要求は既定で拒否（403）、<code>Host</code> はポート番号まで照合（DNS rebinding 対策）、POST は <code>application/json</code> 以外を拒否。127.0.0.1 以外で待ち受けるには Bearer 認証が必須です。</p></div></li>
-        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d2.h">承認しても、実行は1回だけ</h4><p data-i18n="v1.d2.p">承認・拒否は DB の compare-and-swap で状態を進めます。ボタンの二重クリックや「承認」と「拒否」が競合しても、実行は1回だけ。実行中にアプリが終了した要求は、次の起動時に「中断」として記録され、もう一度承認することはできません。</p></div></li>
-        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d3.h">承認省略は Bearer 必須、High は必ずキューへ</h4><p data-i18n="v1.d3.p">エージェント名を名乗るだけでは、承認省略は使えません。Bearer 認証を有効にしてはじめて付与でき、それでも <strong>High リスクは常に承認キュー</strong>に入ります。既定では、<code>sudo</code> を含むコマンド、本番タグ（<code>prod</code> など）の接続先、Low 以外のコマンドも承認が必要です。</p></div></li>
-        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d4.h">承認時の修正と、その記録</h4><p data-i18n="v1.d4.p">承認画面でコマンドを直してから実行できます。直したコマンドはリスクを判定し直し、上がった場合はもう一度確認を求めます。要求されたコマンドと実際に実行したコマンドは、別々に履歴へ残ります。</p></div></li>
-        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d5.h">監査 API の保護</h4><p data-i18n="v1.d5.p">監査用のエンドポイント <code>/audit/events</code> は GET だけを受け付け、Bearer 認証が有効なときはトークンが必要です。返す件数にも上限（既定 100 件、最大 500 件）を設けました。</p></div></li>
-        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d6.h">接続先の管理と編集画面</h4><p data-i18n="v1.d6.p">接続先は名前ではなく不変の ID で管理するため、名前を変えても履歴やタブがついてきます。パスワードは保存後に画面へ返しません（空欄のまま保存すれば、保存済みの値を保ちます）。「接続テスト」は保存前の入力でも試せて、保存済みの状態は書き換えません。編集画面には「保存済み／未保存の変更あり」を表示し、未保存のまま移ろうとすると確認します。</p></div></li>
-        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d7.h">ターミナルの複数タブと、新しいサイドバー</h4><p data-i18n="v1.d7.p">1つの接続先に、シェルをいくつでも開けます。タブは画面を移っても閉じず、1つ閉じても他のタブはそのまま。サイドバーには、接続中のセッション、シェルの数、実行中のコマンド数、MCP の待受状態と承認待ちの件数を表示します。</p></div></li>
-        <!-- TODO: screenshot — 複数タブのターミナル、新しいサイドバー、接続先編集画面の画像をここに追加する -->
-        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d8.h">MCP：結果の取得・再送・終了コード</h4><p data-i18n="v1.d8.p"><code>get_request_status</code> で、承認キューに入った要求の状態と結果を取得できます（<code>wait_seconds</code> で最大 60 秒待てます）。<code>client_request_id</code> を付ければ、24 時間以内の再送は新しく実行せず、同じ <code>request_id</code> を返します。結果には <code>exit_code</code> が入り、失敗は <code>isError</code> で判定できます。</p></div></li>
-        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d9.h">CI と依存関係</h4><p data-i18n="v1.d9.p">テストは macOS・Windows・Linux の3つの OS で <code>-race</code> 付きで実行し、<code>govulncheck</code> と <code>npm audit</code>（high 以上で失敗）も毎回かけます。GitHub Actions は commit SHA で固定し、更新は Dependabot で追います。リリース用のワークフローは、成果物に <code>SHA256SUMS.txt</code> を添付します。</p></div></li>
+        <li><span class="num">+</span><div class="ft"><h4 data-i18n="v1.n1.h"><code>--headless</code> と Web 管理画面</h4><p data-i18n="v1.n1.p"><code>--headless</code> で起動すると、ウィンドウを出さずに MCP サーバーと Web 管理画面だけが動きます。承認・接続先の編集・ターミナル・設定は、ブラウザから操作します（Linux / macOS / Windows）。Web 管理画面は既定で <code>127.0.0.1:8788</code> に待ち受け、127.0.0.1 から開くときもログイン（管理トークン、または任意で設定する管理パスワード）が必須です。管理の資格情報は MCP の Bearer トークンとは別物で、互いに通りません。LAN に公開するには TLS が必須で、無ければ起動を拒否します。Linux 版は headless 専用ビルド（cgo なしの単体の実行ファイルで、GTK / WebKit は不要）で、systemd の unit と Docker の例も用意しています。</p></div></li>
+        <!-- TODO: screenshot — headless の Web 管理画面（ログイン画面と承認キュー）の画像をここに追加する -->
+        <li><span class="num">+</span><div class="ft"><h4 data-i18n="v1.n2.h">AI 専用の継続 SSH セッション</h4><p data-i18n="v1.n2.p">MCP の <code>open_session</code> / <code>send_line</code> / <code>read_output</code> / <code>close_session</code> で AI 専用のシェルを開き、<code>cd</code> や環境変数を持ち越したまま、コマンドを順に送れます。送る1行ごとにリスク判定と承認を通し（承認省略の規則も同じ）、承認されていない行はシェルに届きません。人のターミナルタブとは分けてあり、AI から人のタブを読んだり入力したりはできません。送った行と出力は監査に残ります。アイドル（既定 10 分）と最大寿命（既定 1 時間）で自動的に閉じ、人は画面から一覧・閲覧・強制終了ができます。既定はオフで、使えるのはエージェント専用トークンで認証したエージェントだけです。</p></div></li>
+        <!-- TODO: screenshot — 「AI セッション」画面（一覧と読み取り専用のターミナル）の画像をここに追加する -->
+        <li><span class="num">+</span><div class="ft"><h4 data-i18n="v1.n3.h">ターミナルのシグナル送信</h4><p data-i18n="v1.n3.p">ターミナルのツールバーのメニューから、Ctrl-C・Ctrl-Z・Ctrl-\・Ctrl-D の制御文字と、SSH の signal（TERM・KILL・HUP・INT）を送れます。サーバーが signal に対応していなければ、その旨を表示します。KILL と TERM は確認してから送ります。シリアルでは BREAK を送れます。</p></div></li>
+        <li><span class="num">+</span><div class="ft"><h4 data-i18n="v1.n4.h">複数タブ、サーバータブ、ショートカット</h4><p data-i18n="v1.n4.p">1つの接続先に、シェルをいくつでも開けます。タブは画面を移っても閉じず、1つ閉じても他のタブはそのまま。画面の上には接続先ごとのタブがあり、承認キューや履歴をその接続先で絞り込めます。サイドバーには、接続中のセッション、シェルの数、実行中のコマンド数、MCP の待受状態と承認待ちの件数を表示します。新しいシェル・タブを閉じる・タブやサーバーの切り替えには、キーボードショートカットがあります（macOS は Cmd、Windows は Ctrl+Shift、Web 管理画面では Alt+Shift）。</p></div></li>
+        <!-- TODO: screenshot — 複数タブのターミナル、上部のサーバータブ、新しいサイドバー、接続先編集画面の画像をここに追加する -->
+        <li><span class="num">+</span><div class="ft"><h4 data-i18n="v1.n5.h">パスワードは OS のキーチェーンへ</h4><p data-i18n="v1.n5.p">接続先のパスワードは SQLite ではなく、OS のキーチェーン（macOS のキーチェーン、Windows の資格情報マネージャー、Linux の Secret Service）に保存します。キーチェーンが使えないときも、平文で DB に書くことはしません（そのセッションの間だけ使うことはできます）。DB に残っていた平文のパスワードは、起動時にキーチェーンへ移します。SSH 鍵のパスフレーズは既定では保存せず、入力するときに「キーチェーンに保存する」を選んだときだけ保存します。headless では保存先を <code>keychain</code> / <code>file</code>（0600 の <code>secrets.json</code>）/ <code>env</code> から選べます。</p></div></li>
+        <li><span class="num">+</span><div class="ft"><h4 data-i18n="v1.d6.h">接続先の管理と編集画面</h4><p data-i18n="v1.d6.p">接続先は名前ではなく不変の ID で管理するため、名前を変えても履歴やタブがついてきます。パスワードは保存後に画面へ返しません（空欄のまま保存すれば、保存済みの値を保ちます）。「接続テスト」は保存前の入力でも試せて、保存済みの状態は書き換えません。編集画面には「保存済み／未保存の変更あり」を表示し、未保存のまま移ろうとすると確認します。</p></div></li>
+        <li><span class="num">+</span><div class="ft"><h4 data-i18n="v1.d8.h">MCP：結果の取得・再送・終了コード</h4><p data-i18n="v1.d8.p"><code>get_request_status</code> で、承認キューに入った要求の状態と結果を取得できます（<code>wait_seconds</code> で最大 60 秒待てます）。<code>client_request_id</code> を付ければ、24 時間以内の再送は新しく実行せず、同じ <code>request_id</code> を返します。結果には <code>exit_code</code> が入り、失敗は <code>isError</code> で判定できます。</p></div></li>
       </ul>
 
-      <h3 class="v1-group"><span class="pill wip" data-i18n="v1.wip.pill">開発中</span><span data-i18n="v1.wip.h">組み込みの途中・画面は未完成</span></h3>
-      <p class="v1-group-note" data-i18n="v1.wip.note">内容や名前は変わることがあります。</p>
+      <h3 class="v1-group"><span class="pill done" data-i18n="v1.safe.pill">安全</span><span data-i18n="v1.safe.h">承認と実行の守りを固める</span></h3>
       <ul class="feat-list">
-        <li><span class="num wip">…</span><div class="ft"><h4 data-i18n="v1.w1.h">ホスト鍵の検証（TOFU）</h4><p data-i18n="v1.w1.p">初めて接続したホストの鍵を専用の known_hosts に記録し、以後、鍵が一致しなければ接続を拒否します。</p></div></li>
-        <li><span class="num wip">…</span><div class="ft"><h4 data-i18n="v1.w2.h">エージェント専用トークン</h4><p data-i18n="v1.w2.p">共有のトークンだけでは承認省略を使えないようにし、エージェントごとのトークンに期限・上限リスク・対象の接続先を持たせます。</p></div></li>
-        <li><span class="num wip">…</span><div class="ft"><h4 data-i18n="v1.w3.h">リスク判定の強化</h4><p data-i18n="v1.w3.p"><code>;</code> や <code>&amp;&amp;</code> でつないだコマンド、フルパスの <code>sudo</code>、<code>env</code>／<code>xargs</code> 経由の実行も見分けます。</p></div></li>
-        <li><span class="num wip">…</span><div class="ft"><h4 data-i18n="v1.w4.h">実行先が変わったら承認を止める</h4><p data-i18n="v1.w4.p">要求のあとで接続先の user@host:port が変わっていたら、承認しても実行しません。</p></div></li>
-        <li><span class="num wip">…</span><div class="ft"><h4 data-i18n="v1.w5.h">上部のサーバータブとショートカット</h4><p data-i18n="v1.w5.p">画面の上に接続先ごとのタブを置き、承認キューや履歴をその接続先で絞り込みます。キーボードショートカットも追加します。</p></div></li>
+        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d1.h">ブラウザ経由の攻撃を遮断</h4><p data-i18n="v1.d1.p">悪意ある Web ページから localhost の MCP へ要求を送り込む経路を塞ぎます。<code>Origin</code> ヘッダ付きの要求は既定で拒否（403）、<code>Host</code> はポート番号まで照合（DNS rebinding 対策）、POST は <code>application/json</code> 以外を拒否。127.0.0.1 以外で待ち受けるには Bearer 認証が必須です。</p></div></li>
+        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d3.h">承認省略は専用トークンだけ、High は必ずキューへ</h4><p data-i18n="v1.d3.p">エージェント名を名乗るだけでも、共有の Bearer トークンでも、承認省略は使えません。効くのは、そのエージェント専用のトークン（発行時に一度だけ表示し、保存するのはハッシュだけ）で MCP を呼んだときだけです。承認省略には期限（承認画面から付けたときは 8 時間）、上限のリスク（Low か Medium）、対象の接続先を持たせられ、<strong>High リスクは常に承認キュー</strong>に入ります。既定では、<code>sudo</code> を含むコマンド、本番タグ（<code>prod</code> など）の接続先、Low 以外のコマンドも承認が必要です。</p></div></li>
+        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d11.h">リスク判定は許可リスト方式</h4><p data-i18n="v1.d11.p">Low になるのは、許可リストにある読み取り専用のコマンドを素の引数で呼んだときだけです。クォート、エスケープ、変数の展開、リダイレクト、制御文字や見えない文字、インタプリタに渡すコードなど、読み切れない書き方は High にします。<code>;</code>・<code>&amp;&amp;</code>・<code>|</code> でつないだコマンドは1つずつ判定し、いちばん高いリスクを採ります。許可リストにも危険なコマンドの一覧にも無いものは Medium です。</p></div></li>
+        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d10.h">ホスト鍵の検証（TOFU）</h4><p data-i18n="v1.d10.p">初めて接続するホストの鍵は、人が画面から接続テストをしたときに ssh-gete 専用の known_hosts（0600）へ記録し、指紋を表示します。エージェント（MCP）からは、記録の無いホストに接続しません。鍵が記録と違えば、どの経路でも接続を拒否します。厳格モードでは <code>~/.ssh/known_hosts</code> も信頼し、新しい鍵は記録しません。</p></div></li>
+        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d12.h">実行先が変わったら承認を止める</h4><p data-i18n="v1.d12.p">要求のあとで接続先の user@host:port が変わっていたら、承認しても実行しません。エージェントには、もう一度要求してもらいます。どの承認の経路でも同じです。</p></div></li>
+        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d2.h">承認しても、実行は1回だけ</h4><p data-i18n="v1.d2.p">承認・拒否は DB の compare-and-swap で状態を進めます。ボタンの二重クリックや「承認」と「拒否」が競合しても、実行は1回だけ。実行中にアプリが終了した要求は、次の起動時に「中断」として記録され、もう一度承認することはできません。</p></div></li>
+        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d4.h">承認時の修正と、その記録</h4><p data-i18n="v1.d4.p">承認画面でコマンドを直してから実行できます。直したコマンドはリスクを判定し直し、上がった場合はもう一度確認を求めます。要求されたコマンドと実際に実行したコマンドは、別々に履歴へ残ります。</p></div></li>
+        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d5.h">監査 API の保護</h4><p data-i18n="v1.d5.p">監査用のエンドポイント <code>/audit/events</code> は GET だけを受け付け、Bearer 認証が有効なときはトークンが必要です。返す件数にも上限（既定 100 件、最大 500 件）を設けました。</p></div></li>
+        <li><span class="num">✓</span><div class="ft"><h4 data-i18n="v1.d9.h">CI と依存関係</h4><p data-i18n="v1.d9.p">テストは macOS・Windows・Linux の3つの OS で <code>-race</code> 付きで実行し、<code>govulncheck</code> と <code>npm audit</code>（high 以上で失敗）も毎回かけます。GitHub Actions は commit SHA で固定し、更新は Dependabot で追います。リリース用のワークフローは、成果物に <code>SHA256SUMS.txt</code> を添付します。</p></div></li>
       </ul>
     </div>
   </section>
@@ -430,15 +436,15 @@
       </details>
       <details>
         <summary data-i18n="faq.q2.s">本当にエージェントから勝手に実行されませんか？</summary>
-        <div class="ans" data-i18n="faq.q2.a">はい。MCP 経由のコマンドはリスクに関係なく承認キューに入ります。実行されるのは、人間が GUI で承認したときか、特定エージェントに明示的に「承認省略」を与えたときだけです。後者は人間が意図的に付与した場合のみ有効です。<br /><small>v1（未リリース）では、承認省略は Bearer 認証を有効にしたときだけ付与でき、High リスクのコマンドは承認省略があっても必ず承認キューに入ります。</small></div>
+        <div class="ans" data-i18n="faq.q2.a">はい。MCP 経由のコマンドは、既定ではリスクに関係なく承認キューに入ります。キューを通らずに実行されるのは、人が特定のエージェントに「承認省略」を与え、そのエージェントが専用のトークンで呼んだときだけです。承認省略には期限と上限のリスクがあり、High リスクのコマンドは承認省略があっても必ず承認キューに入ります。AI 専用セッションで送る1行ずつも、同じ規則で承認を通ります。</div>
       </details>
       <details>
         <summary data-i18n="faq.q3.s">リスク分類（High/Medium/Low）はどこまで信用できますか？</summary>
-        <div class="ans" data-i18n="faq.q3.a">コマンド文字列のヒューリスティックなので、クオートやエイリアスで回避され得ます。あくまで人間の判断を助ける<strong>目安</strong>で、これ自体が実行可否を決めるわけではありません。実行可否は承認とポリシーが決めます。</div>
+        <div class="ans" data-i18n="faq.q3.a">Low になるのは、許可リストにある読み取り専用のコマンドを素の引数で呼んだときだけで、読み切れない書き方は High にします。それでも判定はコマンドの文字列だけを見るので、接続先で同じ名前のコマンドが実際に何をするかまでは分かりません。あくまで人間の判断を助ける<strong>目安</strong>で、これ自体が実行可否を決めるわけではありません。実行可否は承認とポリシーが決めます。</div>
       </details>
       <details>
         <summary data-i18n="faq.q4.s">外部に公開されますか？</summary>
-        <div class="ans" data-i18n="faq.q4.a">既定の待受は <code>127.0.0.1:8787</code>。ローカルのエージェントとだけ通信する前提です。必要に応じて Bearer 認証・ボディサイズ上限・CORS 制限を設定できます。<br /><small>v1（未リリース）では、<code>Origin</code> ヘッダ付きの要求を既定で拒否し、127.0.0.1 以外で待ち受けるには Bearer 認証が必須になります。</small></div>
+        <div class="ans" data-i18n="faq.q4.a">既定の待受は、MCP が <code>127.0.0.1:8787</code>、headless の Web 管理画面が <code>127.0.0.1:8788</code> で、同じ PC からだけ使う前提です。<code>Origin</code> ヘッダ付きの要求は既定で拒否します。LAN に公開するには、MCP は Bearer 認証が、Web 管理画面は TLS が必須で、満たさないと待ち受けません。Web 管理画面は、どこから開いてもログインが必要です。</div>
       </details>
       <details>
         <summary data-i18n="faq.q5.s">シリアルポートにも使えますか？</summary>
@@ -446,7 +452,7 @@
       </details>
       <details>
         <summary data-i18n="faq.q6.s">資格情報はどこに保存されますか？</summary>
-        <div class="ans" data-i18n="faq.q6.a">接続先の鍵パス／パスワードと Bearer トークンは SQLite に保存されます。一方、<strong>SSH 鍵のパスフレーズは保存せず</strong>、アプリ起動中のメモリにのみ保持します。DB ファイルは <code>0700</code> のディレクトリに置かれます。<br /><small>v1（未リリース）では、DB ファイル自体も <code>0600</code> で作成し、保存したパスワードは画面に返しません。</small></div>
+        <div class="ans" data-i18n="faq.q6.a">接続先のパスワードは OS のキーチェーンに保存し、SQLite には残しません（headless では <code>file</code> や <code>env</code> も選べます）。<strong>SSH 鍵のパスフレーズは既定では保存せず</strong>、アプリ起動中のメモリにだけ持ちます（保存を選んだときだけキーチェーンへ）。SQLite には接続先の設定や鍵のパス、共有の Bearer トークンが入り、DB ファイルは <code>0600</code> で作ります。エージェント専用トークンは、ハッシュだけを保存します。保存したパスワードは画面に返しません。</div>
       </details>
       <details>
         <summary data-i18n="faq.q7.s">保証はありますか？</summary>
@@ -477,17 +483,18 @@
     <div class="wrap body">
       <p class="sec-label" data-i18n="dl.label">ダウンロード</p>
       <h2 class="sec-title" data-i18n="dl.title">単一ファイルで、すぐ使える。</h2>
-      <p data-i18n="dl.p">インストール後、サイドバーの「コマンド履歴・承認」や「ターミナル」からそのまま使えます。</p>
+      <p data-i18n="dl.p">GUI 版は macOS と Windows 向けです。サーバーやコンテナで常駐させるなら、headless 専用ビルド（Linux / macOS / Windows）を使ってください。</p>
+      <!-- リンクは releases/latest/download/<成果物名>。成果物名は .github/workflows/release.yml の matrix.artifact と同じ。 -->
       <div class="dl-grid">
         <div class="dl-card">
           <div class="os">
             <svg viewBox="0 0 24 24" fill="currentColor"><path d="M16.4 12.6c0-2.3 1.9-3.4 2-3.5-1.1-1.6-2.8-1.8-3.4-1.8-1.4-.1-2.8.8-3.5.8-.7 0-1.8-.8-3-.8-1.5 0-3 .9-3.8 2.3-1.6 2.8-.4 7 1.2 9.3.8 1.1 1.7 2.4 2.9 2.3 1.2 0 1.6-.7 3-.7s1.8.7 3 .7c1.2 0 2-1.1 2.8-2.2.9-1.3 1.2-2.5 1.3-2.6-.1 0-2.5-1-2.5-3.8zM14.2 5.9c.6-.8 1-1.9.9-3-.9 0-2 .6-2.7 1.4-.6.7-1.1 1.8-.9 2.9 1 .1 2-.5 2.7-1.3z"/></svg>
             macOS
           </div>
-          <div class="meta" data-i18n="dl.mac.meta">Apple Silicon (arm64) · .app (zip)</div>
-          <a class="dlbtn" href="https://github.com/yoshiyakato/ssh-gate-oss/releases" target="_blank" rel="noopener">
+          <div class="meta" data-i18n="dl.mac.meta">Universal（Apple Silicon / Intel）· .app (zip)</div>
+          <a class="dlbtn" href="https://github.com/yoshiyakato/ssh-gate-oss/releases/latest/download/ssh-gate-mac-universal.zip">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M5 21h14"/></svg>
-            <span data-i18n="dl.mac.btn">ダウンロード（5.1MB）</span>
+            <span data-i18n="dl.mac.btn">ダウンロード</span>
           </a>
         </div>
         <div class="dl-card">
@@ -495,18 +502,45 @@
             <svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 5.5l7.5-1v7.3H3V5.5zm0 13l7.5 1v-7.2H3v6.2zM11.3 4.4L21 3v8.8h-9.7V4.4zm0 15.2L21 21v-8.7h-9.7v7.3z"/></svg>
             Windows
           </div>
-          <div class="meta" data-i18n="dl.win.meta">x64 · .exe (zip)</div>
-          <a class="dlbtn" id="win-btn" href="https://github.com/yoshiyakato/ssh-gate-oss/releases" target="_blank" rel="noopener">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M5 21h14"/></svg>
-            <span data-i18n="dl.win.btn">ダウンロード（8.5MB）</span>
-          </a>
+          <div class="meta" data-i18n="dl.win.meta">x64 / ARM64 · .exe (zip)</div>
+          <div class="dl-links">
+            <a class="dlbtn" id="win-btn" href="https://github.com/yoshiyakato/ssh-gate-oss/releases/latest/download/ssh-gate-win-x64.zip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M5 21h14"/></svg>
+              <span data-i18n="dl.win.x64">x64 をダウンロード</span>
+            </a>
+            <a class="dlbtn" href="https://github.com/yoshiyakato/ssh-gate-oss/releases/latest/download/ssh-gate-win-arm64.zip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M5 21h14"/></svg>
+              <span data-i18n="dl.win.arm64">ARM64 をダウンロード</span>
+            </a>
+          </div>
+        </div>
+        <div class="dl-card wide">
+          <div class="os">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>
+            <span data-i18n="dl.hl.title">headless 版</span>
+          </div>
+          <div class="meta" data-i18n="dl.hl.meta">GUI なし · ブラウザの Web 管理画面で操作 · Linux は tar.gz（systemd の unit 付き）、macOS / Windows は zip</div>
+          <div class="dl-links">
+            <a class="dlbtn sub" href="https://github.com/yoshiyakato/ssh-gate-oss/releases/latest/download/ssh-gate-linux-x64-headless.tar.gz"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M5 21h14"/></svg>Linux x64</a>
+            <a class="dlbtn sub" href="https://github.com/yoshiyakato/ssh-gate-oss/releases/latest/download/ssh-gate-linux-arm64-headless.tar.gz"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M5 21h14"/></svg>Linux arm64</a>
+            <a class="dlbtn sub" href="https://github.com/yoshiyakato/ssh-gate-oss/releases/latest/download/ssh-gate-mac-arm64-headless.zip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M5 21h14"/></svg>macOS Apple Silicon</a>
+            <a class="dlbtn sub" href="https://github.com/yoshiyakato/ssh-gate-oss/releases/latest/download/ssh-gate-mac-x64-headless.zip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M5 21h14"/></svg>macOS Intel</a>
+            <a class="dlbtn sub" href="https://github.com/yoshiyakato/ssh-gate-oss/releases/latest/download/ssh-gate-win-x64-headless.zip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M5 21h14"/></svg>Windows x64</a>
+            <a class="dlbtn sub" href="https://github.com/yoshiyakato/ssh-gate-oss/releases/latest/download/ssh-gate-win-arm64-headless.zip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M5 21h14"/></svg>Windows ARM64</a>
+          </div>
         </div>
       </div>
+      <p class="dl-extra">
+        <a href="https://github.com/yoshiyakato/ssh-gate-oss/releases/latest/download/SHA256SUMS.txt" data-i18n="dl.sums">SHA256SUMS.txt</a>
+        <span class="sep">·</span>
+        <a href="https://github.com/yoshiyakato/ssh-gate-oss/releases" target="_blank" rel="noopener" data-i18n="dl.all">すべてのリリース</a>
+      </p>
       <div class="dl-note" data-i18n="dl.note">
-        配布中のバージョンは <strong>v0.1.0</strong> です。「v1 の変更」節の内容は、まだ含まれていません。<br />
-        初回起動の注意（macOS）：未署名アプリのため、初回は <code>.app</code> を右クリック →「開く」で許可してください。<br />
+        配布中のバージョンは <strong>v1.0.0</strong> です。ボタンは GitHub Releases の最新版のファイルを直接ダウンロードします。各ファイルは、リリースに添付の <code>SHA256SUMS.txt</code> で照合できます（<code>shasum -a 256 -c SHA256SUMS.txt --ignore-missing</code>）。<br />
+        初回起動の注意（macOS）：未署名アプリのため、初回は <code>.app</code> を右クリック →「開く」で許可してください。headless 版は、展開したあと <code>xattr -d com.apple.quarantine ssh-gete</code> で隔離属性を外してから起動します。<br />
         初回起動の注意（Windows）：未署名のため SmartScreen が出る場合は「詳細情報」→「実行」で起動できます。<br />
-        ソースからビルド：<code>wails build</code>（Go 1.25 / Node が必要）。詳細は GitHub の README を参照。<br />
+        headless 版の使い方（起動、ログイン、TLS、systemd、Docker）は、アーカイブに同梱の <code>headless.md</code>、または GitHub の <a href="https://github.com/yoshiyakato/ssh-gate-oss/blob/main/docs/headless.md" target="_blank" rel="noopener">docs/headless.md</a> を参照。GUI 版も <code>--headless</code> を付けて起動できます。<br />
+        ソースからビルド：<code>wails build</code>（Go 1.26 / Node が必要）。詳細は GitHub の README を参照。<br />
         ライセンスは <strong>MIT</strong>（商用利用・改変・再配布OK）。<br />
         <strong>無保証（AS IS）</strong>：本ソフトウェアは現状有姿で提供され、明示・黙示を問わず一切の保証はありません。生じた損害について作者・配布者は責任を負いません。<strong>利用は自己責任</strong>でお願いします。
       </div>
@@ -538,7 +572,7 @@
 
       "nav.why": "なぜ必要か",
       "nav.features": "機能",
-      "nav.v1": "v1 の変更",
+      "nav.v1": "v1.0.0 の変更",
       "nav.oss": "オープンソース",
       "nav.faq": "FAQ",
       "nav.download": "ダウンロード",
@@ -548,7 +582,7 @@
       "hero.lead": '<strong style="color:#fff">何でも出来るからこそ、暴走させない。行動の履歴は、きっちり残す。</strong>\n        エージェントの要求は<strong style="color:#fff">承認キュー</strong>に並び、人間が通してはじめて実機へ。実行はすべて<strong style="color:#fff">監査ログ</strong>に残ります。\n        <strong style="color:#fff">SSH GATE</strong>（<code>ssh-gete</code>）は、ローカルで完結する human-in-the-loop な SSH ゲートウェイです。',
       "hero.cta.dl": "ダウンロード",
       "hero.cta.how": "仕組みを見る",
-      "hero.note": "macOS（Apple Silicon）/ Windows · オープンソース · 通信はローカルだけ",
+      "hero.note": "macOS / Windows / Linux（headless）· オープンソース · 既定の通信はローカルだけ",
       "hero.console.title": "SSH GATE — 承認キュー",
       "hero.console.body": '<span class="m">agent</span> <span class="y">claude</span> → execute_command\n  host: web01   command: sudo systemctl restart nginx\n  <span class="b">⚠ risk: High</span>   status: 承認待ち（まだ実行していません）\n\n<span class="m"># 人間が GUI で内容を確認 →「承認して実行」</span>\n  <span class="g">✓ 実行済み</span>   0.8s · 監査ログに記録\n',
 
@@ -579,15 +613,15 @@
       "feat.f1.h": "人間承認ゲートウェイ",
       "feat.f1.p": "エージェントの要求は承認キューへ。GUI で内容を確認し、必要ならコマンドを微修正してから実行できます。",
       "feat.f2.h": "MCP サーバー内蔵",
-      "feat.f2.p": "JSON-RPC 2.0 over HTTP で <code>list_hosts</code> / <code>execute_command</code> などを提供。Claude などの MCP クライアントから接続できます。",
+      "feat.f2.p": "JSON-RPC 2.0 over HTTP で <code>list_hosts</code> / <code>execute_command</code> / <code>get_request_status</code> などと、AI 専用セッションのツール（<code>open_session</code> ほか）を提供。Claude などの MCP クライアントから接続できます。",
       "feat.f3.h": "リスク分類",
       "feat.f3.p": "コマンドを High / Medium / Low に推定して表示。人間の判断を助けます（あくまで目安。実行可否は承認とポリシーが決めます）。",
       "feat.f4.h": "監査ログ",
       "feat.f4.p": "すべての要求・実行結果・所要時間を SQLite に記録。接続先を消しても履歴は残します。",
       "feat.f5.h": "ライブターミナル（SSH / シリアル）",
-      "feat.f5.p": "承認フローとは別に、人間が直接操作する対話端末を内蔵。SSH の対話シェルとシリアルポートを、同じ画面で扱えます。",
+      "feat.f5.p": "承認フローとは別に、人間が直接操作する対話端末を内蔵。SSH の対話シェルとシリアルポートを同じ画面で扱え、1つの接続先にタブをいくつでも開けます。",
       "feat.f6.h": "ローカル完結 & 最小保持",
-      "feat.f6.p": "既定の待受は <code>127.0.0.1:8787</code>。SSH 鍵パスフレーズは保存せずメモリのみ。任意で Bearer 認証も。",
+      "feat.f6.p": "既定の待受は <code>127.0.0.1:8787</code>。パスワードは OS のキーチェーンに置き、SSH 鍵パスフレーズは既定で保存せずメモリのみ。任意で Bearer 認証も。",
 
       "how.label": "仕組み",
       "how.title": "エージェントと実機の間に、門番を置く。",
@@ -599,55 +633,58 @@
 
       "term.label": "ターミナル",
       "term.title": "SSH も シリアルも、ひとつの画面で。",
-      "term.p": '承認フローに乗らない「人間の直接操作」も用意しています。接続先に種別（SSH / シリアル）を持たせ、ターミナルはそれに従属。\n        ネットワーク機器のコンソールや USB シリアルも、SSH の対話シェルと同じ操作で開けます。\n        <strong>シリアル接続先は MCP からは実行できません</strong>（対話 GUI 専用）。',
+      "term.p": "承認フローに乗らない「人間の直接操作」も用意しています。接続先に種別（SSH / シリアル）を持たせ、ターミナルはそれに従属。\n        ネットワーク機器のコンソールや USB シリアルも、SSH の対話シェルと同じ操作で開けます。\n        ツールバーからは、Ctrl-C などの制御文字、SSH の signal（TERM・KILL・HUP・INT）、シリアルの BREAK を送れます。\n        <strong>シリアル接続先は MCP からは実行できません</strong>（対話 GUI 専用）。",
 
       "sec.label": "安全設計",
       "sec.title": "安全は、1個ではなく層で積む。",
       "sec.s1.h": "デフォルト承認必須",
       "sec.s1.p": "Low リスクでも自動実行しない。<code>AutoExecuteLowRisk</code> はバックエンドとフロントの二重で false に固定。",
-      "sec.s2.h": "エージェント名の必須化",
-      "sec.s2.p": "誰の要求かを必ず記録。未申告のエージェントには承認省略を付与できません。",
+      "sec.s2.h": "エージェント名の必須化と専用トークン",
+      "sec.s2.p": "誰の要求かを必ず記録。承認省略は、人が付与したエージェントが、そのエージェント専用のトークンで呼んだときにしか効きません。",
       "sec.s3.h": "出力上限とタイムアウト",
       "sec.s3.p": "stdout/stderr を上限で打ち切り、接続・コマンドにタイムアウト。超過時は確実に kill。",
       "sec.s4.h": "資格情報の最小保持",
-      "sec.s4.p": "SSH 鍵パスフレーズはメモリのみ（DB 非保存）。トークンはマスク表示で平文を返しません。",
+      "sec.s4.p": "パスワードは OS のキーチェーンへ（DB に平文で置かない）。SSH 鍵パスフレーズは既定でメモリのみ。トークンはマスク表示で平文を返さず、エージェント専用トークンはハッシュだけを保存。",
 
-      "v1.label": "v1 の変更",
+      "v1.label": "v1.0.0 の変更",
       "v1.title": "安全の層を、もう一段厚く。",
-      "v1.note": "この節は次の版（v1）の内容です。<strong>いま配布している v0.1.0 には含まれていません。</strong>「実装済み」はコードとテストがそろったもの、「開発中」はまだ組み込みの途中で、画面も含めて完成していないものです。",
-      "v1.done.pill": "実装済み",
-      "v1.done.h": "未リリース",
+      "v1.note": "v1.0.0 で加わった主な変更です。「新機能」は新しくできるようになったこと、「安全」は承認と実行の守りを固めたものです。",
+      "v1.new.pill": "新機能",
+      "v1.new.h": "使い方が広がる",
+      "v1.n1.h": "<code>--headless</code> と Web 管理画面",
+      "v1.n1.p": "<code>--headless</code> で起動すると、ウィンドウを出さずに MCP サーバーと Web 管理画面だけが動きます。承認・接続先の編集・ターミナル・設定は、ブラウザから操作します（Linux / macOS / Windows）。Web 管理画面は既定で <code>127.0.0.1:8788</code> に待ち受け、127.0.0.1 から開くときもログイン（管理トークン、または任意で設定する管理パスワード）が必須です。管理の資格情報は MCP の Bearer トークンとは別物で、互いに通りません。LAN に公開するには TLS が必須で、無ければ起動を拒否します。Linux 版は headless 専用ビルド（cgo なしの単体の実行ファイルで、GTK / WebKit は不要）で、systemd の unit と Docker の例も用意しています。",
+      "v1.n2.h": "AI 専用の継続 SSH セッション",
+      "v1.n2.p": "MCP の <code>open_session</code> / <code>send_line</code> / <code>read_output</code> / <code>close_session</code> で AI 専用のシェルを開き、<code>cd</code> や環境変数を持ち越したまま、コマンドを順に送れます。送る1行ごとにリスク判定と承認を通し（承認省略の規則も同じ）、承認されていない行はシェルに届きません。人のターミナルタブとは分けてあり、AI から人のタブを読んだり入力したりはできません。送った行と出力は監査に残ります。アイドル（既定 10 分）と最大寿命（既定 1 時間）で自動的に閉じ、人は画面から一覧・閲覧・強制終了ができます。既定はオフで、使えるのはエージェント専用トークンで認証したエージェントだけです。",
+      "v1.n3.h": "ターミナルのシグナル送信",
+      "v1.n3.p": "ターミナルのツールバーのメニューから、Ctrl-C・Ctrl-Z・Ctrl-\\・Ctrl-D の制御文字と、SSH の signal（TERM・KILL・HUP・INT）を送れます。サーバーが signal に対応していなければ、その旨を表示します。KILL と TERM は確認してから送ります。シリアルでは BREAK を送れます。",
+      "v1.n4.h": "複数タブ、サーバータブ、ショートカット",
+      "v1.n4.p": "1つの接続先に、シェルをいくつでも開けます。タブは画面を移っても閉じず、1つ閉じても他のタブはそのまま。画面の上には接続先ごとのタブがあり、承認キューや履歴をその接続先で絞り込めます。サイドバーには、接続中のセッション、シェルの数、実行中のコマンド数、MCP の待受状態と承認待ちの件数を表示します。新しいシェル・タブを閉じる・タブやサーバーの切り替えには、キーボードショートカットがあります（macOS は Cmd、Windows は Ctrl+Shift、Web 管理画面では Alt+Shift）。",
+      "v1.n5.h": "パスワードは OS のキーチェーンへ",
+      "v1.n5.p": "接続先のパスワードは SQLite ではなく、OS のキーチェーン（macOS のキーチェーン、Windows の資格情報マネージャー、Linux の Secret Service）に保存します。キーチェーンが使えないときも、平文で DB に書くことはしません（そのセッションの間だけ使うことはできます）。DB に残っていた平文のパスワードは、起動時にキーチェーンへ移します。SSH 鍵のパスフレーズは既定では保存せず、入力するときに「キーチェーンに保存する」を選んだときだけ保存します。headless では保存先を <code>keychain</code> / <code>file</code>（0600 の <code>secrets.json</code>）/ <code>env</code> から選べます。",
+      "v1.d6.h": "接続先の管理と編集画面",
+      "v1.d6.p": "接続先は名前ではなく不変の ID で管理するため、名前を変えても履歴やタブがついてきます。パスワードは保存後に画面へ返しません（空欄のまま保存すれば、保存済みの値を保ちます）。「接続テスト」は保存前の入力でも試せて、保存済みの状態は書き換えません。編集画面には「保存済み／未保存の変更あり」を表示し、未保存のまま移ろうとすると確認します。",
+      "v1.d8.h": "MCP：結果の取得・再送・終了コード",
+      "v1.d8.p": "<code>get_request_status</code> で、承認キューに入った要求の状態と結果を取得できます（<code>wait_seconds</code> で最大 60 秒待てます）。<code>client_request_id</code> を付ければ、24 時間以内の再送は新しく実行せず、同じ <code>request_id</code> を返します。結果には <code>exit_code</code> が入り、失敗は <code>isError</code> で判定できます。",
+      "v1.safe.pill": "安全",
+      "v1.safe.h": "承認と実行の守りを固める",
       "v1.d1.h": "ブラウザ経由の攻撃を遮断",
       "v1.d1.p": "悪意ある Web ページから localhost の MCP へ要求を送り込む経路を塞ぎます。<code>Origin</code> ヘッダ付きの要求は既定で拒否（403）、<code>Host</code> はポート番号まで照合（DNS rebinding 対策）、POST は <code>application/json</code> 以外を拒否。127.0.0.1 以外で待ち受けるには Bearer 認証が必須です。",
+      "v1.d3.h": "承認省略は専用トークンだけ、High は必ずキューへ",
+      "v1.d3.p": "エージェント名を名乗るだけでも、共有の Bearer トークンでも、承認省略は使えません。効くのは、そのエージェント専用のトークン（発行時に一度だけ表示し、保存するのはハッシュだけ）で MCP を呼んだときだけです。承認省略には期限（承認画面から付けたときは 8 時間）、上限のリスク（Low か Medium）、対象の接続先を持たせられ、<strong>High リスクは常に承認キュー</strong>に入ります。既定では、<code>sudo</code> を含むコマンド、本番タグ（<code>prod</code> など）の接続先、Low 以外のコマンドも承認が必要です。",
+      "v1.d11.h": "リスク判定は許可リスト方式",
+      "v1.d11.p": "Low になるのは、許可リストにある読み取り専用のコマンドを素の引数で呼んだときだけです。クォート、エスケープ、変数の展開、リダイレクト、制御文字や見えない文字、インタプリタに渡すコードなど、読み切れない書き方は High にします。<code>;</code>・<code>&amp;&amp;</code>・<code>|</code> でつないだコマンドは1つずつ判定し、いちばん高いリスクを採ります。許可リストにも危険なコマンドの一覧にも無いものは Medium です。",
+      "v1.d10.h": "ホスト鍵の検証（TOFU）",
+      "v1.d10.p": "初めて接続するホストの鍵は、人が画面から接続テストをしたときに ssh-gete 専用の known_hosts（0600）へ記録し、指紋を表示します。エージェント（MCP）からは、記録の無いホストに接続しません。鍵が記録と違えば、どの経路でも接続を拒否します。厳格モードでは <code>~/.ssh/known_hosts</code> も信頼し、新しい鍵は記録しません。",
+      "v1.d12.h": "実行先が変わったら承認を止める",
+      "v1.d12.p": "要求のあとで接続先の user@host:port が変わっていたら、承認しても実行しません。エージェントには、もう一度要求してもらいます。どの承認の経路でも同じです。",
       "v1.d2.h": "承認しても、実行は1回だけ",
       "v1.d2.p": "承認・拒否は DB の compare-and-swap で状態を進めます。ボタンの二重クリックや「承認」と「拒否」が競合しても、実行は1回だけ。実行中にアプリが終了した要求は、次の起動時に「中断」として記録され、もう一度承認することはできません。",
-      "v1.d3.h": "承認省略は Bearer 必須、High は必ずキューへ",
-      "v1.d3.p": "エージェント名を名乗るだけでは、承認省略は使えません。Bearer 認証を有効にしてはじめて付与でき、それでも <strong>High リスクは常に承認キュー</strong>に入ります。既定では、<code>sudo</code> を含むコマンド、本番タグ（<code>prod</code> など）の接続先、Low 以外のコマンドも承認が必要です。",
       "v1.d4.h": "承認時の修正と、その記録",
       "v1.d4.p": "承認画面でコマンドを直してから実行できます。直したコマンドはリスクを判定し直し、上がった場合はもう一度確認を求めます。要求されたコマンドと実際に実行したコマンドは、別々に履歴へ残ります。",
       "v1.d5.h": "監査 API の保護",
       "v1.d5.p": "監査用のエンドポイント <code>/audit/events</code> は GET だけを受け付け、Bearer 認証が有効なときはトークンが必要です。返す件数にも上限（既定 100 件、最大 500 件）を設けました。",
-      "v1.d6.h": "接続先の管理と編集画面",
-      "v1.d6.p": "接続先は名前ではなく不変の ID で管理するため、名前を変えても履歴やタブがついてきます。パスワードは保存後に画面へ返しません（空欄のまま保存すれば、保存済みの値を保ちます）。「接続テスト」は保存前の入力でも試せて、保存済みの状態は書き換えません。編集画面には「保存済み／未保存の変更あり」を表示し、未保存のまま移ろうとすると確認します。",
-      "v1.d7.h": "ターミナルの複数タブと、新しいサイドバー",
-      "v1.d7.p": "1つの接続先に、シェルをいくつでも開けます。タブは画面を移っても閉じず、1つ閉じても他のタブはそのまま。サイドバーには、接続中のセッション、シェルの数、実行中のコマンド数、MCP の待受状態と承認待ちの件数を表示します。",
-      "v1.d8.h": "MCP：結果の取得・再送・終了コード",
-      "v1.d8.p": "<code>get_request_status</code> で、承認キューに入った要求の状態と結果を取得できます（<code>wait_seconds</code> で最大 60 秒待てます）。<code>client_request_id</code> を付ければ、24 時間以内の再送は新しく実行せず、同じ <code>request_id</code> を返します。結果には <code>exit_code</code> が入り、失敗は <code>isError</code> で判定できます。",
       "v1.d9.h": "CI と依存関係",
       "v1.d9.p": "テストは macOS・Windows・Linux の3つの OS で <code>-race</code> 付きで実行し、<code>govulncheck</code> と <code>npm audit</code>（high 以上で失敗）も毎回かけます。GitHub Actions は commit SHA で固定し、更新は Dependabot で追います。リリース用のワークフローは、成果物に <code>SHA256SUMS.txt</code> を添付します。",
-      "v1.wip.pill": "開発中",
-      "v1.wip.h": "組み込みの途中・画面は未完成",
-      "v1.wip.note": "内容や名前は変わることがあります。",
-      "v1.w1.h": "ホスト鍵の検証（TOFU）",
-      "v1.w1.p": "初めて接続したホストの鍵を専用の known_hosts に記録し、以後、鍵が一致しなければ接続を拒否します。",
-      "v1.w2.h": "エージェント専用トークン",
-      "v1.w2.p": "共有のトークンだけでは承認省略を使えないようにし、エージェントごとのトークンに期限・上限リスク・対象の接続先を持たせます。",
-      "v1.w3.h": "リスク判定の強化",
-      "v1.w3.p": "<code>;</code> や <code>&amp;&amp;</code> でつないだコマンド、フルパスの <code>sudo</code>、<code>env</code>／<code>xargs</code> 経由の実行も見分けます。",
-      "v1.w4.h": "実行先が変わったら承認を止める",
-      "v1.w4.p": "要求のあとで接続先の user@host:port が変わっていたら、承認しても実行しません。",
-      "v1.w5.h": "上部のサーバータブとショートカット",
-      "v1.w5.p": "画面の上に接続先ごとのタブを置き、承認キューや履歴をその接続先で絞り込みます。キーボードショートカットも追加します。",
 
       "oss.label": "オープンソース",
       "oss.title": "大事な SSH／シリアルだからこそ、中身が見える。",
@@ -659,15 +696,15 @@
       "faq.q1.s": "もっと詳しい紹介・背景は？",
       "faq.q1.a": '開発の背景や使いどころを Qiita の紹介記事にまとめています →\n          <a href="https://qiita.com/yoshiyakato/private/7987aa7a671f089f06ea" target="_blank" rel="noopener">SSH GATE 紹介記事（Qiita）</a>。\n          <br /><small>※ 限定共有リンクです。</small>',
       "faq.q2.s": "本当にエージェントから勝手に実行されませんか？",
-      "faq.q2.a": "はい。MCP 経由のコマンドはリスクに関係なく承認キューに入ります。実行されるのは、人間が GUI で承認したときか、特定エージェントに明示的に「承認省略」を与えたときだけです。後者は人間が意図的に付与した場合のみ有効です。<br /><small>v1（未リリース）では、承認省略は Bearer 認証を有効にしたときだけ付与でき、High リスクのコマンドは承認省略があっても必ず承認キューに入ります。</small>",
+      "faq.q2.a": "はい。MCP 経由のコマンドは、既定ではリスクに関係なく承認キューに入ります。キューを通らずに実行されるのは、人が特定のエージェントに「承認省略」を与え、そのエージェントが専用のトークンで呼んだときだけです。承認省略には期限と上限のリスクがあり、High リスクのコマンドは承認省略があっても必ず承認キューに入ります。AI 専用セッションで送る1行ずつも、同じ規則で承認を通ります。",
       "faq.q3.s": "リスク分類（High/Medium/Low）はどこまで信用できますか？",
-      "faq.q3.a": "コマンド文字列のヒューリスティックなので、クオートやエイリアスで回避され得ます。あくまで人間の判断を助ける<strong>目安</strong>で、これ自体が実行可否を決めるわけではありません。実行可否は承認とポリシーが決めます。",
+      "faq.q3.a": "Low になるのは、許可リストにある読み取り専用のコマンドを素の引数で呼んだときだけで、読み切れない書き方は High にします。それでも判定はコマンドの文字列だけを見るので、接続先で同じ名前のコマンドが実際に何をするかまでは分かりません。あくまで人間の判断を助ける<strong>目安</strong>で、これ自体が実行可否を決めるわけではありません。実行可否は承認とポリシーが決めます。",
       "faq.q4.s": "外部に公開されますか？",
-      "faq.q4.a": "既定の待受は <code>127.0.0.1:8787</code>。ローカルのエージェントとだけ通信する前提です。必要に応じて Bearer 認証・ボディサイズ上限・CORS 制限を設定できます。<br /><small>v1（未リリース）では、<code>Origin</code> ヘッダ付きの要求を既定で拒否し、127.0.0.1 以外で待ち受けるには Bearer 認証が必須になります。</small>",
+      "faq.q4.a": "既定の待受は、MCP が <code>127.0.0.1:8787</code>、headless の Web 管理画面が <code>127.0.0.1:8788</code> で、同じ PC からだけ使う前提です。<code>Origin</code> ヘッダ付きの要求は既定で拒否します。LAN に公開するには、MCP は Bearer 認証が、Web 管理画面は TLS が必須で、満たさないと待ち受けません。Web 管理画面は、どこから開いてもログインが必要です。",
       "faq.q5.s": "シリアルポートにも使えますか？",
       "faq.q5.a": "使えます。接続先の種別を「シリアル」にすると、ターミナル画面でシリアルコンソールが開きます。SSH と同じ操作感です。なお、シリアルは対話 GUI 専用で、MCP（エージェント）からは実行できません。",
       "faq.q6.s": "資格情報はどこに保存されますか？",
-      "faq.q6.a": "接続先の鍵パス／パスワードと Bearer トークンは SQLite に保存されます。一方、<strong>SSH 鍵のパスフレーズは保存せず</strong>、アプリ起動中のメモリにのみ保持します。DB ファイルは <code>0700</code> のディレクトリに置かれます。<br /><small>v1（未リリース）では、DB ファイル自体も <code>0600</code> で作成し、保存したパスワードは画面に返しません。</small>",
+      "faq.q6.a": "接続先のパスワードは OS のキーチェーンに保存し、SQLite には残しません（headless では <code>file</code> や <code>env</code> も選べます）。<strong>SSH 鍵のパスフレーズは既定では保存せず</strong>、アプリ起動中のメモリにだけ持ちます（保存を選んだときだけキーチェーンへ）。SQLite には接続先の設定や鍵のパス、共有の Bearer トークンが入り、DB ファイルは <code>0600</code> で作ります。エージェント専用トークンは、ハッシュだけを保存します。保存したパスワードは画面に返しません。",
       "faq.q7.s": "保証はありますか？",
       "faq.q7.a": "<strong>ありません。</strong>本ソフトウェアは MIT ライセンスに基づき「<strong>現状有姿（AS IS）</strong>」で提供され、明示・黙示を問わず一切の保証（商品性・特定目的適合性・非侵害など）はありません。利用によって生じたいかなる損害についても、作者・配布者は責任を負いません。本番環境で使う場合は、必ずご自身の責任で検証してください。",
 
@@ -678,12 +715,17 @@
 
       "dl.label": "ダウンロード",
       "dl.title": "単一ファイルで、すぐ使える。",
-      "dl.p": "インストール後、サイドバーの「コマンド履歴・承認」や「ターミナル」からそのまま使えます。",
-      "dl.mac.meta": "Apple Silicon (arm64) · .app (zip)",
-      "dl.mac.btn": "ダウンロード（5.1MB）",
-      "dl.win.meta": "x64 · .exe (zip)",
-      "dl.win.btn": "ダウンロード（8.5MB）",
-      "dl.note": "配布中のバージョンは <strong>v0.1.0</strong> です。「v1 の変更」節の内容は、まだ含まれていません。<br />\n        初回起動の注意（macOS）：未署名アプリのため、初回は <code>.app</code> を右クリック →「開く」で許可してください。<br />\n        初回起動の注意（Windows）：未署名のため SmartScreen が出る場合は「詳細情報」→「実行」で起動できます。<br />\n        ソースからビルド：<code>wails build</code>（Go 1.25 / Node が必要）。詳細は GitHub の README を参照。<br />\n        ライセンスは <strong>MIT</strong>（商用利用・改変・再配布OK）。<br />\n        <strong>無保証（AS IS）</strong>：本ソフトウェアは現状有姿で提供され、明示・黙示を問わず一切の保証はありません。生じた損害について作者・配布者は責任を負いません。<strong>利用は自己責任</strong>でお願いします。",
+      "dl.p": "GUI 版は macOS と Windows 向けです。サーバーやコンテナで常駐させるなら、headless 専用ビルド（Linux / macOS / Windows）を使ってください。",
+      "dl.mac.meta": "Universal（Apple Silicon / Intel）· .app (zip)",
+      "dl.mac.btn": "ダウンロード",
+      "dl.win.meta": "x64 / ARM64 · .exe (zip)",
+      "dl.win.x64": "x64 をダウンロード",
+      "dl.win.arm64": "ARM64 をダウンロード",
+      "dl.hl.title": "headless 版",
+      "dl.hl.meta": "GUI なし · ブラウザの Web 管理画面で操作 · Linux は tar.gz（systemd の unit 付き）、macOS / Windows は zip",
+      "dl.sums": "SHA256SUMS.txt",
+      "dl.all": "すべてのリリース",
+      "dl.note": "配布中のバージョンは <strong>v1.0.0</strong> です。ボタンは GitHub Releases の最新版のファイルを直接ダウンロードします。各ファイルは、リリースに添付の <code>SHA256SUMS.txt</code> で照合できます（<code>shasum -a 256 -c SHA256SUMS.txt --ignore-missing</code>）。<br />\n        初回起動の注意（macOS）：未署名アプリのため、初回は <code>.app</code> を右クリック →「開く」で許可してください。headless 版は、展開したあと <code>xattr -d com.apple.quarantine ssh-gete</code> で隔離属性を外してから起動します。<br />\n        初回起動の注意（Windows）：未署名のため SmartScreen が出る場合は「詳細情報」→「実行」で起動できます。<br />\n        headless 版の使い方（起動、ログイン、TLS、systemd、Docker）は、アーカイブに同梱の <code>headless.md</code>、または GitHub の <a href=\"https://github.com/yoshiyakato/ssh-gate-oss/blob/main/docs/headless.md\" target=\"_blank\" rel=\"noopener\">docs/headless.md</a> を参照。GUI 版も <code>--headless</code> を付けて起動できます。<br />\n        ソースからビルド：<code>wails build</code>（Go 1.26 / Node が必要）。詳細は GitHub の README を参照。<br />\n        ライセンスは <strong>MIT</strong>（商用利用・改変・再配布OK）。<br />\n        <strong>無保証（AS IS）</strong>：本ソフトウェアは現状有姿で提供され、明示・黙示を問わず一切の保証はありません。生じた損害について作者・配布者は責任を負いません。<strong>利用は自己責任</strong>でお願いします。",
 
       "foot.license": "MIT License",
       "foot.article": "紹介記事",
@@ -695,7 +737,7 @@
 
       "nav.why": "Why",
       "nav.features": "Features",
-      "nav.v1": "What's new in v1",
+      "nav.v1": "What's new in v1.0.0",
       "nav.oss": "Open Source",
       "nav.faq": "FAQ",
       "nav.download": "Download",
@@ -705,7 +747,7 @@
       "hero.lead": '<strong style="color:#fff">It can do anything — so it must never run wild. And every action leaves a record.</strong>\n        The agent\'s requests wait in an <strong style="color:#fff">approval queue</strong> and reach the machine only after a human approves them — every run lands in the <strong style="color:#fff">audit log</strong>.\n        <strong style="color:#fff">SSH GATE</strong> (<code>ssh-gete</code>) is a fully local, human-in-the-loop SSH gateway.',
       "hero.cta.dl": "Download",
       "hero.cta.how": "See how it works",
-      "hero.note": "macOS (Apple Silicon) / Windows · Open source · All traffic stays local",
+      "hero.note": "macOS / Windows / Linux (headless) · Open source · Local-only by default",
       "hero.console.title": "SSH GATE — Approval Queue",
       "hero.console.body": '<span class="m">agent</span> <span class="y">claude</span> → execute_command\n  host: web01   command: sudo systemctl restart nginx\n  <span class="b">⚠ risk: High</span>   status: awaiting approval (not yet executed)\n\n<span class="m"># A human reviews it in the GUI → "Approve & run"</span>\n  <span class="g">✓ executed</span>   0.8s · recorded in the audit log\n',
 
@@ -736,15 +778,15 @@
       "feat.f1.h": "Human approval gateway",
       "feat.f1.p": "Agent requests go into the approval queue. Review them in the GUI and, if needed, tweak the command before running it.",
       "feat.f2.h": "Built-in MCP server",
-      "feat.f2.p": "Exposes <code>list_hosts</code> / <code>execute_command</code> and more over JSON-RPC 2.0 on HTTP. MCP clients such as Claude can connect.",
+      "feat.f2.p": "Exposes <code>list_hosts</code> / <code>execute_command</code> / <code>get_request_status</code> and more, plus the AI session tools (<code>open_session</code> and others), over JSON-RPC 2.0 on HTTP. MCP clients such as Claude can connect.",
       "feat.f3.h": "Risk classification",
       "feat.f3.p": "Estimates and labels each command as High / Medium / Low to aid human judgment (a guide only — approval and policy decide whether it runs).",
       "feat.f4.h": "Audit log",
       "feat.f4.p": "Every request, execution result, and duration is recorded in SQLite. The history remains even if you delete the host.",
       "feat.f5.h": "Live terminal (SSH / serial)",
-      "feat.f5.p": "Separate from the approval flow, an interactive terminal for direct human operation is built in. Handle interactive SSH shells and serial ports on the same screen.",
+      "feat.f5.p": "Separate from the approval flow, an interactive terminal for direct human operation is built in. Handle interactive SSH shells and serial ports on the same screen, with as many tabs per host as you need.",
       "feat.f6.h": "Fully local & minimal retention",
-      "feat.f6.p": "Listens on <code>127.0.0.1:8787</code> by default. SSH key passphrases are never stored — kept in memory only. Optional Bearer authentication too.",
+      "feat.f6.p": "Listens on <code>127.0.0.1:8787</code> by default. Passwords go to the OS keychain; SSH key passphrases are not stored by default — memory only. Optional Bearer authentication too.",
 
       "how.label": "How it works",
       "how.title": "Place a gatekeeper between the agent and the real machine.",
@@ -756,55 +798,58 @@
 
       "term.label": "Terminal",
       "term.title": "SSH and serial, on a single screen.",
-      "term.p": '"Direct human operation" that does not go through the approval flow is provided too. Each host carries a type (SSH / serial), and the terminal follows it.\n        Network-device consoles and USB serial open with the same feel as an interactive SSH shell.\n        <strong>Serial hosts cannot be executed from MCP</strong> (interactive GUI only).',
+      "term.p": "\"Direct human operation\" that does not go through the approval flow is provided too. Each host carries a type (SSH / serial), and the terminal follows it.\n        Network-device consoles and USB serial open with the same feel as an interactive SSH shell.\n        From the toolbar you can send control characters such as Ctrl-C, SSH signals (TERM, KILL, HUP, INT), and a serial BREAK.\n        <strong>Serial hosts cannot be executed from MCP</strong> (interactive GUI only).",
 
       "sec.label": "Security by design",
       "sec.title": "Safety is built in layers, not a single switch.",
       "sec.s1.h": "Approval required by default",
       "sec.s1.p": "Low-risk commands are not auto-executed either. <code>AutoExecuteLowRisk</code> is pinned to false on both the backend and the frontend.",
-      "sec.s2.h": "Agent name required",
-      "sec.s2.p": "Always records whose request it is. You cannot grant approval-skip to an undeclared agent.",
+      "sec.s2.h": "Agent name required, per-agent tokens",
+      "sec.s2.p": "Always records whose request it is. Approval-skip works only when an agent a human granted it to calls with that agent's own token.",
       "sec.s3.h": "Output limits and timeouts",
       "sec.s3.p": "stdout/stderr are truncated at a cap, and connections and commands have timeouts. On overrun, the process is reliably killed.",
       "sec.s4.h": "Minimal credential retention",
-      "sec.s4.p": "SSH key passphrases live in memory only (never stored in the DB). Tokens are shown masked and never returned in plaintext.",
+      "sec.s4.p": "Passwords go to the OS keychain (never in plaintext in the DB). SSH key passphrases are memory-only by default. Tokens are shown masked and never returned in plaintext; per-agent tokens are stored only as hashes.",
 
-      "v1.label": "What's new in v1",
+      "v1.label": "What's new in v1.0.0",
       "v1.title": "One more layer of safety.",
-      "v1.note": "This section describes the next version (v1). <strong>None of it is in v0.1.0, the version distributed today.</strong> \"Implemented\" means the code and tests are in place; \"In development\" means it is still being integrated and is not finished, including its screens.",
-      "v1.done.pill": "Implemented",
-      "v1.done.h": "Not yet released",
+      "v1.note": "The main changes in v1.0.0. \"New\" lists what you can now do; \"Safety\" lists what tightens approval and execution.",
+      "v1.new.pill": "New",
+      "v1.new.h": "More ways to use it",
+      "v1.n1.h": "<code>--headless</code> and the web admin screen",
+      "v1.n1.p": "Started with <code>--headless</code>, it shows no window and runs only the MCP server and a web admin screen. Approvals, host editing, terminals, and settings are all operated from a browser (Linux / macOS / Windows). The web admin screen listens on <code>127.0.0.1:8788</code> by default, and login (the admin token, or an optional admin password) is required even from 127.0.0.1. The admin credentials are separate from the MCP Bearer token, and neither works in place of the other. Exposing it on the LAN requires TLS; without it, startup is refused. The Linux version is a headless-only build (a single executable without cgo; no GTK / WebKit needed), with a systemd unit and Docker examples.",
+      "v1.n2.h": "Persistent SSH sessions for the AI",
+      "v1.n2.p": "With the MCP tools <code>open_session</code> / <code>send_line</code> / <code>read_output</code> / <code>close_session</code>, an agent opens a shell of its own and sends commands one after another, with <code>cd</code> and environment variables carried over. Every line goes through risk classification and approval (the approval-skip rules apply as usual), and a line that has not been approved never reaches the shell. These sessions are kept apart from the human's terminal tabs: the AI cannot read from or type into them. The lines sent and their output are kept in the audit log. Sessions close on their own after an idle period (10 minutes by default) and a maximum lifetime (1 hour by default), and a human can list, watch, and force-close them from the screen. Off by default, and only agents authenticated with their own agent token can use it.",
+      "v1.n3.h": "Sending signals from the terminal",
+      "v1.n3.p": "From the menu in the terminal toolbar you can send the control characters Ctrl-C, Ctrl-Z, Ctrl-\\, and Ctrl-D, and SSH signals (TERM, KILL, HUP, INT). If the server does not support a signal, it tells you so. KILL and TERM ask for confirmation first. On serial, you can send a BREAK.",
+      "v1.n4.h": "Multiple tabs, server tabs, and shortcuts",
+      "v1.n4.p": "Open as many shells as you like on one host. Tabs stay open when you move to another screen, and closing one leaves the others running. Per-host tabs across the top filter the approval queue and history to that host. The sidebar shows connected sessions, the number of shells, running commands, the MCP listener status, and how many requests await approval. Keyboard shortcuts open a new shell, close a tab, and switch tabs and servers (Cmd on macOS, Ctrl+Shift on Windows, Alt+Shift in the web admin screen).",
+      "v1.n5.h": "Passwords in the OS keychain",
+      "v1.n5.p": "Host passwords are stored not in SQLite but in the OS keychain (the macOS Keychain, Windows Credential Manager, or the Linux Secret Service). If the keychain is unavailable, they are still never written to the DB in plaintext (you can use one for the current session only). Plaintext passwords left in the DB are moved to the keychain at startup. SSH key passphrases are not stored by default; one is saved only when you choose \"Save in keychain\" while entering it. In headless mode you can choose where secrets go: <code>keychain</code>, <code>file</code> (<code>secrets.json</code>, mode 0600), or <code>env</code>.",
+      "v1.d6.h": "Host management and the edit screen",
+      "v1.d6.p": "Hosts are tracked by an immutable ID rather than by name, so history and tabs follow a rename. Passwords are never sent back to the screen after saving (saving with the field left blank keeps the stored value). \"Test connection\" works on unsaved input and does not overwrite the saved state. The edit screen shows \"Saved / Unsaved changes\" and asks before you leave with unsaved changes.",
+      "v1.d8.h": "MCP: fetching results, retries, exit codes",
+      "v1.d8.p": "<code>get_request_status</code> returns the state and result of a request in the approval queue (<code>wait_seconds</code> lets it wait up to 60 seconds). With a <code>client_request_id</code>, a retry within 24 hours does not run again and returns the same <code>request_id</code>. Results include <code>exit_code</code>, and failures can be detected with <code>isError</code>.",
+      "v1.safe.pill": "Safety",
+      "v1.safe.h": "Tighter approval and execution",
       "v1.d1.h": "Blocking attacks through the browser",
       "v1.d1.p": "Closes the path by which a malicious web page pushes requests into the MCP server on localhost. Requests with an <code>Origin</code> header are rejected by default (403), <code>Host</code> is checked down to the port number (against DNS rebinding), and POST bodies other than <code>application/json</code> are refused. Listening on anything other than 127.0.0.1 requires Bearer authentication.",
+      "v1.d3.h": "Approval-skip needs the agent's own token; High always queues",
+      "v1.d3.p": "Neither declaring an agent name nor the shared Bearer token unlocks approval-skip. It works only when the agent calls MCP with its own agent token (shown once when issued; only its hash is stored). A grant carries an expiry (8 hours when given from the approval screen), a maximum risk (Low or Medium), and the hosts it covers, and <strong>High-risk commands always go to the approval queue</strong>. By default, commands containing <code>sudo</code>, hosts with a production tag (such as <code>prod</code>), and any command that is not Low risk also require approval.",
+      "v1.d11.h": "Allow-list risk classification",
+      "v1.d11.p": "A command is Low only when it is an allow-listed read-only command called with plain arguments. Anything the classifier cannot read with certainty — quoting, escapes, expansions, redirections, control or invisible characters, code handed to an interpreter — is High. Commands chained with <code>;</code>, <code>&amp;&amp;</code>, or <code>|</code> are classified one by one, and the highest risk wins. Commands that are neither allow-listed nor recognized as destructive are Medium.",
+      "v1.d10.h": "Host key verification (TOFU)",
+      "v1.d10.p": "The key of a new host is recorded in ssh-gete's own known_hosts file (mode 0600) when a human runs a connection test from the screen, and its fingerprint is shown. Agents (MCP) never connect to a host with no recorded key. If a key does not match the record, the connection is refused on every path. In strict mode, <code>~/.ssh/known_hosts</code> is trusted as well and new keys are never recorded.",
+      "v1.d12.h": "Approval stops if the target changed",
+      "v1.d12.p": "If the host's user@host:port changed after the request was made, approving it does not run the command; the agent has to ask again. This holds on every approval path.",
       "v1.d2.h": "Approved once, run once",
       "v1.d2.p": "Approve and reject advance the request state with a compare-and-swap in the DB. Even with a double click, or approve and reject racing each other, the command runs only once. A request that was running when the app quit is recorded as \"Interrupted\" on the next launch and cannot be approved again.",
-      "v1.d3.h": "Approval-skip needs Bearer; High always queues",
-      "v1.d3.p": "Declaring an agent name is not enough to use approval-skip. It can be granted only once Bearer authentication is enabled, and even then <strong>High-risk commands always go to the approval queue</strong>. By default, commands containing <code>sudo</code>, hosts with a production tag (such as <code>prod</code>), and any command that is not Low risk also require approval.",
       "v1.d4.h": "Editing at approval time, and its record",
       "v1.d4.p": "You can fix the command on the approval screen before running it. The edited command is re-classified, and if its risk went up you are asked to confirm again. The requested command and the command actually executed are kept separately in the history.",
       "v1.d5.h": "Protected audit API",
       "v1.d5.p": "The audit endpoint <code>/audit/events</code> accepts GET only and requires the token when Bearer authentication is enabled. The number of entries it returns is capped (100 by default, 500 at most).",
-      "v1.d6.h": "Host management and the edit screen",
-      "v1.d6.p": "Hosts are tracked by an immutable ID rather than by name, so history and tabs follow a rename. Passwords are never sent back to the screen after saving (saving with the field left blank keeps the stored value). \"Test connection\" works on unsaved input and does not overwrite the saved state. The edit screen shows \"Saved / Unsaved changes\" and asks before you leave with unsaved changes.",
-      "v1.d7.h": "Multiple terminal tabs and a new sidebar",
-      "v1.d7.p": "Open as many shells as you like on one host. Tabs stay open when you move to another screen, and closing one leaves the others running. The sidebar shows connected sessions, the number of shells, running commands, the MCP listener status, and how many requests await approval.",
-      "v1.d8.h": "MCP: fetching results, retries, exit codes",
-      "v1.d8.p": "<code>get_request_status</code> returns the state and result of a request in the approval queue (<code>wait_seconds</code> lets it wait up to 60 seconds). With a <code>client_request_id</code>, a retry within 24 hours does not run again and returns the same <code>request_id</code>. Results include <code>exit_code</code>, and failures can be detected with <code>isError</code>.",
       "v1.d9.h": "CI and dependencies",
       "v1.d9.p": "Tests run with <code>-race</code> on three OSes — macOS, Windows, and Linux — and <code>govulncheck</code> and <code>npm audit</code> (failing at high or above) run every time. GitHub Actions are pinned to commit SHAs and kept up to date with Dependabot. The release workflow attaches <code>SHA256SUMS.txt</code> to its artifacts.",
-      "v1.wip.pill": "In development",
-      "v1.wip.h": "Still being integrated; screens not finished",
-      "v1.wip.note": "Details and names may change.",
-      "v1.w1.h": "Host key verification (TOFU)",
-      "v1.w1.p": "Records the key of a host on first connection in a dedicated known_hosts file, and from then on refuses to connect if the key does not match.",
-      "v1.w2.h": "Per-agent tokens",
-      "v1.w2.p": "The shared token alone will no longer unlock approval-skip; each agent gets its own token with an expiry, a maximum risk, and the hosts it applies to.",
-      "v1.w3.h": "Stronger risk classification",
-      "v1.w3.p": "Also recognizes commands chained with <code>;</code> or <code>&amp;&amp;</code>, <code>sudo</code> given by full path, and execution through <code>env</code> / <code>xargs</code>.",
-      "v1.w4.h": "Stop approval if the target changed",
-      "v1.w4.p": "If the host's user@host:port changed after the request was made, approving it will not run the command.",
-      "v1.w5.h": "Server tabs at the top, and shortcuts",
-      "v1.w5.p": "Per-host tabs across the top of the screen filter the approval queue and history to that host. Keyboard shortcuts are added too.",
 
       "oss.label": "Open source",
       "oss.title": "Because SSH and serial matter, you can see what's inside.",
@@ -816,15 +861,15 @@
       "faq.q1.s": "Where can I read a fuller introduction and background?",
       "faq.q1.a": 'We have summarized the development background and use cases in an article on Qiita →\n          <a href="https://qiita.com/yoshiyakato/private/7987aa7a671f089f06ea" target="_blank" rel="noopener">SSH GATE introduction (Qiita)</a>.\n          <br /><small>* This is a limited-share link.</small>',
       "faq.q2.s": "Will it really never run on its own from an agent?",
-      "faq.q2.a": "Correct. Commands via MCP go into the approval queue regardless of risk. They run only when a human approves them in the GUI, or when a specific agent has been explicitly granted \"approval-skip.\" The latter takes effect only when a human intentionally granted it.<br /><small>In v1 (unreleased), approval-skip can be granted only when Bearer authentication is enabled, and High-risk commands always go to the approval queue even with approval-skip.</small>",
+      "faq.q2.a": "Correct. By default, commands via MCP go into the approval queue regardless of risk. A command skips the queue only when a human has granted a specific agent \"approval-skip\" and that agent calls with its own agent token. The grant has an expiry and a maximum risk, and High-risk commands always go to the approval queue even with approval-skip. Each line sent in an AI session goes through approval under the same rules.",
       "faq.q3.s": "How far can I trust the risk classification (High/Medium/Low)?",
-      "faq.q3.a": "It's a heuristic on the command string, so it can be evaded with quoting or aliases. It's a <strong>guide</strong> to aid human judgment only and does not itself decide whether a command runs. Approval and policy decide that.",
+      "faq.q3.a": "A command is Low only when it is an allow-listed read-only command with plain arguments; anything the classifier cannot read with certainty is High. Even so, it looks only at the command string, so it cannot know what a command of that name actually does on the target host. It's a <strong>guide</strong> to aid human judgment and does not itself decide whether a command runs. Approval and policy decide that.",
       "faq.q4.s": "Will it be exposed externally?",
-      "faq.q4.a": "It listens on <code>127.0.0.1:8787</code> by default, on the assumption that it talks only to local agents. You can configure Bearer authentication, a body-size cap, and CORS restrictions as needed.<br /><small>In v1 (unreleased), requests carrying an <code>Origin</code> header are rejected by default, and listening on anything other than 127.0.0.1 requires Bearer authentication.</small>",
+      "faq.q4.a": "By default, MCP listens on <code>127.0.0.1:8787</code> and the headless web admin screen on <code>127.0.0.1:8788</code>, on the assumption that they are used only from the same PC. Requests carrying an <code>Origin</code> header are rejected by default. To expose them on the LAN, MCP requires Bearer authentication and the web admin screen requires TLS; without these they do not listen. The web admin screen always requires login, wherever it is opened from.",
       "faq.q5.s": "Can I use it for serial ports?",
       "faq.q5.a": "Yes. Set the host's type to \"serial\" and a serial console opens in the terminal screen, with the same feel as SSH. Note that serial is interactive-GUI only and cannot be executed from MCP (agents).",
       "faq.q6.s": "Where are credentials stored?",
-      "faq.q6.a": "A host's key path / password and the Bearer token are stored in SQLite. On the other hand, <strong>SSH key passphrases are not stored</strong> — they are kept only in memory while the app is running. The DB file is placed in a <code>0700</code> directory.<br /><small>In v1 (unreleased), the DB file itself is created as <code>0600</code>, and saved passwords are never sent back to the screen.</small>",
+      "faq.q6.a": "Host passwords are stored in the OS keychain, not in SQLite (in headless mode you can also choose <code>file</code> or <code>env</code>). <strong>SSH key passphrases are not stored by default</strong> — they are kept only in memory while the app is running (and saved to the keychain only if you choose to). SQLite holds the host settings, key paths, and the shared Bearer token, and the DB file is created as <code>0600</code>. Per-agent tokens are stored only as hashes. Saved passwords are never sent back to the screen.",
       "faq.q7.s": "Is there a warranty?",
       "faq.q7.a": "<strong>No.</strong> This software is provided under the MIT License <strong>\"AS IS\"</strong>, without warranty of any kind, express or implied, including but not limited to merchantability, fitness for a particular purpose, and non-infringement. In no event shall the authors or distributors be liable for any damage arising from its use. If you use it in production, be sure to validate it at your own risk.",
 
@@ -835,12 +880,17 @@
 
       "dl.label": "Download",
       "dl.title": "A single file, ready to use right away.",
-      "dl.p": "After installing, use it directly from \"Command history & approvals\" or \"Terminal\" in the sidebar.",
-      "dl.mac.meta": "Apple Silicon (arm64) · .app (zip)",
-      "dl.mac.btn": "Download (5.1MB)",
-      "dl.win.meta": "x64 · .exe (zip)",
-      "dl.win.btn": "Download (8.5MB)",
-      "dl.note": "The version currently distributed is <strong>v0.1.0</strong>. It does not yet include anything in the \"What's new in v1\" section.<br />\n        First-launch note (macOS): Since the app is unsigned, on first launch right-click the <code>.app</code> → \"Open\" to allow it.<br />\n        First-launch note (Windows): Since it is unsigned, if SmartScreen appears, click \"More info\" → \"Run anyway\" to start it.<br />\n        Build from source: <code>wails build</code> (requires Go 1.25 / Node). See the README on GitHub for details.<br />\n        Licensed under <strong>MIT</strong> (commercial use, modification, and redistribution OK).<br />\n        <strong>No warranty (AS IS)</strong>: This software is provided as-is, without warranty of any kind, express or implied. The authors and distributors are not liable for any damage that may arise. <strong>Use is at your own risk.</strong>",
+      "dl.p": "The GUI version is for macOS and Windows. To run it as a service on a server or in a container, use a headless-only build (Linux / macOS / Windows).",
+      "dl.mac.meta": "Universal (Apple Silicon / Intel) · .app (zip)",
+      "dl.mac.btn": "Download",
+      "dl.win.meta": "x64 / ARM64 · .exe (zip)",
+      "dl.win.x64": "Download x64",
+      "dl.win.arm64": "Download ARM64",
+      "dl.hl.title": "Headless",
+      "dl.hl.meta": "No GUI · operated from the web admin screen in a browser · tar.gz for Linux (with a systemd unit), zip for macOS / Windows",
+      "dl.sums": "SHA256SUMS.txt",
+      "dl.all": "All releases",
+      "dl.note": "The version currently distributed is <strong>v1.0.0</strong>. The buttons download the files of the latest release on GitHub Releases directly. Each file can be checked against the <code>SHA256SUMS.txt</code> attached to the release (<code>shasum -a 256 -c SHA256SUMS.txt --ignore-missing</code>).<br />\n        First-launch note (macOS): Since the app is unsigned, on first launch right-click the <code>.app</code> → \"Open\" to allow it. For the headless build, after extracting, remove the quarantine attribute with <code>xattr -d com.apple.quarantine ssh-gete</code> before starting it.<br />\n        First-launch note (Windows): Since it is unsigned, if SmartScreen appears, click \"More info\" → \"Run anyway\" to start it.<br />\n        For how to use the headless build (startup, login, TLS, systemd, Docker), see <code>headless.md</code> in the archive or <a href=\"https://github.com/yoshiyakato/ssh-gate-oss/blob/main/docs/headless.md\" target=\"_blank\" rel=\"noopener\">docs/headless.md</a> on GitHub. The GUI version can also be started with <code>--headless</code>.<br />\n        Build from source: <code>wails build</code> (requires Go 1.26 / Node). See the README on GitHub for details.<br />\n        Licensed under <strong>MIT</strong> (commercial use, modification, and redistribution OK).<br />\n        <strong>No warranty (AS IS)</strong>: This software is provided as-is, without warranty of any kind, express or implied. The authors and distributors are not liable for any damage that may arise. <strong>Use is at your own risk.</strong>",
 
       "foot.license": "MIT License",
       "foot.article": "Article",
