@@ -12,7 +12,7 @@
   "devDependencies": {
     "jsdom": "^29.1.1",
     "vite": "^8.3.5",
-    "vitest": "^4.1.12"
+    "vitest": "^5.0.4"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",
