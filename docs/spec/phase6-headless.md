@@ -896,7 +896,7 @@ test.yml への追加: `headless` ジョブ（ubuntu）で `mkdir -p frontend/di
 - 型の先出し: B の `WebConfig` / `SessionConfig` / `SecretsConfig`、C の `auditSink` / `adminAuditEntry`、A の `eventSink` は、最初の半日で空の実装として先に入れ、他の担当はそれを前提に進める。
 - A は B・C・D・F の関数を呼ぶだけ（中身を知らない）。A のテストでは偽物を差し込めるよう、`runHeadless` の内部を `headlessDeps` の構造体経由で組み立てる。
 - E は Go のコードに依存しない（HTTP の約束 §3.1・§4.1・§6.3 だけに依存する）。
-- 統合担当（1人、並列作業の後）: go.mod（yaml の追加と `go mod tidy`）、`runHeadless` の結線、全テストを両方のタグで実行、本体（`/Users/katouyoshiya/Documents/ssh-gate-oss`）のリスク判定・app.go などの修正とのマージ（このブランチで触る既存ファイルは §0 の4つだけなので、衝突はそこに限られる）、ssh-gate-spec.sqlite の REQ-015 の状態の更新、CLAUDE.md / design-v1 に §2.2 の「Wails の runtime は `*_wails.go` だけ」の規約を追記。
+- 統合担当（1人、並列作業の後）: go.mod（yaml の追加と `go mod tidy`）、`runHeadless` の結線、全テストを両方のタグで実行、本体（`<repo>`）のリスク判定・app.go などの修正とのマージ（このブランチで触る既存ファイルは §0 の4つだけなので、衝突はそこに限られる）、ssh-gate-spec.sqlite の REQ-015 の状態の更新、CLAUDE.md / design-v1 に §2.2 の「Wails の runtime は `*_wails.go` だけ」の規約を追記。
 
 ---
 

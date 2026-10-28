@@ -286,7 +286,7 @@ a6f2706 のコピー上のスクラッチテストで再現した（要求の Co
 
 **内容**: ssh-agent への接続には期限がなく、ctx がキャンセルされても閉じられません。handshake を監視する goroutine は netConn しか閉じず、closeAgent は openSSHClient が戻るまで defer されています。agent が応答しないと、認証は `agentClient.Signers()`/Sign の中で止まったままになり、ConnectTimeout も netConn の期限も ctx（CommandTimeout）も効かず、openSSHClient は永久に止まります。
 
-**再現シナリオ**: 固定したツリーで再現した（コピーは `/private/tmp/claude-501/-Users-katouyoshiya-Documents-ssh-gate-oss/d3371860-2ba6-4405-9062-4dd18830d8d2/scratchpad/agenthang/agenthang_test.go`）。SSH_AUTH_SOCK を、接続は受け付けるが一切応答しない agent に向ける（応答されない Touch ID や承認プロンプトを待っている Secretive/1Password 型の agent、または固まった agent）。接続は鍵認証で鍵ファイルがないので、207行の agent だけの経路を通る。runSSHCommand（2秒タイムアウトの ctx、ConnectTimeout=1）は8秒後も止まったままだった。暗号化された鍵の経路も同じで、248行の filtered() がダイヤルより前に `agentClient.Signers()` を同期的に呼ぶ。影響として、MCP の execute_command の goroutine が CommandTimeout を過ぎても running のまま残り、testSSHConnection / startSSHSession では UI の操作が止まる。
+**再現シナリオ**: 固定したツリーで再現した（コピーは `<scratchpad>/agenthang/agenthang_test.go`）。SSH_AUTH_SOCK を、接続は受け付けるが一切応答しない agent に向ける（応答されない Touch ID や承認プロンプトを待っている Secretive/1Password 型の agent、または固まった agent）。接続は鍵認証で鍵ファイルがないので、207行の agent だけの経路を通る。runSSHCommand（2秒タイムアウトの ctx、ConnectTimeout=1）は8秒後も止まったままだった。暗号化された鍵の経路も同じで、248行の filtered() がダイヤルより前に `agentClient.Signers()` を同期的に呼ぶ。影響として、MCP の execute_command の goroutine が CommandTimeout を過ぎても running のまま残り、testSSHConnection / startSSHSession では UI の操作が止まる。
 
 **修正案**: agent のソケットに期限を付ける。ダイヤルした直後に `agentConn.SetDeadline(now+timeout)` を設定し、handshake 監視の ctx.Done 分岐でも agent を閉じる（closeAgent はすでに Once で保護されている）。248行のダイヤル前の Signers() 呼び出しにも同じ期限を付ける。
 
@@ -294,7 +294,7 @@ a6f2706 のコピー上のスクラッチテストで再現した（要求の Co
 
 **内容**: openStore は、DB ファイルが存在するかどうかだけで `fresh` を決め、SQLite が開く前に空の 0600 ファイルを作ります。初回起動が migrate のコミット前に失敗するか強制終了されると、0バイトのファイルが残ります。次回の起動では fresh=false、prevVersion=0 になります。migrateLegacyData は取り込みをスキップします（importData = store.fresh）が、connections.json と mcp-settings.json は *.migrated にリネームします。旧版の接続、パスワード、MCP トークンがすべて、何の知らせもなくアプリから消えます。
 
-**再現シナリオ**: JSON だけの旧版から更新する。v1 の初回起動で `os.OpenFile(path, O_CREATE, 0600)` が走り、移行トランザクションがコミットされる前に落ちる（クラッシュ、強制終了、migrate のエラー、ディスクフル）。0バイトの ssh-gete.sqlite が残る。次回の起動ではファイルが存在するので fresh=false になり、user_version は 0 と読まれる。migrateLegacyData は importData=false にして、旧 JSON を *.migrated にリネームする。a6f2706 のスクラッチコピーで再現した（`/private/tmp/claude-501/-Users-katouyoshiya-Documents-ssh-gate-oss/d3371860-2ba6-4405-9062-4dd18830d8d2/scratchpad/st2/zz_audit_test.go`）。空の DB ファイルと、パスワード接続を1件含む connections.json を事前に用意し、openStore + migrateLegacyData を呼ぶ。結果は fresh=false prev=0 conns=0 jsonExists=false migratedExists=true。接続は取り込まれず、リネームされたファイルだけが残った。
+**再現シナリオ**: JSON だけの旧版から更新する。v1 の初回起動で `os.OpenFile(path, O_CREATE, 0600)` が走り、移行トランザクションがコミットされる前に落ちる（クラッシュ、強制終了、migrate のエラー、ディスクフル）。0バイトの ssh-gete.sqlite が残る。次回の起動ではファイルが存在するので fresh=false になり、user_version は 0 と読まれる。migrateLegacyData は importData=false にして、旧 JSON を *.migrated にリネームする。a6f2706 のスクラッチコピーで再現した（`<scratchpad>/st2/zz_audit_test.go`）。空の DB ファイルと、パスワード接続を1件含む connections.json を事前に用意し、openStore + migrateLegacyData を呼ぶ。結果は fresh=false prev=0 conns=0 jsonExists=false migratedExists=true。接続は取り込まれず、リネームされたファイルだけが残った。
 
 **修正案**: 新規かどうかをファイルの有無ではなく DB の中身で決める（user_version==0 で、CREATE の前に connections にも sqlite_master にも行がない）。または、仕様 §5.5 が示すとおり、旧データの取り込みを schema_meta のフラグ（例: legacy_migrated）として記録する。JSON のリネームは取り込みが成功した後だけにする。
 
@@ -334,7 +334,7 @@ a6f2706 のコピー上のスクラッチテストで再現した（要求の Co
 
 **内容**: classifyRisk の High の一覧は、各コマンドについて決まった1つの綴りにしか一致しません。難読化していない、ふつうの破壊的コマンドでも、書き方が違えば Low になります。承認省略の権限を持つエージェントは、設計上「High は常にキュー」であるはずのものを承認なしで実行できます。
 
-**再現シナリオ**: 既定の設定（RequireApprovalWriteOp/Sudo/Prod が ON）、Bearer 有効、エージェント 'claude-desktop' に承認省略、接続先に prod タグなし。エージェントが execute_command で `dd of=/dev/sda if=/dev/zero` を送る。パターンの 'dd if=' は if= が先に来ることを前提にしているので一致しない。ほかの例: `systemctl poweroff`、`poweroff`、`systemctl  stop sshd`（空白2つ）、`systemctl disable --now sshd`、`shred -u /etc/x`、`crontab -r`、`find / -delete`。classifyRisk をスクラッチプログラムにコピーして実行すると（`/private/tmp/claude-501/-Users-katouyoshiya-Documents-ssh-gate-oss/d3371860-2ba6-4405-9062-4dd18830d8d2/scratchpad/cr/main.go`）、どれも Low を返す。risk が Low なので needsHumanApproval は false を返し、executeCommandAndLog がすぐに auto_running として実行する。
+**再現シナリオ**: 既定の設定（RequireApprovalWriteOp/Sudo/Prod が ON）、Bearer 有効、エージェント 'claude-desktop' に承認省略、接続先に prod タグなし。エージェントが execute_command で `dd of=/dev/sda if=/dev/zero` を送る。パターンの 'dd if=' は if= が先に来ることを前提にしているので一致しない。ほかの例: `systemctl poweroff`、`poweroff`、`systemctl  stop sshd`（空白2つ）、`systemctl disable --now sshd`、`shred -u /etc/x`、`crontab -r`、`find / -delete`。classifyRisk をスクラッチプログラムにコピーして実行すると（`<scratchpad>/cr/main.go`）、どれも Low を返す。risk が Low なので needsHumanApproval は false を返し、executeCommandAndLog がすぐに auto_running として実行する。
 
 **修正案**: コマンドをトークンに分け（空白をまとめた後）、決まった「名前 + 引数」の文字列ではなくコマンド名で照合する。順番に関係なく if= か of= を持つ dd、poweroff/init/telinit、状態を変える systemctl のすべての動詞、shred、crontab -r、find -delete を High にする。これらの形のテストを追加する。
 
