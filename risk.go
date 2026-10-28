@@ -422,15 +422,21 @@ func readOnlyCommand(name string, args []string) bool {
 	switch name {
 	case "ls", "cat", "head", "tail", "wc", "df", "du", "free", "uptime", "uname", "whoami", "id",
 		"pwd", "stat", "which", "grep", "egrep", "fgrep", "uniq", "cut", "nl", "echo", "printf",
-		"true", "false", "nproc", "arch", "lsblk", "lscpu", "lsof", "ss", "netstat", "printenv",
+		"true", "false", "nproc", "arch", "lsblk", "lscpu", "lsof", "netstat", "printenv",
 		"basename", "dirname", "realpath", "readlink", "md5sum", "sha1sum", "sha256sum", "sha512sum",
 		"cksum", "tac", "rev", "column", "groups", "users", "who", "w", "last", "vmstat", "iostat",
 		"mpstat", "sleep", "test", "tr", "diff", "cmp", "comm", "getent", "dig", "host", "nslookup",
 		"ping", "tty", "locale", "sha256", "md5", "exit", "yes", "seq":
 		// uniq writes its second operand.
 		return !(name == "uniq" && len(nonOptions(args)) > 1)
+	case "ss":
+		// ss -K / --kill closes sockets and -D / --diag=FILE writes a file.
+		return !hasShortFlag(args, 'K') && !hasShortFlag(args, 'D') && !hasArg(args, "--kill", "--diag")
 	case "hostname":
-		return len(nonOptions(args)) == 0
+		// -F/--file and -b/--boot set the name; -FX and --file=X carry the
+		// value in the same word.
+		return len(nonOptions(args)) == 0 && !hasShortFlag(args, 'F') && !hasShortFlag(args, 'b') &&
+			!hasArg(args, "--file", "--boot")
 	case "file":
 		// file -C / --compile writes a .mgc file.
 		return !hasShortFlag(args, 'C') && !hasArg(args, "--compile")
@@ -446,7 +452,8 @@ func readOnlyCommand(name string, args []string) bool {
 		return !hasArg(args, "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls")
 	case "journalctl":
 		return !hasArgPrefix(args, "--vacuum") && !hasArg(args, "--vacuum-size", "--vacuum-time", "--vacuum-files",
-			"--rotate", "--flush", "--sync", "--relinquish-var", "--smart-relinquish-var", "--setup-keys", "--update-catalog")
+			"--rotate", "--flush", "--sync", "--relinquish-var", "--smart-relinquish-var", "--setup-keys", "--update-catalog",
+			"--cursor-file")
 	case "systemctl":
 		switch firstOperand(args) {
 		case "status", "is-active", "is-enabled", "is-failed", "list-units", "list-unit-files", "list-timers", "list-sockets", "show", "cat":
@@ -531,18 +538,51 @@ func readOnlyIP(args []string) bool {
 	return false
 }
 
-// dateSetsClock reports -s in a short option cluster (-s, -us). -d, -f, -r
-// and -I take the rest of the cluster as their value.
+// dateSetsClock reports -s in a short option cluster (-s, -us) and any
+// operand that is not a +FORMAT (date MMDDhhmm[[CC]YY] sets the clock).
+// -d, -f and -r take the rest of the cluster, or the next word, as their
+// value; -I takes only the rest of the cluster.
 func dateSetsClock(args []string) bool {
-	for _, a := range args {
-		if len(a) < 2 || a[0] != '-' || a[1] == '-' {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			for _, op := range args[i+1:] {
+				if !strings.HasPrefix(op, "+") {
+					return true
+				}
+			}
+			return false
+		}
+		if strings.HasPrefix(a, "--") {
+			key, _, hasValue := strings.Cut(a, "=")
+			if !hasValue && len(key) > 2 {
+				for _, v := range []string{"--date", "--file", "--reference"} {
+					if strings.HasPrefix(v, key) {
+						i++
+						break
+					}
+				}
+			}
 			continue
 		}
-		for _, c := range a[1:] {
+		if len(a) < 2 || a[0] != '-' {
+			if !strings.HasPrefix(a, "+") {
+				return true
+			}
+			continue
+		}
+		for j := 1; j < len(a); j++ {
+			c := a[j]
 			if c == 's' {
 				return true
 			}
-			if strings.ContainsRune("dfrI", c) {
+			if c == 'I' {
+				break
+			}
+			if strings.IndexByte("dfr", c) >= 0 {
+				if j == len(a)-1 {
+					i++
+				}
 				break
 			}
 		}

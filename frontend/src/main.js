@@ -124,12 +124,17 @@ function keepPageInput() {
     if (textarea) return { requestId: textarea.dataset.requestId ?? '', value: textarea.value };
   }
   if (state.active === 'settings' && state.dirty.settings && document.querySelector('#mcp-form')) {
-    const form = collectMCPForm();
-    const names = new Set([...document.querySelectorAll('#mcp-form [name]')].map((element) => element.name));
-    const shown = Object.fromEntries(Object.entries(form).filter(([key]) => names.has(key)));
-    state.settingsMcp = { ...state.settingsMcp, ...shown };
+    state.settingsMcp = { ...state.settingsMcp, ...shownMCPForm() };
   }
   return null;
+}
+
+// shownMCPForm is collectMCPForm limited to the fields the form draws, so
+// keeping unsaved input does not invent values for hidden ones.
+function shownMCPForm() {
+  const form = collectMCPForm();
+  const names = new Set([...document.querySelectorAll('#mcp-form [name]')].map((element) => element.name));
+  return Object.fromEntries(Object.entries(form).filter(([key]) => names.has(key)));
 }
 
 function restorePageInput(kept) {
@@ -837,7 +842,7 @@ function renderSettings() {
               ${inputCol(t('mcp.healthPath'), 'healthPath', mcp.healthPath)}
               ${inputCol(t('mcp.auditPath'), 'auditPath', mcp.auditPath)}
               ${inputCol(t('mcp.tokenName'), 'tokenName', mcp.tokenName)}
-              ${inputCol(t('mcp.tokenInput'), 'tokenInput', '', 'password')}
+              ${inputCol(t('mcp.tokenInput'), 'tokenInput', state.dirty.settings ? (mcp.tokenInput ?? '') : '', 'password')}
               ${readonlyCol(t('mcp.tokenPreview'), mcp.tokenFromEnv ? t('mcp.tokenFromEnv') : mcp.tokenPreview)}
               ${inputCol(t('mcp.allowedOrigins'), 'allowedOrigins', (mcp.allowedOrigins ?? []).join(', '), 'text', 'col-12')}
               ${selectCol(t('mcp.tlsMode'), 'tlsMode', mcp.tlsMode, ['ローカル平文', '内蔵TLS（未実装）', 'リバースプロキシ終端'], 'col-12 col-md-6', { 'ローカル平文': t('mcp.tls.local'), '内蔵TLS（未実装）': t('mcp.tls.builtin'), 'リバースプロキシ終端': t('mcp.tls.proxy') })}
@@ -1096,12 +1101,19 @@ async function handleCommonClick(event) {
   }
 
   if (action === 'generate-token') {
+    // Unsaved edits in the MCP form survive the token action: they are kept
+    // over the refreshed settings and the form stays dirty.
+    const kept = state.dirty.settings && document.querySelector('#mcp-form') ? shownMCPForm() : null;
     ctx.bumpGen();
     const result = await GenerateMCPToken();
     showToast(resultMessage(result));
     if (result.token) state.issuedToken = result.token;
-    state.dirty.settings = false;
+    state.dirty.settings = Boolean(kept);
     await refreshData({ silent: true });
+    if (kept) {
+      state.settingsMcp = { ...state.data.mcp, ...kept };
+      if (state.active === 'settings') renderPage();
+    }
     return;
   }
 

@@ -347,6 +347,27 @@ describe('main.js integration', () => {
     expect(document.querySelector('#mcp-form [name="listenAddress"]').value).toBe('0.0.0.0');
   });
 
+  // Final audit #11: a typed shared token survives a language switch.
+  it('keeps a typed shared token through a language switch', async () => {
+    await click('[data-nav="settings"]');
+    await typeInto('#mcp-form [name="tokenInput"]', 'new-shared-token');
+    await click('[data-lang="en"]');
+    expect(document.querySelector('#mcp-form [name="tokenInput"]').value).toBe('new-shared-token');
+    await click('[data-lang="ja"]');
+    expect(document.querySelector('#mcp-form [name="tokenInput"]').value).toBe('new-shared-token');
+  });
+
+  // Final audit #10: generating a token keeps unsaved MCP form edits.
+  it('keeps unsaved MCP form edits across token generation', async () => {
+    await click('[data-nav="settings"]');
+    await typeInto('#mcp-form [name="port"]', '8799');
+    await typeInto('#mcp-form [name="allowedOrigins"]', 'http://a.example');
+    await click('[data-action="generate-token"]');
+    await flush();
+    expect(document.querySelector('#mcp-form [name="port"]').value).toBe('8799');
+    expect(document.querySelector('#mcp-form [name="allowedOrigins"]').value).toBe('http://a.example');
+  });
+
   // E7: one shape for both ~/.claude.json examples, labeled, no Japanese
   // placeholder in English.
   it('labels the shared-Bearer example and localizes its placeholder', async () => {

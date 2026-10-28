@@ -39,6 +39,7 @@ export const RESULT_I18N = {
     'result.code.resize_failed': 'サイズ変更に失敗しました',
     'result.code.port_unavailable': 'シリアルポートを確認できません',
     'result.code.port_in_use': 'シリアルポートは使用中です',
+    'result.code.input_timeout': '入力の送信が詰まっています',
   },
   en: {
     'result.done': 'Done',
@@ -73,6 +74,7 @@ export const RESULT_I18N = {
     'result.code.resize_failed': 'Resizing failed',
     'result.code.port_unavailable': 'The serial port cannot be checked',
     'result.code.port_in_use': 'The serial port is in use',
+    'result.code.input_timeout': 'Sending input is stuck',
   },
 };
 

@@ -925,18 +925,18 @@ func (a *App) TestConnectionWithPassphrase(id string, passphrase string) ActionR
 func (a *App) TestConnectionConfig(conn Connection, passphrase string) ActionResult {
 	conn = normalizeConnection(conn)
 	if conn.ID != "" && conn.usesPassword() && conn.Credential == "" && conn.Type != "Serial" {
-		if saved, ok := a.connectionByID(conn.ID); ok && saved.usesPassword() {
-			if !sameEndpoint(saved, conn) {
-				// The stored password (or one given for this session) belongs
-				// to the saved host/port/user: never send it anywhere else
-				// (audit #36).
-				return passwordRequiredResult(conn.ID)
-			}
-			// A keychain password stays a reference (Credential "",
-			// CredentialSet) until resolveCredential reads it.
-			conn.Credential = saved.Credential
-			conn.CredentialSet = saved.CredentialSet
+		saved, ok := a.connectionByID(conn.ID)
+		if !ok || !saved.usesPassword() || saved.connectionType() == "Serial" || !sameEndpoint(saved, conn) {
+			// The stored password (or one given for this session) belongs
+			// to a saved password connection at the saved host/port/user:
+			// never send it anywhere else (audit #36), and not when the
+			// saved row no longer uses a password (final audit #4).
+			return passwordRequiredResult(conn.ID)
 		}
+		// A keychain password stays a reference (Credential "",
+		// CredentialSet) until resolveCredential reads it.
+		conn.Credential = saved.Credential
+		conn.CredentialSet = saved.CredentialSet
 	}
 	if conn.Type == "Serial" {
 		return a.testSerialConnection(conn)
@@ -1272,9 +1272,11 @@ func (a *App) saveConnection(connection Connection) (result ActionResult, post f
 		delete(a.sshPassphrases, connection.ID)
 	}
 	a.forgetSecretsLocked(connection.ID)
-	if (newPassword || !sameEndpoint(previous, connection)) && a.sessionSecrets != nil {
-		// The saved password now wins over one given for this session, and a
-		// session password never follows the connection to a new endpoint.
+	stopsUsingPassword := !connection.usesPassword() || connection.connectionType() == "Serial"
+	if (newPassword || stopsUsingPassword || !sameEndpoint(previous, connection)) && a.sessionSecrets != nil {
+		// The saved password now wins over one given for this session, a
+		// session password never follows the connection to a new endpoint,
+		// and it is dropped when the connection stops using a password.
 		_ = a.sessionSecrets.Delete(context.Background(), passwordAccount(connection.ID))
 	}
 	a.conns[index] = connection
@@ -2432,7 +2434,7 @@ func (a *App) finalizeRequest(id string, from string, mutate func(*CommandReques
 		}
 	}
 	if index < 0 {
-		return CommandRequest{}, errors.New("request not found")
+		return CommandRequest{}, errRequestNotFound
 	}
 	current := a.requests[index]
 	if current.Status != from {

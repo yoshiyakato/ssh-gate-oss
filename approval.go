@@ -167,6 +167,10 @@ func (a *App) waitForRequests(ctx context.Context, ids []string, wait time.Durat
 	}
 }
 
+// errRequestNotFound is transitionRequest's error for an id that is not in
+// memory (as opposed to a storage failure during the CAS update).
+var errRequestNotFound = errors.New("request not found")
+
 // transitionRequest moves a request from one of `from` to a new state via
 // mutate, atomically: the in-memory check and the SQLite compare-and-swap
 // happen under a.mu, so two approvals (or approve vs reject) can never both
@@ -182,7 +186,7 @@ func (a *App) transitionRequest(id string, from []string, mutate func(*CommandRe
 		}
 	}
 	if index < 0 {
-		return CommandRequest{}, errors.New("request not found")
+		return CommandRequest{}, errRequestNotFound
 	}
 	current := a.requests[index]
 	allowed := false
@@ -440,6 +444,11 @@ func (a *App) approve(id string, command string, allowRiskIncrease bool, grantBy
 		_, _ = a.finishRequest(running, stateFailed, result, execErr)
 		return done(ActionResult{OK: false, Code: "shutting_down", Message: fmt.Sprintf("%s は終了処理のため中断されました%s", id, bypassNote)})
 	}
+	if isStopCause(execErr) && !isExitError(execErr) {
+		// Disconnected while waiting for the keychain or during the run.
+		_, _ = a.finishRequest(running, stateFailed, result, execErr)
+		return done(ActionResult{OK: false, Code: "canceled", Message: fmt.Sprintf("%s は切断されたため中止しました%s", id, bypassNote)})
+	}
 	if execErr != nil && !isExitError(execErr) {
 		_, _ = a.finishRequest(running, stateFailed, result, execErr)
 		return done(ActionResult{OK: false, Code: "exec_failed", Message: fmt.Sprintf("%s の実行に失敗しました: %s%s", id, explainSSHError(conn, execErr), bypassNote)})
@@ -560,8 +569,13 @@ func (a *App) RejectCommand(id string) ActionResult {
 	if errors.Is(err, errStateConflict) {
 		return ActionResult{OK: false, Message: fmt.Sprintf("%s は既に処理済みです（%s）", id, updated.Status), Code: "not_pending"}
 	}
-	if err != nil {
+	if errors.Is(err, errRequestNotFound) {
 		return ActionResult{OK: false, Code: "not_found", Message: "拒否対象のリクエストが見つかりません"}
+	}
+	if err != nil {
+		// A storage failure (SQLite busy, disk full): the request is still
+		// pending, so do not report it as gone.
+		return ActionResult{OK: false, Code: "state_storage", Message: fmt.Sprintf("%s の状態を更新できません（承認待ちのままです）: %v", id, err)}
 	}
 	return ActionResult{OK: true, Message: fmt.Sprintf("%s を拒否しました", id)}
 }
@@ -772,7 +786,9 @@ func (a *App) executeSSH(parent context.Context, conn Connection, command string
 	conn, err := a.resolveCredential(credCtx, conn)
 	credCancel()
 	if err != nil {
-		return commandResult{}, err
+		// A keychain wait cut short by a disconnect, shutdown or gone client
+		// is that stop, not a keychain failure.
+		return commandResult{}, a.withStopCause(parent, err)
 	}
 	timeout := timeoutSeconds(conn.CommandTimeout, 30)
 	if timeoutOverride > 0 {
@@ -793,19 +809,28 @@ func (a *App) executeSSH(parent context.Context, conn Connection, command string
 		outputCap = defaultOutputCap
 	}
 	res, err := runSSHCommand(ctx, conn, command, outputCap, strictHostKey)
-	if err != nil && parent.Err() != nil && !isExitError(err) {
-		// Carry the cancel cause so finishRequest can tell a disconnect, a
-		// gone MCP client or shutdown apart from a plain timeout or network
-		// error. Shutdown wins whatever cause the context carries.
-		cause := context.Cause(parent)
-		if errors.Is(context.Cause(a.appCtx), errShuttingDown) {
-			cause = errShuttingDown
-		}
-		if isStopCause(cause) {
-			err = fmt.Errorf("%w: %w", cause, err)
-		}
+	if err != nil && !isExitError(err) {
+		err = a.withStopCause(parent, err)
 	}
 	return res, err
+}
+
+// withStopCause carries parent's cancel cause on err so finishRequest can
+// tell a disconnect, a gone MCP client or shutdown apart from a plain
+// timeout, network or keychain error. Shutdown wins whatever cause the
+// context carries.
+func (a *App) withStopCause(parent context.Context, err error) error {
+	if err == nil || parent.Err() == nil {
+		return err
+	}
+	cause := context.Cause(parent)
+	if a.appCtx != nil && errors.Is(context.Cause(a.appCtx), errShuttingDown) {
+		cause = errShuttingDown
+	}
+	if !isStopCause(cause) || errors.Is(err, cause) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", cause, err)
 }
 
 // isStopCause reports whether err is one of the reasons ssh-gete itself
@@ -825,10 +850,12 @@ func classifyExecError(err error) string {
 	switch {
 	case err == nil:
 		return ""
+	case isStopCause(err):
+		// Checked first: a keychain wait stopped by a disconnect or shutdown
+		// is a credentialError wrapping the stop cause.
+		return "canceled"
 	case errors.As(err, &credErr):
 		return "credential_unavailable"
-	case isStopCause(err):
-		return "canceled"
 	case isExitError(err):
 		return "exit_nonzero"
 	case errors.Is(err, context.DeadlineExceeded):

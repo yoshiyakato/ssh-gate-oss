@@ -218,8 +218,11 @@ func (s *osSecretStore) unref(account string, l *accountLock) {
 	}
 }
 
+// unavailable wraps both ErrSecretUnavailable and the context cause, so a
+// keychain wait stopped by a disconnect, shutdown or gone MCP client still
+// matches errDisconnected / errShuttingDown / errClientGone.
 func unavailable(ctx context.Context) error {
-	return fmt.Errorf("%w: %v", ErrSecretUnavailable, context.Cause(ctx))
+	return fmt.Errorf("%w: %w", ErrSecretUnavailable, context.Cause(ctx))
 }
 
 func (s *osSecretStore) Get(ctx context.Context, account string) (string, error) {

@@ -75,6 +75,7 @@ export const APPROVALS_I18N = {
     'appr.bypass.until': '{time} まで',
     'appr.bypass.inactive': '専用トークンが無いため無効',
     'appr.stillPending': '要求は承認待ちのままです。修正したコマンドは残しています',
+    'appr.crNormalized': 'この要求のコマンドには改行コード CR（<U+000D>）が含まれています。編集欄では CR が改行（LF）に変わるため、承認すると別のコマンドとして実行されます（CR の後ろも別のコマンドとして実行されます）。このまま承認しますか？',
     'appr.bypassResult.granted': 'このエージェントの承認省略を許可しました',
     'appr.bypassResult.inactive': 'このエージェントの承認省略を許可しました（エージェント専用トークンを発行するまでは有効になりません）',
     'appr.bypassResult.failed': '承認省略を保存できませんでした',
@@ -127,6 +128,7 @@ export const APPROVALS_I18N = {
     'appr.bypass.until': 'until {time}',
     'appr.bypass.inactive': 'inactive: no agent token',
     'appr.stillPending': 'The request is still pending; your edited command is kept',
+    'appr.crNormalized': 'The requested command contains a carriage return (<U+000D>). The edit box turns it into a line feed, so the command you approve runs differently (the text after the CR runs as a separate command). Approve anyway?',
     'appr.bypassResult.granted': 'Approval bypass was turned on for this agent',
     'appr.bypassResult.inactive': 'Approval bypass was turned on for this agent (it does nothing until you issue an agent token)',
     'appr.bypassResult.failed': 'Approval bypass could not be saved',
@@ -272,8 +274,20 @@ export function resolvedByLabel(resolvedBy, t) {
 // The localized text keeps what the backend message would have said: that
 // the request is still pending, and what happened to the approval bypass
 // (with the backend detail when it, or saving the result, failed).
-export function approvalResultMessage(result, t) {
-  if (!(result && !result.ok && APPROVAL_CODES.includes(result.code))) return String(result?.message ?? '');
+// Any other result (success, exec_failed, not_found, state_storage, ...)
+// goes through fallback, the E6 resultMessage (ctx.resultMessage), so English
+// mode does not show the backend's Japanese text.
+export function approvalResultMessage(result, t, fallback) {
+  if (!(result && !result.ok && APPROVAL_CODES.includes(result.code))) {
+    const message = String(result?.message ?? '');
+    if (typeof fallback !== 'function') return message;
+    const base = String(fallback(result) ?? '');
+    if (base === message) return message;
+    // Localized: the backend's bypass note was part of the replaced text.
+    const bypass = result?.bypass;
+    if (bypass === 'granted' || bypass === 'inactive' || bypass === 'failed') return `${base} / ${t(`appr.bypassResult.${bypass}`)}`;
+    return base;
+  }
   const parts = [t(`appr.code.${result.code}`)];
   if (result.pending && result.code !== 'bearer_required') parts.push(t('appr.stillPending'));
   if (result.bypass === 'granted' || result.bypass === 'inactive' || result.bypass === 'failed') {
@@ -294,7 +308,10 @@ export function approvalResultMessage(result, t) {
 export function plainDisplayChar(cp, { newline = false } = {}) {
   if (cp >= 0x20 && cp <= 0x7e) return true;
   if (newline && cp === 0x0a) return true;
-  return (cp >= 0x3001 && cp <= 0x303f)
+  // Combining marks (U+302A–U+302F, U+3099–U+309A, ...) are badged like the
+  // backend's invisibleRune does; U+303F draws as a blank.
+  if (cp === 0x303f || /\p{M}/u.test(String.fromCodePoint(cp))) return false;
+  return (cp >= 0x3001 && cp <= 0x303e)
     || (cp >= 0x3041 && cp <= 0x3096)
     || (cp >= 0x309b && cp <= 0x30ff)
     || (cp >= 0x31f0 && cp <= 0x31ff)
@@ -756,8 +773,21 @@ async function finishApproval(ctx, request, result) {
   if (result?.code === 'target_changed' || result?.code === 'target_unknown') await loadApprovalTarget(ctx, request.id);
   // Keep the request selected so its stdout/stderr (or new state) shows.
   state.selectedRequestId = request.id ?? '';
-  ctx.toast(approvalResultMessage(result, t));
+  ctx.toast(approvalResultMessage(result, t, ctx.resultMessage));
   await ctx.refresh({ silent: true });
+}
+
+// approvalCommandToSend is the command an approval sends. A textarea's value
+// turns CR and CRLF into LF, so a form whose text still equals the requested
+// command (as the textarea shows it) sends the requested command itself:
+// "echo hi\rrm -rf ~" must not become two commands (final audit #7). An
+// edit is sent as typed.
+export function approvalCommandToSend(original, textareaValue) {
+  const requested = String(original ?? '');
+  if (textareaValue == null) return requested;
+  const value = String(textareaValue);
+  if (value === requested.replace(/\r\n?/g, '\n')) return requested;
+  return value;
 }
 
 async function approve(ctx, view, button, { bypass }) {
@@ -769,7 +799,11 @@ async function approve(ctx, view, button, { bypass }) {
     return;
   }
   const id = selected.id ?? '';
-  const command = document.querySelector('#approval-command')?.value ?? selected.command ?? '';
+  const command = approvalCommandToSend(selected.command, document.querySelector('#approval-command')?.value);
+  if (command !== String(selected.command ?? '') && /\r/.test(String(selected.command ?? ''))
+    && !window.confirm(t('appr.crNormalized'))) {
+    return;
+  }
   if (button) button.disabled = true;
 
   // Look the target up again right before approving; the backend refuses a
@@ -826,7 +860,7 @@ async function approve(ctx, view, button, { bypass }) {
     // shutdown before the request left pending): keep the edited command
     // rather than redrawing the agent's original over it.
     keepEdit(ctx, button);
-    ctx.toast(approvalResultMessage(result, t));
+    ctx.toast(approvalResultMessage(result, t, ctx.resultMessage));
     return;
   }
   await finishApproval(ctx, selected, result);
@@ -843,7 +877,7 @@ async function reject(ctx, view) {
   state.dirty.approval = false;
   ctx.bumpGen();
   const result = await RejectCommand(selected.id ?? '');
-  ctx.toast(approvalResultMessage(result, t));
+  ctx.toast(approvalResultMessage(result, t, ctx.resultMessage));
   await ctx.refresh({ silent: true });
 }
 

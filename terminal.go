@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.bug.st/serial"
@@ -153,41 +154,111 @@ type serialHandle struct {
 	// applyMu serializes applyNow calls of this tab. Taken before termMu and
 	// writeMu, never while holding either.
 	applyMu sync.Mutex
-	// writeMu is a leaf lock: it is held only around port.Write, port.Drain
-	// and port.SetMode, so input and an in-place SetMode never overlap.
+	// writeMu serializes the port operations of input and applyNow, so input
+	// and an in-place SetMode never overlap. Write holds it for one piece of
+	// at most writePiece bytes only, so applyNow waits for a short piece, not
+	// a whole paste at a low baud rate. closePort never takes it.
 	writeMu sync.Mutex
-	// closed is guarded by writeMu. Once set, no Write / Drain / SetMode
-	// reaches the port: go.bug.st/serial's unix Write and ioctls use the raw
-	// fd without checking that the port is open, so after Close they would
-	// hit whatever file or socket reused the fd number (N1).
-	closed   bool
+	// stateMu (a leaf lock) guards closed, users and portClosed. Every
+	// Write / Drain / SetMode holds a use (acquire / release) while it is
+	// on the fd; closePort marks the handle closed without waiting, and
+	// whoever drops the last use closes the fd. Once closed is set no new
+	// use starts: go.bug.st/serial's unix Write and ioctls use the raw fd
+	// without checking that the port is open, so after Close they would hit
+	// whatever file or socket reused the fd number (N1). The fd is closed
+	// only after the last use ended, so no use outlives it (final audit #5).
+	stateMu    sync.Mutex
+	closed     bool
+	users      int
+	portClosed bool
+	// baud is the current line speed, read by Write to size its pieces.
+	baud     atomic.Int64
 	settings serialSettings  // guarded by termMu: what the port is set to
 	pending  *serialSettings // guarded by termMu: applied while connecting
+	// applyGen (guarded by termMu) counts in-place applies requested by
+	// applySerialSettings, so a stale pending value does not override a
+	// newer one (final audit #6).
+	applyGen uint64
 }
 
 // errSerialPortClosed is returned by a serialHandle after closePort.
 var errSerialPortClosed = io.ErrClosedPipe
 
-// Write is the serial tab's stdin; only pumpTerminalInput calls it.
-func (h *serialHandle) Write(p []byte) (int, error) {
-	h.writeMu.Lock()
-	defer h.writeMu.Unlock()
+// acquire starts a use of the fd; false once the handle is closed.
+func (h *serialHandle) acquire() bool {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
 	if h.closed {
-		return 0, errSerialPortClosed
+		return false
 	}
-	return h.port.Write(p)
+	h.users++
+	return true
 }
 
-// closePort marks the handle closed under writeMu (waiting for a write or
-// SetMode in progress, which still uses the valid fd) and then closes the
-// port. Every later Write / applyNow fails with errSerialPortClosed. Safe to
-// call more than once.
+// release ends a use; the last one after closePort closes the fd.
+func (h *serialHandle) release() {
+	h.stateMu.Lock()
+	h.users--
+	closeNow := h.closed && h.users == 0 && !h.portClosed
+	if closeNow {
+		h.portClosed = true
+	}
+	h.stateMu.Unlock()
+	if closeNow && h.port != nil {
+		_ = h.port.Close()
+	}
+}
+
+// writePiece is how many bytes Write hands to the port at once: about
+// 100 ms of line time, so a close or a settings change is not stuck behind
+// a long paste (a blocking tty write returns only once most of it is sent).
+func (h *serialHandle) writePiece() int {
+	baud := h.baud.Load()
+	if baud <= 0 {
+		baud = 9600
+	}
+	return int(max(1, min(baud/100, 4096)))
+}
+
+// Write is the serial tab's stdin; only pumpTerminalInput calls it. It
+// writes in pieces and stops at the first piece after closePort.
+func (h *serialHandle) Write(p []byte) (int, error) {
+	written := 0
+	for len(p) > 0 {
+		piece := p[:min(len(p), h.writePiece())]
+		h.writeMu.Lock()
+		if !h.acquire() {
+			h.writeMu.Unlock()
+			return written, errSerialPortClosed
+		}
+		n, err := h.port.Write(piece)
+		h.release()
+		h.writeMu.Unlock()
+		written += n
+		if err != nil {
+			return written, err
+		}
+		if n < len(piece) {
+			return written, io.ErrShortWrite
+		}
+		p = p[n:]
+	}
+	return written, nil
+}
+
+// closePort marks the handle closed and closes the port, at once when no
+// Write / Drain / SetMode is on the fd, otherwise when the last one ends.
+// It never waits for a write in progress. Every later Write / applyNow
+// fails with errSerialPortClosed. Safe to call more than once.
 func (h *serialHandle) closePort() {
-	h.writeMu.Lock()
-	already := h.closed
+	h.stateMu.Lock()
 	h.closed = true
-	h.writeMu.Unlock()
-	if !already && h.port != nil {
+	closeNow := h.users == 0 && !h.portClosed
+	if closeNow {
+		h.portClosed = true
+	}
+	h.stateMu.Unlock()
+	if closeNow && h.port != nil {
 		_ = h.port.Close()
 	}
 }
@@ -373,6 +444,7 @@ func (a *App) StartTerminal(id string, connID string, cols int, rows int) Action
 		ts.normPort = serialReservationKey(serialGOOS, ts.port) // stats the path: outside termMu
 		ts.baud = settings.Baud
 		ts.serial = &serialHandle{settings: settings}
+		ts.serial.baud.Store(int64(settings.Baud))
 	}
 
 	a.termMu.Lock()
@@ -647,9 +719,13 @@ func (a *App) openSerialTerminal(ctx context.Context, ts *terminalSession) (stri
 	a.termMu.Lock()
 	pending := h.pending
 	h.pending = nil
+	gen := h.applyGen
 	a.termMu.Unlock()
 	if pending != nil {
-		_, _ = a.applyNow(ts, *pending) // on failure the open settings stay
+		// Skipped when applySerialSettings applied newer settings in place
+		// after the tab turned open (final audit #6). On failure the open
+		// settings stay.
+		_, _ = a.applyNowIf(ts, *pending, &gen)
 	}
 	return "", nil
 }
@@ -719,6 +795,9 @@ func (a *App) applySerialSettings(connID string, s serialSettings) (applied bool
 		a.termMu.Unlock()
 		return true, nil
 	}
+	// This apply is newer than any value saved while the tab was connecting.
+	ts.serial.pending = nil
+	ts.serial.applyGen++
 	a.termMu.Unlock()
 	return a.applyNow(ts, s)
 }
@@ -728,33 +807,43 @@ func (a *App) applySerialSettings(connID string, s serialSettings) (applied bool
 // windows the library has already closed the port, so the tab ends with
 // io_error.
 func (a *App) applyNow(ts *terminalSession, s serialSettings) (bool, error) {
+	return a.applyNowIf(ts, s, nil)
+}
+
+// applyNowIf is applyNow that, when gen is set, does nothing if another
+// in-place apply was requested since gen was read (checked under applyMu,
+// so the newer apply cannot be overwritten).
+func (a *App) applyNowIf(ts *terminalSession, s serialSettings, gen *uint64) (bool, error) {
 	h := ts.serial
 	h.applyMu.Lock()
 	a.termMu.Lock()
 	prev := h.settings
+	stale := gen != nil && h.applyGen != *gen
 	a.termMu.Unlock()
-	if prev == s {
+	if stale || prev == s {
 		h.applyMu.Unlock()
 		return true, nil
 	}
 	goos := serialGOOS
 	h.writeMu.Lock()
-	if h.closed {
+	if !h.acquire() {
 		// The tab is closing: the fd may already belong to something else.
 		h.writeMu.Unlock()
 		h.applyMu.Unlock()
 		return false, errSerialPortClosed
 	}
-	drainWithTimeout(h.port, serialDrainTimeout)
+	h.drainWithTimeout(serialDrainTimeout)
 	err := h.port.SetMode(s.mode())
 	if err != nil && goos != "windows" {
 		_ = h.port.SetMode(prev.mode())
 	}
+	h.release()
 	h.writeMu.Unlock()
 	if err == nil {
 		a.termMu.Lock()
 		h.settings = s
 		ts.baud = s.Baud
+		h.baud.Store(int64(s.Baud))
 		a.termMu.Unlock()
 	}
 	h.applyMu.Unlock()
@@ -769,11 +858,17 @@ func (a *App) applyNow(ts *terminalSession, s serialSettings) (bool, error) {
 }
 
 // drainWithTimeout waits for queued output to leave, but not for ever: a
-// removed device may never finish draining.
-func drainWithTimeout(p serialPort, d time.Duration) {
+// removed device may never finish draining. The Drain holds its own use of
+// the fd, so a Drain that outlives the timeout still keeps the fd from being
+// closed (and reused) under it.
+func (h *serialHandle) drainWithTimeout(d time.Duration) {
+	if !h.acquire() {
+		return
+	}
 	done := make(chan struct{})
 	go func() {
-		_ = p.Drain()
+		defer h.release()
+		_ = h.port.Drain()
 		close(done)
 	}()
 	timer := time.NewTimer(d)

@@ -39,11 +39,15 @@ vi.mock('../wailsjs/go/main/App', () => ({
 
 import { MODEL_I18N, interpolate, mergeI18n } from './model.js';
 import { BASE_I18N } from './i18n.js';
+import { RESULT_I18N, resultMessage } from './result-message.js';
 import {
   APPROVALS_I18N,
   APPROVAL_CODES,
   approvalBlock,
+  approvalCommandToSend,
   approvalResultMessage,
+  hasHiddenChars,
+  plainDisplayChar,
   bypassAvailability,
   bypassConfirmText,
   commandsView,
@@ -192,6 +196,57 @@ describe('pure helpers', () => {
     expect(approvalResultMessage({ ok: false, code: 'target_changed', message: 'JA' }, tEn)).toContain('Reject it and have the agent ask again');
     expect(approvalResultMessage({ ok: true, message: 'done' }, tEn)).toBe('done');
     expect(approvalResultMessage({ ok: false, code: 'other', message: 'raw' }, tEn)).toBe('raw');
+  });
+
+  // Final audit #8: in English, success and non-approval codes go through
+  // resultMessage instead of showing the backend's Japanese text.
+  it('approvalResultMessage falls back to resultMessage for other results', () => {
+    const tEn = tFor('en');
+    const dict = { ...I18N.en, ...RESULT_I18N.en };
+    const tr = (key, vars) => interpolate(dict[key] ?? key, vars);
+    const fallback = (result) => resultMessage(result, { lang: 'en', t: tr, dict });
+    const cases = [
+      [{ ok: true, message: 'R1 を承認し、実行しました' }, RESULT_I18N.en['result.done']],
+      [{ ok: true, message: 'R3 を拒否しました' }, RESULT_I18N.en['result.done']],
+      [{ ok: false, code: 'exec_failed', message: 'R1 の実行に失敗しました: x' }, RESULT_I18N.en['result.code.exec_failed']],
+      [{ ok: false, code: 'not_found', message: '拒否対象のリクエストが見つかりません' }, RESULT_I18N.en['result.code.not_found']],
+      [{ ok: false, code: 'state_storage', message: 'R1 の状態を更新できません' }, RESULT_I18N.en['result.code.state_storage']],
+    ];
+    for (const [result, want] of cases) {
+      const got = approvalResultMessage(result, tEn, fallback);
+      expect(got).toBe(want);
+      expect(got).not.toMatch(/[\u3040-\u30ff\u4e00-\u9fff]/);
+    }
+    expect(approvalResultMessage({ ok: true, message: 'R1 を承認し、実行しました、agent の承認省略を許可しました', bypass: 'granted' }, tEn, fallback))
+      .toBe(`${RESULT_I18N.en['result.done']} / ${I18N.en['appr.bypassResult.granted']}`);
+    // Japanese mode keeps the backend text (it already has the bypass note).
+    const ja = (result) => resultMessage(result, { lang: 'ja', t: tr, dict });
+    expect(approvalResultMessage({ ok: true, message: 'R1 を承認し、実行しました', bypass: 'granted' }, tFor('ja'), ja)).toBe('R1 を承認し、実行しました');
+  });
+
+  // Final audit #7: a textarea turns CR into LF; an unedited approval sends
+  // the requested command.
+  it('approvalCommandToSend keeps the requested command when the form is unedited', () => {
+    const textarea = document.createElement('textarea');
+    const requested = 'echo hi\rrm -rf ~';
+    textarea.value = requested;
+    expect(textarea.value).not.toBe(requested); // the normalization the fix guards against
+    expect(approvalCommandToSend(requested, textarea.value)).toBe(requested);
+    expect(approvalCommandToSend('a\r\nb', 'a\nb')).toBe('a\r\nb');
+    expect(approvalCommandToSend('ls', 'ls -la')).toBe('ls -la');
+    expect(approvalCommandToSend('ls', undefined)).toBe('ls');
+  });
+
+  // Final audit #9: combining marks in the CJK symbols block are badged.
+  it('plainDisplayChar badges combining marks in U+3000-U+303F', () => {
+    for (const cp of [0x302a, 0x302b, 0x302c, 0x302d, 0x302e, 0x302f, 0x303f, 0x3099, 0x309a]) {
+      expect(plainDisplayChar(cp)).toBe(false);
+    }
+    for (const cp of [0x3001, 0x3002, 0x300c, 0x3029, 0x3030, 0x303e, 0x3042, 0x30a2, 0x65e5]) {
+      expect(plainDisplayChar(cp)).toBe(true);
+    }
+    expect(hasHiddenChars('rm -rf /tmp/a\u302a')).toBe(true);
+    expect(hasHiddenChars('ログ「エラー」を確認')).toBe(false);
   });
 
   it('bypassConfirmText states 8 hours, the Medium cap and the token requirement in both languages', () => {
@@ -423,6 +478,19 @@ describe('approve / reject handlers', () => {
     expect(root.querySelector('.approval-target-changed')).not.toBeNull();
     expect(root.querySelector('[data-action="approve-command"]').disabled).toBe(true);
     expect(ctx.refresh).toHaveBeenCalled();
+  });
+
+  // Final audit #7: approving an unedited request with a bare CR sends the
+  // requested bytes, not the textarea's LF version.
+  it('approves an unedited CR command as requested', async () => {
+    state.data.requests = [request('R1', { command: 'echo hi\rrm -rf ~', risk: 'High' })];
+    await render();
+    const confirm = vi.spyOn(window, 'confirm');
+    await click('[data-action="approve-command"]');
+    expect(confirm).not.toHaveBeenCalled();
+    confirm.mockRestore();
+    expect(backend.calls).toContainEqual(['ApproveCommand', 'R1', 'echo hi\rrm -rf ~']);
+    expect(backend.calls).not.toContainEqual(['ApproveCommand', 'R1', 'echo hi\nrm -rf ~']);
   });
 
   it('asks again on risk_increased and approves with ApproveCommandConfirmed on OK', async () => {

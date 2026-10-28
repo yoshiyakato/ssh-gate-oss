@@ -349,6 +349,24 @@ describe('terminal-tabs', () => {
     expect(mod.setTerminalServerFilter('')).toBe(true);
     for (const entry of tabs.values()) expect(entry.pane.hidden).toBe(false);
   });
+  // Final audit #12: in English the toast detail is not the backend's
+  // Japanese message.
+  it('input_timeout toast detail goes through resultMessage', async () => {
+    api.StartTerminal.mockResolvedValue({ ok: true });
+    const { id } = await mod.openTerminalTab('c1');
+    const entry = mod.getTerminalState().tabs.get(id);
+    ctx.resultMessage = vi.fn(() => 'Sending input is stuck');
+    ctx.toast.mockClear?.();
+    api.SendTerminalInput.mockImplementation(async () => ({ ok: false, code: 'input_timeout', message: '入力の送信が詰まっています' }));
+    entry.xterm.cb('x'); await tick(); await tick();
+    expect(entry.exitReason).toBe('input_dropped');
+    expect(ctx.resultMessage).toHaveBeenCalledWith(expect.objectContaining({ code: 'input_timeout' }));
+    const last = ctx.toast.mock.calls.at(-1)[0];
+    expect(last).toContain('Sending input is stuck');
+    expect(last).not.toContain('入力の送信が詰まっています');
+    delete ctx.resultMessage;
+    api.SendTerminalInput.mockReset?.();
+  });
   // audit-2 N6: lost input must not be followed by later keys.
   it('input_timeout makes the tab read-only, closes the session and offers reconnect', async () => {
     api.StartTerminal.mockResolvedValue({ ok: true });

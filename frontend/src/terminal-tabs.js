@@ -505,7 +505,10 @@ function blockInput(entry, result) {
   const id = entry.id;
   entry.exitReason = INPUT_DROPPED;
   markExited(entry, `\r\n\x1b[31m[${tr('tabs.inputDropped')}]\x1b[0m\r\n`);
-  const detail = result?.message ? `: ${result.message}` : '';
+  // The backend message is Japanese; English mode shows the code's text
+  // (resultMessage, E6).
+  const text = result?.message ? String(ctx?.resultMessage ? ctx.resultMessage(result) : result.message) : '';
+  const detail = text ? `: ${text}` : '';
   ctx?.toast?.(`${tr('tabs.inputDropped')}${detail}`);
   renderTabsIfVisible();
   Promise.resolve()
