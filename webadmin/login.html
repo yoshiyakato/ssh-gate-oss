@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>ssh-gete ログイン</title>
+<link rel="stylesheet" href="/login-assets/login.css">
+<script src="/login-assets/login.js" defer></script>
+</head>
+<body>
+<main class="card">
+  <h1>ssh-gete</h1>
+  <p class="lead" data-i18n="lead">管理トークンか管理パスワードを入力してください。</p>
+  <form id="login-form" autocomplete="off" novalidate>
+    <label for="token" data-i18n="label">管理トークンまたはパスワード</label>
+    <input id="token" name="token" type="password" spellcheck="false" autocapitalize="off" autocomplete="off" required>
+    <button id="submit" type="submit" data-i18n="submit">ログイン</button>
+    <p id="message" class="message" role="alert" aria-live="polite"></p>
+  </form>
+  <p class="hint" data-i18n="hint">トークンはサーバーで <code>ssh-gete --print-admin-token</code> を実行すると表示されます。パスワードは <code>ssh-gete --set-admin-password</code> で設定できます。</p>
+</main>
+</body>
+</html>

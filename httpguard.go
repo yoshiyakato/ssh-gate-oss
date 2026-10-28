@@ -63,8 +63,11 @@ func guardHTTP(settings MCPSettings, next http.Handler) http.Handler {
 
 func allowedHost(hostHeader string, settings MCPSettings) bool {
 	// An explicit BaseURL (reverse proxy) names the one extra hostname allowed.
+	// The scheme's default port may be written in either one (browsers leave
+	// it out of Host), so compare without it.
 	if settings.BaseURL != "" {
-		if u, err := url.Parse(settings.BaseURL); err == nil && strings.EqualFold(u.Host, hostHeader) {
+		if u, err := url.Parse(settings.BaseURL); err == nil && u.Host != "" &&
+			strings.EqualFold(hostWithoutDefaultPort(u.Scheme, u.Host), hostWithoutDefaultPort(u.Scheme, hostHeader)) {
 			return true
 		}
 	}
@@ -82,6 +85,22 @@ func allowedHost(hostHeader string, settings MCPSettings) bool {
 		return true
 	}
 	return net.ParseIP(host) != nil
+}
+
+// hostWithoutDefaultPort drops ":443" for https and ":80" for http from a
+// host[:port].
+func hostWithoutDefaultPort(scheme, hostport string) string {
+	host, port, err := net.SplitHostPort(hostport)
+	if err != nil {
+		return hostport
+	}
+	if (strings.EqualFold(scheme, "https") && port == "443") || (strings.EqualFold(scheme, "http") && port == "80") {
+		if strings.Contains(host, ":") {
+			return "[" + host + "]"
+		}
+		return host
+	}
+	return hostport
 }
 
 func originAllowed(origin string, allowed []string) bool {

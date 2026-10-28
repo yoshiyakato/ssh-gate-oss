@@ -97,7 +97,7 @@ func openStore(path string) (*Store, error) {
 	if err := restrictToOwner(dir); err != nil {
 		log.Printf("restrict %s: %v", dir, err)
 	}
-	lock, err := acquireInstanceLock(path)
+	lock, err := acquireStoreLock(path)
 	if err != nil {
 		return nil, err
 	}
@@ -133,13 +133,13 @@ func openStore(path string) (*Store, error) {
 	return store, nil
 }
 
-// acquireInstanceLock takes the single-instance lock of dbPath: a small
+// acquireStoreLock takes the single-instance lock of dbPath: a small
 // SQLite file <dbPath>.lock held in EXCLUSIVE locking mode. After its first
 // write the connection keeps the exclusive file lock until it is closed (or
 // the process dies, when the OS drops it), so a second process, or a second
 // Store in this one, gets SQLITE_BUSY at once and openStore fails with
 // errAnotherInstance. It works the same on macOS, Linux and Windows.
-func acquireInstanceLock(dbPath string) (*sql.DB, error) {
+func acquireStoreLock(dbPath string) (*sql.DB, error) {
 	lockPath := dbPath + ".lock"
 	if !fileExists(lockPath) {
 		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0o600)

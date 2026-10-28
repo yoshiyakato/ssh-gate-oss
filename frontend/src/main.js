@@ -69,7 +69,7 @@ import {
   mountAgentsSection,
 } from './agents.js';
 import { ALL_SERVERS, normalizeServerFilter, renderServerTabs, renderShellSubtabs } from './servertabs.js';
-import { createShortcutHandler, cycleIndex, cycleServer, detectPlatform, resolveTabIndex } from './shortcuts.js';
+import { createShortcutHandler, cycleIndex, cycleServer, resolveTabIndex, shortcutPlatformFor } from './shortcuts.js';
 import { deriveServerView, loadServerFilter, saveServerFilter } from './serverview.js';
 import { handleCredentialsClick, mountKeychainNotices, recoverCredential } from './credentials.js';
 
@@ -594,7 +594,9 @@ function stepServer(delta) {
   return setServerFilter(cycleServer(state.serverFilter, ids, delta), { source: 'shortcut' });
 }
 
-const shortcutPlatform = detectPlatform();
+// In the headless Web UI the browser keeps Cmd+T / Cmd+W / Ctrl+Shift+T / W,
+// so the shortcuts move to Alt+Shift there (shortcuts.js 'browser').
+const shortcutPlatform = shortcutPlatformFor(window);
 
 // One instance goes to every xterm (terminal-tabs.js createTab) and to the
 // document: shortcuts.js dedupes per event only within one instance.

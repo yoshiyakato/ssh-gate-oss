@@ -8,6 +8,7 @@ import {
   cycleServer,
   shortcutLabel,
   createShortcutHandler,
+  shortcutPlatformFor,
 } from './shortcuts.js';
 
 const ev = (code, mods = {}, extra = {}) => ({ type: 'keydown', code, key: '', ...mods, ...extra });
@@ -246,4 +247,52 @@ test('brackets follow the printed key, so a JIS keyboard is not inverted', () =>
   for (const [platform, e, expected] of jis) {
     expect(matchShortcut(e, platform), `${platform} ${e.code} ${e.key}`).toStrictEqual(expected);
   }
+});
+
+// Review finding 7: in the headless Web UI the browser keeps Cmd+T / Cmd+W /
+// Ctrl+Shift+T / Ctrl+Shift+W, so the terminal shortcuts move to Alt+Shift.
+test('shortcutPlatformFor picks browser chords when the headless shim is loaded', () => {
+  expect(shortcutPlatformFor({ __sshGeteHeadless: {}, navigator: { platform: 'MacIntel' } })).toBe('browser');
+  expect(shortcutPlatformFor({ navigator: { platform: 'MacIntel' } })).toBe('mac');
+  expect(shortcutPlatformFor({ navigator: { platform: 'Win32' } })).toBe('other');
+  expect(shortcutPlatformFor(undefined)).toBe('other');
+});
+
+test('browser platform: the chords the browser keeps are not claimed', () => {
+  for (const e of [
+    ev('KeyT', MAC), ev('KeyW', MAC), ev('Digit1', MAC), ev('KeyT', WIN), ev('KeyW', WIN),
+    ev('Digit1', WIN), ev('BracketRight', { metaKey: true, shiftKey: true }), ev('PageDown', WIN),
+  ]) {
+    expect(matchShortcut(e, 'browser')).toBe(null);
+  }
+});
+
+test('browser platform: Alt+Shift chords, by key position (macOS Option changes event.key)', () => {
+  const AS = { altKey: true, shiftKey: true };
+  expect(matchShortcut(ev('KeyT', AS, { key: 'ˇ' }), 'browser')).toEqual({ type: 'newShell' });
+  expect(matchShortcut(ev('KeyW', AS, { key: '„' }), 'browser')).toEqual({ type: 'closeTab' });
+  expect(matchShortcut(ev('BracketRight', AS, { key: '’' }), 'browser')).toEqual({ type: 'nextTab' });
+  expect(matchShortcut(ev('BracketLeft', AS, { key: '”' }), 'browser')).toEqual({ type: 'prevTab' });
+  expect(matchShortcut(ev('PageDown', AS), 'browser')).toEqual({ type: 'nextTab' });
+  expect(matchShortcut(ev('PageUp', AS), 'browser')).toEqual({ type: 'prevTab' });
+  expect(matchShortcut(ev('Digit3', AS, { key: '#' }), 'browser')).toEqual({ type: 'selectTab', index: 2 });
+  expect(matchShortcut(ev('Digit9', AS), 'browser')).toEqual({ type: 'selectTab', index: -1 });
+  expect(matchShortcut(ev('ArrowRight', AS), 'browser')).toEqual({ type: 'nextServer' });
+  expect(matchShortcut(ev('ArrowLeft', AS), 'browser')).toEqual({ type: 'prevServer' });
+  expect(matchShortcut(ev('Digit0', AS), 'browser')).toEqual({ type: 'allServers' });
+  // Extra Ctrl / Cmd, or a missing Shift, is not ours.
+  expect(matchShortcut(ev('KeyT', { ...AS, ctrlKey: true }), 'browser')).toBe(null);
+  expect(matchShortcut(ev('KeyT', { ...AS, metaKey: true }), 'browser')).toBe(null);
+  expect(matchShortcut(ev('KeyT', { altKey: true }), 'browser')).toBe(null);
+  expect(matchShortcut(ev('KeyT', AS, { isComposing: true }), 'browser')).toBe(null);
+  expect(shortcutLabel('closeTab', 'browser')).toBe('Alt+Shift+W');
+  expect(shortcutLabel('selectTab', 'browser', 4)).toBe('Alt+Shift+4');
+});
+
+test('browser platform: the handler closes a terminal tab on Alt+Shift+W, not on Cmd+W', () => {
+  const calls = [];
+  const h = createShortcutHandler({ platform: 'browser', actions: { closeTab: () => calls.push('close') } });
+  expect(h(ev('KeyW', MAC))).toBe(true); // left to the browser
+  expect(h(ev('KeyW', { altKey: true, shiftKey: true }))).toBe(false);
+  expect(calls).toEqual(['close']);
 });
