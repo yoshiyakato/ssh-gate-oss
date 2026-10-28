@@ -264,6 +264,12 @@ func (t *aiExecTransport) Interrupt() error {
 	return err
 }
 
+// interruptGrace is how long after Interrupt the line may still hold the
+// transport: the close timer plus a margin for the channel to wind down.
+func (t *aiExecTransport) interruptGrace() time.Duration {
+	return aiExecInterruptGrace + time.Second
+}
+
 func (t *aiExecTransport) Ready() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()

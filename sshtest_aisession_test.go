@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -86,6 +87,18 @@ func runAITestSh(ch ssh.Channel) int {
 		case "cat":
 			rest, _ := io.ReadAll(ch)
 			_, _ = ch.Write(rest)
+		case "sleep":
+			// Ignores the signal request (as old OpenSSH and Dropbear do):
+			// runs until the client closes the channel.
+			for {
+				time.Sleep(20 * time.Millisecond)
+				if _, err := ch.Write([]byte{}); err != nil {
+					return 0
+				}
+				if _, err := ch.SendRequest("keepalive@test", true, nil); err != nil {
+					return 0
+				}
+			}
 		case "alias", "true":
 		case "head":
 			fmt.Fprintln(ch, "db password=hunter22-raw")

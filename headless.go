@@ -387,6 +387,11 @@ func runHeadlessWith(ctx context.Context, opts CLIOptions, dist fs.FS, deps head
 	app := NewApp()
 	if app.store == nil {
 		app.shutdown(context.Background())
+		if errors.Is(app.storeErr, errAnotherInstance) {
+			// A GUI on the same data holds only the database lock, not
+			// ssh-gate.lock; it is still "another process" (§1.1: exit 3).
+			return fail(exitLocked, "データベースを開けません: %s", app.storageError)
+		}
 		return fail(exitRuntime, "データベースを開けません: %s", app.storageError)
 	}
 	stopApp := func() {

@@ -52,7 +52,9 @@ PrivateDevices=no
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# AF_NETLINK: Go の net.InterfaceAddrs（0.0.0.0 / :: で待ち受けるときに自分の IP を
+# オリジンと自己署名証明書に入れる）が Linux では netlink で読むため
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes

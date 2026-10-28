@@ -102,8 +102,12 @@ jobs:
           retention-days: 1
 
       # -s: フロントエンドの install / build を飛ばす（上で済ませている）。
+      # -ldflags: --version と headless の起動ログに出す版（build-headless と同じ）。
       - name: Build
-        run: wails build -s -platform ${{ matrix.platform }} -clean -trimpath
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: wails build -s -platform ${{ matrix.platform }} -clean -trimpath -ldflags "-X main.appVersion=${VERSION}"
 
       - name: Package (macOS)
         if: runner.os == 'macOS'

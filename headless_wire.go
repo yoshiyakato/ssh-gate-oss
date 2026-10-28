@@ -8,8 +8,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -95,9 +98,20 @@ func prepareHeadlessWeb(p headlessWebParams) (headlessWebPlan, error) {
 	p.App.mu.Lock()
 	mcp := p.App.mcp
 	mcpToken := p.App.effectiveTokenLocked()
+	savedToken := p.App.mcpToken
 	p.App.mu.Unlock()
 	if err := validateWebListen(opts, mcp, mcpToken, srv.AdminTokenHash()); err != nil {
 		return headlessWebPlan{}, err
+	}
+	// validateWebListen compares the Bearer with the admin token only. The
+	// admin password must not be an MCP Bearer either: the effective one
+	// (SSH_GETE_TOKEN or the saved one) or the saved one that SSH_GETE_TOKEN
+	// hides now (storedMCPSecrets counts it too). A GUI on the same data
+	// directory saves the Bearer without this check.
+	for _, t := range []string{mcpToken, savedToken} {
+		if strings.TrimSpace(t) != "" && srv.auth.isAdminCredential(t) {
+			return headlessWebPlan{}, errors.New("MCP の Bearer トークンと管理パスワード（または管理トークン）が同じです。別の値にしてください（--set-admin-password）")
+		}
 	}
 	// The startup check above only covers the admin token. While running,
 	// SaveMCPSettings must not take an admin credential as the Bearer, and a
@@ -105,6 +119,7 @@ func prepareHeadlessWeb(p headlessWebParams) (headlessWebPlan, error) {
 	srv.auth.mcpSecret = p.App.isMCPSecret
 	p.App.mu.Lock()
 	p.App.adminCredential = srv.auth.isAdminCredential
+	p.App.webListenOverlap = webListenOverlapCheck(opts.Listen)
 	p.App.mu.Unlock()
 
 	var banner []string
@@ -112,4 +127,18 @@ func prepareHeadlessWeb(p headlessWebParams) (headlessWebPlan, error) {
 		banner = append(banner, fmt.Sprintf("TLS           : %s, SHA-256 %s", strings.TrimSpace(p.Web.TLS.Mode), fp))
 	}
 	return headlessWebPlan{Server: srv, WithEvents: func(ctx context.Context) context.Context { return withWebHub(ctx, hub) }, Banner: banner}, nil
+}
+
+// webListenOverlapCheck is App.webListenOverlap for the Web admin listening
+// on listen: whether an MCP host and port would overlap it, and the Web
+// address for the message. nil when listen cannot be read (startup already
+// refused it then).
+func webListenOverlapCheck(listen string) func(host string, port int) (string, bool) {
+	webHost, webPort, err := webSplitListen(listen)
+	if err != nil {
+		return nil
+	}
+	return func(host string, port int) (string, bool) {
+		return net.JoinHostPort(webHost, strconv.Itoa(webPort)), webListenOverlaps(webHost, webPort, host, port)
+	}
 }

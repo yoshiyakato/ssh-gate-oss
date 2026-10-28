@@ -353,6 +353,9 @@ var sessionStateBuiltins = map[string]bool{
 	"typeset": true, "readonly": true, "local": true, "stty": true, "ulimit": true, "umask": true,
 	"pushd": true, "popd": true, "exec": true, "source": true, ".": true, "eval": true, "let": true,
 	"function": true,
+	// fc re-runs (and edits) earlier lines, possibly a High line a human
+	// approved; history can also show the init line with the marker nonce.
+	"fc": true, "history": true,
 }
 
 // sessionDetaching outlive the line or the session (§3.2 row 6).
@@ -422,6 +425,12 @@ func classifySessionLine(line string, st sessionRiskState) sessionLineClass {
 	}
 
 	stateChange, detaches, dangerousEnv, hasCd := scanSessionCommands(line, st.Mode == aiModeShell)
+	if st.Mode == aiModeShell && historyExpansion(line) {
+		// ^old^new and !… re-run an earlier line (with substitution) that
+		// the approval screen does not show. The shell starts with history
+		// expansion off; this keeps such lines High if it is not.
+		c.raise("High", "history_reexec")
+	}
 	if dangerousEnv {
 		c.raise("High", "dangerous_env")
 	}
@@ -565,7 +574,7 @@ func scanSessionCommands(line string, shell bool) (stateChange, detaches, danger
 		for len(words) > 0 {
 			w := words[0]
 			if isAssignment(w) {
-				if sessionEnvNameClass(w[:strings.IndexByte(w, '=')]) == "dangerous" {
+				if sessionEnvNameClass(assignmentName(w)) == "dangerous" {
 					dangerousEnv = true
 				}
 				assigned = true
@@ -583,7 +592,7 @@ func scanSessionCommands(line string, shell bool) (stateChange, detaches, danger
 			wrapped = true
 			words = words[1:]
 			for len(words) > 0 && (strings.HasPrefix(words[0], "-") || (name == "env" && isAssignment(words[0])) || (name == "timeout" && isDuration(words[0])) || (name == "nice" && isNumber(words[0]))) {
-				if name == "env" && isAssignment(words[0]) && sessionEnvNameClass(words[0][:strings.IndexByte(words[0], '=')]) == "dangerous" {
+				if name == "env" && isAssignment(words[0]) && sessionEnvNameClass(assignmentName(words[0])) == "dangerous" {
 					dangerousEnv = true
 				}
 				// An option that takes its value as the next word (risk.go
@@ -619,13 +628,26 @@ func scanSessionCommands(line string, shell bool) (stateChange, detaches, danger
 				declared = true
 				n := a
 				if eq := strings.IndexByte(a, '='); eq >= 0 {
-					n = a[:eq]
+					n = strings.TrimSuffix(a[:eq], "+")
 				}
 				if sessionEnvNameClass(n) == "dangerous" {
 					dangerousEnv = true
 				}
 			}
 			if shell && declared {
+				stateChange = true
+			}
+		}
+		// printf -v, read, mapfile, readarray and getopts assign variables
+		// too (printf -v PATH …): the same name check, and in shell mode the
+		// change outlives the line.
+		if names, assigns := sessionVarAssignments(name, args); assigns {
+			for _, n := range names {
+				if sessionEnvNameClass(n) == "dangerous" {
+					dangerousEnv = true
+				}
+			}
+			if shell {
 				stateChange = true
 			}
 		}
@@ -646,6 +668,80 @@ func scanSessionCommands(line string, shell bool) (stateChange, detaches, danger
 		}
 	}
 	return
+}
+
+// assignmentName is the variable name of N=v or N+=v.
+func assignmentName(w string) string {
+	eq := strings.IndexByte(w, '=')
+	if eq < 0 {
+		return w
+	}
+	return strings.TrimSuffix(w[:eq], "+")
+}
+
+// sessionVarAssignments reports whether the command assigns shell variables
+// through its arguments, and the names it may assign (a rough reading: every
+// operand that could be a name). printf counts only with -v.
+func sessionVarAssignments(name string, args []string) ([]string, bool) {
+	switch name {
+	case "printf":
+		for i, a := range args {
+			a = unquoteWord(a)
+			if a == "--" || !strings.HasPrefix(a, "-") {
+				return nil, false
+			}
+			if a == "-v" {
+				if i+1 < len(args) {
+					return []string{sessionArrayBase(unquoteWord(args[i+1]))}, true
+				}
+				return nil, true
+			}
+			if strings.HasPrefix(a, "-v") {
+				return []string{sessionArrayBase(a[2:])}, true
+			}
+		}
+		return nil, false
+	case "read", "mapfile", "readarray", "getopts":
+		var names []string
+		for _, a := range args {
+			a = unquoteWord(a)
+			if a == "" || strings.HasPrefix(a, "-") {
+				continue
+			}
+			names = append(names, sessionArrayBase(a))
+		}
+		return names, true
+	}
+	return nil, false
+}
+
+// sessionArrayBase is NAME for NAME[i].
+func sessionArrayBase(n string) string {
+	if i := strings.IndexByte(n, '['); i > 0 {
+		return n[:i]
+	}
+	return n
+}
+
+// historyExpansion reports a line that bash's history expansion would
+// rewrite: a leading ^old^new, or ! followed by something other than a
+// blank, '=' or '(' outside single quotes (!!, !-1, !cmd, !?str?).
+func historyExpansion(line string) bool {
+	if strings.HasPrefix(strings.TrimSpace(line), "^") {
+		return true
+	}
+	b := blankSingleQuoted(line)
+	for i := 0; i < len(b); i++ {
+		if b[i] != '!' || i+1 >= len(b) || (i > 0 && b[i-1] == '$') {
+			continue
+		}
+		switch b[i+1] {
+		case ' ', '\t', '=', '(', '"':
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // sessionVarDeclarers set or export variables through their arguments.

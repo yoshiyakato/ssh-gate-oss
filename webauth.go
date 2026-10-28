@@ -850,7 +850,11 @@ func (a *adminAuth) handleSession(w http.ResponseWriter, r *http.Request) {
 func (a *adminAuth) requireSession(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// ページ（静的ファイル）は Cookie だけで配る。/api/* はセッション鍵も要る。
-		sess, ok := a.lookup(r, true, strings.HasPrefix(r.URL.Path, "/api/"))
+		// 無操作の時計を進めるのは鍵つきの /api/* だけ。Cookie だけのページ要求は
+		// 別ポートの同一サイトのページ（<img src=…>）からも飛んでくるので、
+		// それで idleMinutes を越えて延命させない。
+		isAPI := strings.HasPrefix(r.URL.Path, "/api/")
+		sess, ok := a.lookup(r, isAPI, isAPI)
 		if !ok {
 			if strings.HasPrefix(r.URL.Path, "/api/") || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
 				webauthError(w, http.StatusUnauthorized, "login required")

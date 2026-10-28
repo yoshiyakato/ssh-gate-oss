@@ -707,7 +707,7 @@ PrivateDevices=no            # シリアルを使わないなら yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
@@ -773,7 +773,7 @@ CMD ["--config", "/config/config.yaml", "--listen", "0.0.0.0:8788", "--tls-self-
 | `ssh-gate-win-x64-headless` | windows/amd64 | zip |
 | `ssh-gate-win-arm64-headless` | windows/arm64 | zip |
 
-   - ビルド: `CGO_ENABLED=0 GOOS=… GOARCH=… go build -tags headless -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o ssh-gete[.exe] .`
+   - ビルド: `CGO_ENABLED=0 GOOS=… GOARCH=… go build -tags headless -trimpath -ldflags "-s -w -X main.appVersion=${GITHUB_REF_NAME}" -o ssh-gete[.exe] .`
    - 検査: `go list -deps -tags headless . | grep -q wailsapp && exit 1`
    - 梱包には `packaging/systemd/ssh-gete.service` と `packaging/headless.example.yaml` も入れる（Linux）。
    - macOS の headless は署名していないので、README に `xattr -d com.apple.quarantine ssh-gete` を書く。universal にする（lipo）のは macOS のランナーが要るので v1 では分ける。

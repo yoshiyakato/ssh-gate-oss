@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -67,8 +68,15 @@ type App struct {
 	// Bearer must not be one, or every MCP client could log in as admin.
 	// Called without a.mu held (it may run argon2id).
 	adminCredential func(string) bool
-	mcpAgents       map[string]time.Time
-	agentPolicies   map[string]AgentPolicy
+	// webListenOverlap reports whether an MCP listen address and port would
+	// overlap the Web admin's listener (set by headless_wire.go; nil in the
+	// GUI). SaveMCPSettings refuses such a save, since startup refuses it too.
+	webListenOverlap func(host string, port int) (string, bool)
+	// storeErr is the error openStore returned (nil when the store opened),
+	// so headless can tell errAnotherInstance from other failures.
+	storeErr      error
+	mcpAgents     map[string]time.Time
+	agentPolicies map[string]AgentPolicy
 	// agentTokens maps agent name to its per-agent token (hash only). A
 	// request authenticated with one may use that agent's approval bypass.
 	agentTokens map[string]AgentToken
@@ -467,6 +475,7 @@ func NewApp() *App {
 	if err != nil {
 		log.Printf("open sqlite store: %v", err)
 		app.storageError = err.Error()
+		app.storeErr = err
 	}
 	app.store = store
 
@@ -1465,6 +1474,7 @@ func (a *App) SaveMCPSettings(settings MCPSettings) ActionResult {
 	settings.ConfigPath = a.dbPath
 	a.mu.RLock()
 	isAdmin := a.adminCredential
+	webOverlap := a.webListenOverlap
 	a.mu.RUnlock()
 	if input := strings.TrimSpace(settings.TokenInput); input != "" && isAdmin != nil && isAdmin(input) {
 		return ActionResult{OK: false, Message: "管理トークンや管理パスワードを MCP の Bearer トークンにしないでください。別の値にしてください"}
@@ -1494,6 +1504,15 @@ func (a *App) SaveMCPSettings(settings MCPSettings) ActionResult {
 	if err := validateListenSettings(settings, effective); err != nil {
 		a.mu.Unlock()
 		return ActionResult{OK: false, Code: "invalid_listen", Message: err.Error()}
+	}
+	// The Web admin's listener is fixed for this run; an overlapping MCP
+	// listener would break one of them now and stop the next headless start.
+	if webOverlap != nil && settings.Enabled {
+		if web, overlaps := webOverlap(settings.ListenAddress, settings.Port); overlaps {
+			a.mu.Unlock()
+			return ActionResult{OK: false, Code: "invalid_listen", Message: fmt.Sprintf("MCP の待受 %s が web 管理画面の待受 %s と重なっています。別のポートにしてください",
+				net.JoinHostPort(settings.ListenAddress, strconv.Itoa(settings.Port)), web)}
+		}
 	}
 	if err := a.store.saveMCPSettings(settings, token); err != nil {
 		a.mu.Unlock()

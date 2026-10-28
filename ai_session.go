@@ -874,6 +874,12 @@ func (r aiSessionRunner) RunLine(ctx context.Context, plan aiLinePlan) (aiLineOu
 	return out, runErr
 }
 
+// aiInterruptGracer is a transport that keeps a line for a fixed time after
+// Interrupt before it lets go of it.
+type aiInterruptGracer interface {
+	interruptGrace() time.Duration
+}
+
 // waitTransportLine waits for the line to end. When ctx ends (timeout,
 // close, shutdown) it sends one interrupt and waits aiLineCancelGrace for the
 // prompt; the error is ctx's cause.
@@ -884,7 +890,17 @@ func waitTransportLine(ctx context.Context, tr aiTransport, h aiLineHandle) aiTr
 	case <-ctx.Done():
 	}
 	_ = tr.Interrupt()
-	grace := time.NewTimer(aiLineCancelGrace)
+	wait := aiLineCancelGrace
+	// A transport that frees the line only after its own grace (exec mode
+	// closes the channel aiExecInterruptGrace after the interrupt) is waited
+	// for, so the gate does not go idle while the transport is still busy
+	// and the next line fails with transport_busy (using up its approval).
+	if g, ok := tr.(aiInterruptGracer); ok {
+		if d := g.interruptGrace(); d > wait {
+			wait = d
+		}
+	}
+	grace := time.NewTimer(wait)
 	defer grace.Stop()
 	oc := aiTransportOutcome{}
 	select {
@@ -2050,8 +2066,12 @@ func aiShellCommand(shell string) string {
 // aiShellInitLine sets the marker prompts. It is written once by
 // writeControl and holds no agent input. The 0x1E bytes are literal (dash
 // does not interpret backslash escapes in PS1).
+//
+// In bash it also turns history off and clears it (this line included), so
+// fc, history and ^old^new cannot re-run an approved line or show the nonce.
 func aiShellInitLine(nonce string) []byte {
-	return []byte("PS1='\x1eSG:" + nonce + ":$?\x1e'; PS2='\x1eSG2:" + nonce + "\x1e'; unset PROMPT_COMMAND; trap - DEBUG 2>/dev/null\n")
+	return []byte("PS1='\x1eSG:" + nonce + ":$?\x1e'; PS2='\x1eSG2:" + nonce + "\x1e'; unset PROMPT_COMMAND; trap - DEBUG 2>/dev/null; " +
+		"if [ -n \"${BASH_VERSION-}\" ]; then set +o history +H; history -c; HISTFILE=/dev/null; fi\n")
 }
 
 // newShellTransport starts the marker shell on client, which it then owns.

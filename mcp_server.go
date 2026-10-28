@@ -444,6 +444,13 @@ func (a *App) executeCommandTool(ctx context.Context, caller mcpCaller, args exe
 	}
 	defer unlock()
 	if existing, ok := a.existingClientRequest(agentName, args.ClientRequestID); ok {
+		// AI session lines share the client_request_id namespace, but only
+		// their owner's token may read them (REQ-016 §2.1, mayReadRequest).
+		// execute_command never answers with one, not even to the owner: no
+		// request id, no output, no session id.
+		if a.isAISessionLine(existing) {
+			return toolError("idempotency_conflict", "client_request_id was already used for an AI session line; use a different value", nil), nil
+		}
 		out := executeView(existing)
 		out["deduplicated"] = true
 		// Same isError rule as the original answer (runBypassedCommand).

@@ -294,9 +294,15 @@ func webOrigins(listen, publicURL string, port int, useTLS bool) []string {
 	return out
 }
 
+// webInterfaceAddrs is net.InterfaceAddrs; a variable so tests can fail it.
+var webInterfaceAddrs = net.InterfaceAddrs
+
 func webInterfaceIPs(includeV6 bool) []string {
-	addrs, err := net.InterfaceAddrs()
+	addrs, err := webInterfaceAddrs()
 	if err != nil {
+		// Under a sandbox without AF_NETLINK (systemd RestrictAddressFamilies)
+		// this fails on Linux; only loopback origins remain, so say so.
+		log.Printf("web: この PC のアドレスを読めません（%v）。オリジンと証明書はループバックだけになります。LAN から使うなら web.publicURL を設定してください", err)
 		return nil
 	}
 	var out []string
