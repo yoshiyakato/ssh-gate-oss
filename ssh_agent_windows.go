@@ -3,27 +3,36 @@
 package main
 
 import (
+	"context"
+	"log"
 	"net"
 	"os"
 	"strings"
-	"time"
+	"sync"
 
 	"github.com/Microsoft/go-winio"
 )
 
-// windowsSSHAgentPipe is the named pipe exposed by the OpenSSH Authentication
-// Agent service that ships with Windows. Unlike Unix, Windows ssh-agent does
-// not use SSH_AUTH_SOCK / Unix sockets.
-const windowsSSHAgentPipe = `\\.\pipe\openssh-ssh-agent`
+// Windows ssh-agent does not use SSH_AUTH_SOCK / Unix sockets; it listens on
+// windowsDefaultAgentPipe (see ssh_exec.go).
+
+var warnAgentSockOnce sync.Once
 
 // dialSSHAgent connects to the Windows ssh-agent over its named pipe. An
-// SSH_AUTH_SOCK that names a pipe takes priority; a Unix-style value (set by
-// Git Bash / MSYS tooling) is ignored in favour of the default pipe.
-func dialSSHAgent() (net.Conn, error) {
-	pipe := strings.TrimSpace(os.Getenv("SSH_AUTH_SOCK"))
-	if !strings.HasPrefix(pipe, `\\.\pipe\`) {
-		pipe = windowsSSHAgentPipe
+// SSH_AUTH_SOCK that names a pipe, in any spelling Win32 accepts (see
+// normalizeWindowsAgentPipe), takes priority; any other value (a Unix-style
+// path set by Git Bash / MSYS tooling) is ignored in favour of the default
+// pipe, and that is logged once. ctx bounds the connect.
+func dialSSHAgent(ctx context.Context) (net.Conn, error) {
+	raw := strings.TrimSpace(os.Getenv("SSH_AUTH_SOCK"))
+	pipe, ok := normalizeWindowsAgentPipe(raw)
+	if !ok {
+		if raw != "" {
+			warnAgentSockOnce.Do(func() {
+				log.Printf("ssh-gete: SSH_AUTH_SOCK %q is not a named pipe; using %s", raw, windowsDefaultAgentPipe)
+			})
+		}
+		pipe = windowsDefaultAgentPipe
 	}
-	timeout := 2 * time.Second
-	return winio.DialPipe(pipe, &timeout)
+	return winio.DialPipeContext(ctx, pipe)
 }
