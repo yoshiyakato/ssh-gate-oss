@@ -1,0 +1,30 @@
+version: 2
+updates:
+  # Actions are pinned to commit SHAs (audit #25/#43); Dependabot keeps the
+  # SHA and the tag comment up to date.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      go-minor:
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+    # Releases younger than two weeks are not proposed.
+    cooldown:
+      default-days: 14
+    groups:
+      npm-minor:
+        update-types: [minor, patch]

@@ -1,0 +1,106 @@
+# ssh-gete headless の設定ファイルの例（phase6-headless.md §1.3、docs/headless.md）
+#
+#   ssh-gete --headless --config /etc/ssh-gete/config.yaml --check-config   # 検証と反映の予定を表示
+#   ssh-gete --headless --config /etc/ssh-gete/config.yaml
+#
+# - 知らないキーは誤りになり、起動を拒否します。平文のパスワードを書くキーはありません。
+#   パスワードは passwordEnv（環境変数）か passwordFile（0600 のファイル）で渡します。
+# - ${VAR} が展開されるのは、パスを表すキー（*File、keyPath、tls.cert、tls.key、dataDir）だけです。
+# - Unix では、このファイルに group / other の書き込み権があると起動を拒否します。
+
+version: 1
+
+# 省略時は --data-dir / SSH_GETE_CONFIG_DIR / 既定の場所
+dataDir: /var/lib/ssh-gete
+
+# seed（既定）: 起動時の初期値。以後は Web 画面での変更を優先する
+#               （設定ファイルの項目が変わったときだけ、書かれたキーを上書きする）
+# enforce:      起動のたびに設定ファイルの内容で上書きする（GitOps 向け）
+apply: seed
+
+web:
+  # --listen が優先。127.0.0.1 以外で待ち受けるときは tls.mode を off にできない。
+  listen: 127.0.0.1:8788
+  # ホスト名でアクセスするとき、リバースプロキシの後ろに置くときに指定する
+  publicURL: ""
+  tls:
+    mode: off                     # off | files | self-signed
+    # mode: files のとき
+    # cert: /etc/ssh-gete/tls.crt
+    # key: /etc/ssh-gete/tls.key
+  # 省略時は <dataDir>/admin-token。中身を見るには ssh-gete --print-admin-token
+  adminTokenFile: ""
+  # 管理パスワード（任意、argon2id のハッシュ）。省略時は <dataDir>/admin-password。
+  # 設定は ssh-gete --set-admin-password
+  adminPasswordFile: ""
+  session:
+    idleMinutes: 30               # 5〜720
+    maxHours: 12                  # 1〜168
+  maxSessions: 32
+
+mcp:                              # 省略したキーは DB の値を使う
+  enabled: true
+  listenAddress: 127.0.0.1        # 環境変数 SSH_GETE_MCP_ADDR があればそちらが優先
+  port: 8787
+  bearerEnabled: true
+  tokenEnv: SSH_GETE_TOKEN        # Bearer トークンを読む環境変数名（値は書けない）
+  allowedOrigins: []
+  requestTimeout: 30
+  maxOutputKB: 256
+  maxBodyKB: 256
+
+policy:
+  strictHostKey: true
+  autoExecuteLowRisk: false
+  requireApprovalSudo: true
+  requireApprovalProd: true
+  requireApprovalWriteOp: true
+  defaultConnectTimeout: 10
+  defaultCommandTimeout: 30
+
+secrets:
+  # keychain（既定）: OS のキーチェーン。無ければパスワードは保存できない（鍵認証・ssh-agent は使える）
+  # file:     <dataDir>/secrets.json（0600、暗号化なし）。キーチェーンの無い Linux サーバー向け
+  # env:      passwordEnv / passphraseEnv で対応づけた環境変数だけを読む。Web からは保存できない
+  # （memory はテスト専用。ここに書くと起動を拒否する）
+  # 環境変数 SSH_GETE_KEYRING（keychain | file | env）があればそちらが優先。
+  backend: keychain
+  # backend: file のときだけ。省略時は <dataDir>/secrets.json、相対パスは dataDir から
+  # file: secrets.json
+
+connections:
+  - name: prod-web-1              # 照合のキー。Web で名前を変えても同じ項目として扱われる
+    type: ssh                     # ssh | serial
+    host: 10.0.0.5
+    port: 22
+    user: deploy
+    auth: key                     # key（鍵ファイル。読めなければ ssh-agent）| password
+    keyPath: /etc/ssh-gete/keys/prod_ed25519
+    passphraseEnv: ""             # 鍵のパスフレーズを読む環境変数
+    tags: [prod, web]
+    description: 本番 Web 1号機
+    connectTimeout: 10
+    commandTimeout: 30
+    mcpFirstTrust: false
+
+  - name: legacy-db
+    type: ssh
+    host: 10.0.0.20
+    user: admin
+    auth: password
+    # どちらか一方。両方とも無ければ Web 画面で後から入れる
+    # passwordEnv: LEGACY_DB_PASSWORD
+    passwordFile: ${CREDENTIALS_DIRECTORY}/legacy-db   # systemd の LoadCredential=legacy-db:...
+    tags: [prod, db]
+
+  - name: core-switch-console
+    type: serial
+    serialPort: /dev/ttyUSB0
+    baudRate: 115200
+    dataBits: 8
+    parity: none
+    stopBits: "1"
+
+# true: 以前この設定ファイルが作り、今は書かれていない接続先を DB から消す
+# （Web 画面で作った接続先は消さない）
+prune: false

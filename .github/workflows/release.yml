@@ -1,8 +1,21 @@
 name: release
 
 # タグ push（v*）で macOS / Windows のバイナリをビルドし、GitHub Releases に添付する。
+# 添付するファイル名にはタグ名（例: v1.01）を付ける（ssh-gate-mac-universal-v1.01.zip など）。
 # 各 OS はそれぞれの runner 上でネイティブにビルドするため、クロスコンパイルの罠を避けられる。
 # SQLite はピュア Go の modernc.org/sqlite を使うため cgo の C コンパイラ依存はない。
+# headless 専用ビルド（-tags headless、CGO_ENABLED=0、Wails なし）は build-headless ジョブで
+# ubuntu から 6 つの OS/CPU 向けにクロスビルドし、Linux は tar.gz、macOS / Windows は zip で添付する（docs/headless.md）。
+#
+# 供給網対策（監査 a6f2706 #24 #25 #27 #43 #44）:
+# - ワークフローの既定権限は read。contents:write は公開ジョブ（release）だけに付ける。
+# - checkout は persist-credentials: false で、トークンを .git/config に残さない。
+# - action はすべてコミット SHA に固定する（コメントは対応するタグ）。
+# - Wails CLI は go.mod の github.com/wailsapp/wails/v2 と同じ版を入れる。
+# - npm 依存は lockfile どおり `npm ci --ignore-scripts` で入れ、ライフサイクルスクリプトを動かさない。
+#   wails.json の frontend:install（npm install）は通らないよう `wails build -s` を使う。
+# - ビルドはテスト（test.yml）が通ってから。公開ジョブは成果物を artifact 経由で受け取るだけで、
+#   ソースの checkout もビルドもしない。
 
 on:
   push:
@@ -11,72 +24,253 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  test:
+    name: test
+    permissions:
+      contents: read
+    uses: ./.github/workflows/test.yml
+
   build:
     name: build (${{ matrix.artifact }})
+    needs: test
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: macos-latest
             platform: darwin/universal
-            artifact: ssh-gete-macos-universal
+            artifact: ssh-gate-mac-universal
           - os: windows-latest
             platform: windows/amd64
-            artifact: ssh-gete-windows-amd64
+            artifact: ssh-gate-win-x64
+          - os: windows-latest
+            platform: windows/arm64
+            artifact: ssh-gate-win-arm64
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.25'
+          go-version-file: go.mod
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '20'
 
-      - name: Install Wails CLI
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+      - name: Install Wails CLI (version from go.mod)
+        run: |
+          WAILS_VERSION="$(go list -m -f '{{.Version}}' github.com/wailsapp/wails/v2)"
+          echo "wails ${WAILS_VERSION}"
+          go install "github.com/wailsapp/wails/v2/cmd/wails@${WAILS_VERSION}"
 
+      # frontend/wailsjs は生成物（git 管理外）。フロントエンドのビルドが import するので先に作る。
+      # main.go の go:embed が frontend/dist を要求するため、空のディレクトリを用意しておく。
+      - name: Generate Wails bindings
+        run: |
+          mkdir -p frontend/dist && touch frontend/dist/.keep
+          wails generate module
+
+      - name: Install frontend dependencies (no lifecycle scripts)
+        working-directory: frontend
+        run: npm ci --ignore-scripts
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      # headless 専用ビルド（build-headless）は frontend/dist を embed する。frontend/wailsjs の生成に
+      # Wails CLI（Linux では WebKit の開発用ライブラリ）が要るので、ここで作ったものを受け渡す。
+      - name: Upload frontend dist (for headless builds)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          if-no-files-found: error
+          retention-days: 1
+
+      # -s: フロントエンドの install / build を飛ばす（上で済ませている）。
+      # -ldflags: --version と headless の起動ログに出す版（build-headless と同じ）。
       - name: Build
-        run: wails build -platform ${{ matrix.platform }} -clean -trimpath
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: wails build -s -platform ${{ matrix.platform }} -clean -trimpath -ldflags "-X main.appVersion=${VERSION}"
 
       - name: Package (macOS)
         if: runner.os == 'macOS'
+        env:
+          VERSION: ${{ github.ref_name }}
         run: |
           cd build/bin
-          ditto -c -k --sequesterRsrc --keepParent ssh-gete.app "../../${{ matrix.artifact }}.zip"
+          ditto -c -k --sequesterRsrc --keepParent ssh-gete.app "../../${{ matrix.artifact }}-${VERSION}.zip"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          VERSION: ${{ github.ref_name }}
         run: |
-          Compress-Archive -Path build/bin/ssh-gete.exe -DestinationPath "${{ matrix.artifact }}.zip"
+          Compress-Archive -Path build/bin/ssh-gete.exe -DestinationPath "${{ matrix.artifact }}-$env:VERSION.zip"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}.zip
+          path: ${{ matrix.artifact }}-${{ github.ref_name }}.zip
+          if-no-files-found: error
+
+  # headless 専用ビルド（phase6-headless.md §2・§9.3）。Wails を import せず、CGO_ENABLED=0 で
+  # GTK / WebKit なしに動く。Linux 1台からクロスビルドする。frontend/dist は build の macOS 行から受け取る。
+  build-headless:
+    name: build (${{ matrix.artifact }})
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            artifact: ssh-gate-linux-x64-headless
+          - goos: linux
+            goarch: arm64
+            artifact: ssh-gate-linux-arm64-headless
+          # macOS / Windows の headless 専用ビルド（§9.3）。署名していない。macOS は arm64 と x64 を分ける
+          # （universal にする lipo には macOS のランナーが要るため）。
+          - goos: darwin
+            goarch: arm64
+            artifact: ssh-gate-mac-arm64-headless
+          - goos: darwin
+            goarch: amd64
+            artifact: ssh-gate-mac-x64-headless
+          - goos: windows
+            goarch: amd64
+            artifact: ssh-gate-win-x64-headless
+          - goos: windows
+            goarch: arm64
+            artifact: ssh-gate-win-arm64-headless
+    env:
+      CGO_ENABLED: '0'
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+      # run: の中に ${{ }} を直接書かない（タグ名をシェルに埋め込まない）。
+      VERSION: ${{ github.ref_name }}
+      ARTIFACT: ${{ matrix.artifact }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: frontend-dist
+          path: frontend/dist
+
+      # headless ビルドの依存に Wails が入っていないこと（入っていると GTK / WebKit が要る）。
+      - name: Check that Wails is not linked
+        run: |
+          if go list -deps -tags headless . | grep -q '^github.com/wailsapp/'; then
+            echo "::error::the headless build depends on github.com/wailsapp" >&2
+            go list -deps -tags headless . | grep '^github.com/wailsapp/' >&2
+            exit 1
+          fi
+
+      - name: Build
+        run: |
+          bin=ssh-gete
+          if [ "${GOOS}" = windows ]; then bin=ssh-gete.exe; fi
+          echo "BIN=${bin}" >> "${GITHUB_ENV}"
+          go build -tags headless -trimpath -ldflags "-s -w -X main.appVersion=${VERSION}" -o "${bin}" .
+          file "${bin}" || true
+
+      # linux/amd64 はランナーで直接動かせるので、静的リンクであることと起動できることを確かめる。
+      - name: Smoke test
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: |
+          ldd ssh-gete 2>&1 | grep -q 'not a dynamic executable' || { echo "::error::not statically linked"; ldd ssh-gete; exit 1; }
+          ./ssh-gete --version
+
+      # Linux は tar.gz で実行権を保ち、systemd の unit も入れる。macOS / Windows は zip（§9.3）。
+      # 中身はアーカイブの直下に置く（deploy/docker/Dockerfile の手順と合わせる）。
+      - name: Package
+        run: |
+          stage="$(mktemp -d)"
+          cp "${BIN}" "${stage}/${BIN}"
+          cp deploy/headless.example.yaml "${stage}/headless.example.yaml"
+          cp docs/headless.md "${stage}/headless.md"
+          cp LICENSE "${stage}/LICENSE"
+          chmod 0755 "${stage}/${BIN}"
+          chmod 0644 "${stage}/headless.example.yaml" "${stage}/headless.md" "${stage}/LICENSE"
+          if [ "${GOOS}" = linux ]; then
+            cp deploy/systemd/ssh-gete.service "${stage}/ssh-gete.service"
+            chmod 0644 "${stage}/ssh-gete.service"
+            tar --sort=name --owner=0 --group=0 --numeric-owner -C "${stage}" -czf "${ARTIFACT}-${VERSION}.tar.gz" \
+              "${BIN}" ssh-gete.service headless.example.yaml headless.md LICENSE
+            tar -tzvf "${ARTIFACT}-${VERSION}.tar.gz"
+            echo "PACKAGE=${ARTIFACT}-${VERSION}.tar.gz" >> "${GITHUB_ENV}"
+          else
+            out="${PWD}/${ARTIFACT}-${VERSION}.zip"
+            (cd "${stage}" && zip -X -q "${out}" "${BIN}" headless.example.yaml headless.md LICENSE)
+            unzip -l "${out}"
+            echo "PACKAGE=${ARTIFACT}-${VERSION}.zip" >> "${GITHUB_ENV}"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ env.PACKAGE }}
+          if-no-files-found: error
 
   release:
     name: publish release
-    needs: build
+    needs: [build, build-headless]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
+    # 書き込み権限はこのジョブだけ。ここではソースを checkout せず、第三者のビルドコードも動かさない。
+    permissions:
+      contents: write
     steps:
+      # frontend-dist（受け渡し用）は公開しない。
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
+          pattern: ssh-gate-*
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- *.zip *.tar.gz | tee SHA256SUMS.txt
 
       - name: Create / update GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          files: dist/**/*.zip
+          files: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt
           generate_release_notes: true

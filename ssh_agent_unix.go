@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"net"
 	"os"
@@ -11,10 +12,12 @@ import (
 
 // dialSSHAgent connects to the running ssh-agent over the Unix domain socket
 // advertised by SSH_AUTH_SOCK. Returns an error when no agent is configured.
-func dialSSHAgent() (net.Conn, error) {
+// ctx bounds the connect (see dialAgentClient for the deadline).
+func dialSSHAgent(ctx context.Context) (net.Conn, error) {
 	socket := strings.TrimSpace(os.Getenv("SSH_AUTH_SOCK"))
 	if socket == "" {
 		return nil, errors.New("SSH_AUTH_SOCK not set")
 	}
-	return net.Dial("unix", socket)
+	var dialer net.Dialer
+	return dialer.DialContext(ctx, "unix", socket)
 }

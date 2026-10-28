@@ -1,0 +1,67 @@
+# ssh-gete headless の systemd unit（docs/headless.md、phase6-headless.md §9.1）
+#
+# 入れ方:
+#   sudo useradd --system --home-dir /var/lib/ssh-gete --shell /usr/sbin/nologin ssh-gete
+#   sudo install -m 0755 ssh-gete /usr/local/bin/ssh-gete
+#   sudo install -d -m 0750 -o root -g ssh-gete /etc/ssh-gete
+#   sudo install -m 0640 -o root -g ssh-gete headless.example.yaml /etc/ssh-gete/config.yaml
+#   sudo install -m 0644 ssh-gete.service /etc/systemd/system/ssh-gete.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now ssh-gete
+#   sudo -u ssh-gete /usr/local/bin/ssh-gete --print-admin-token --data-dir /var/lib/ssh-gete
+#
+# 設定ファイルは group / other に書き込み権があると起動を拒否する（0640 root:ssh-gete は可）。
+
+[Unit]
+Description=ssh-gete (headless SSH gateway for AI agents)
+Documentation=https://github.com/yoshiyakato/ssh-gate-oss/blob/main/docs/headless.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ssh-gete
+Group=ssh-gete
+ExecStart=/usr/local/bin/ssh-gete --headless --config /etc/ssh-gete/config.yaml --data-dir /var/lib/ssh-gete
+StateDirectory=ssh-gete
+StateDirectoryMode=0700
+ConfigurationDirectory=ssh-gete
+
+# パスワードを systemd の credential で渡す例
+# （config.yaml では passwordFile: ${CREDENTIALS_DIRECTORY}/prod-web-1）
+#LoadCredential=prod-web-1:/etc/ssh-gete/secrets/prod-web-1
+
+# MCP の Bearer トークンなど（ファイルは root:root 0600。SSH_GETE_TOKEN=...）
+#EnvironmentFile=/etc/ssh-gete/env
+
+Restart=on-failure
+RestartSec=3
+# 終了処理（Web の受付停止 → 呼び出しの完了待ち → MCP の停止 → DB を閉じる）に余裕を持たせた値
+TimeoutStopSec=30
+KillSignal=SIGTERM
+UMask=0077
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# シリアルを使わないなら yes にする
+PrivateDevices=no
+# シリアルを使うとき
+#SupplementaryGroups=dialout
+#DeviceAllow=/dev/ttyUSB0 rw
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# AF_NETLINK: Go の net.InterfaceAddrs（0.0.0.0 / :: で待ち受けるときに自分の IP を
+# オリジンと自己署名証明書に入れる）が Linux では netlink で読むため
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/ssh-gete
+
+[Install]
+WantedBy=multi-user.target

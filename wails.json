@@ -7,7 +7,9 @@
   "frontend:dev:watcher": "npm run dev",
   "frontend:dev:serverUrl": "auto",
   "author": {
-    "name": "yoshiya kato",
-    "email": "katoyoshiya@gmail.com"
+    "name": "QuickIterate Co., Ltd."
+  },
+  "info": {
+    "productVersion": "1.01"
   }
 }

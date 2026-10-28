@@ -19,6 +19,8 @@
         <string>iconfile</string>
         <key>LSMinimumSystemVersion</key>
         <string>10.13.0</string>
+        <key>NSLocalNetworkUsageDescription</key>
+        <string>SSH GATE は、登録した LAN 内の SSH サーバーに接続するためにローカルネットワークへのアクセスを使います。 / SSH GATE connects to the SSH servers you register on your local network.</string>
         <key>NSHighResolutionCapable</key>
         <string>true</string>
         <key>NSHumanReadableCopyright</key>

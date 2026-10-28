@@ -1,0 +1,673 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"crypto/ed25519"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
+)
+
+// Host key verification is trust-on-first-use against a known_hosts file owned
+// by ssh-gete (appConfigDir()/known_hosts, mode 0600). Only a connection the
+// human started from the GUI may record an unknown key, and never in strict
+// mode; an agent (MCP) dialing an unknown host gets hostkey_unknown. A
+// mismatch is always refused.
+//
+// hostKeyMu is a leaf lock: it is never held together with a.mu, and nothing
+// is called back while holding it (§5.0).
+
+const knownHostsFileName = "known_hosts"
+
+// hostKeyOrigin says who started the dial, which decides whether an unknown
+// host key may be recorded.
+type hostKeyOrigin int
+
+const (
+	hostKeyFromGUI hostKeyOrigin = iota
+	hostKeyFromMCP
+)
+
+// hostKeyPolicy is passed to openSSHClientWithPolicy. Strict
+// (SSH_GETE_STRICT_HOSTKEY / StrictHostKey) additionally trusts the user's
+// ~/.ssh/known_hosts and never records: an unknown host fails with
+// hostkey_unknown for every origin, as before TOFU existed. Mismatch handling
+// is the same either way.
+type hostKeyPolicy struct {
+	Origin hostKeyOrigin
+	Strict bool
+	// Candidate, when set, defers TOFU recording (N20): an unknown key that a
+	// GUI dial may trust is only kept here during the key exchange, and is
+	// written to known_hosts by Candidate.Commit once the dialer has
+	// authenticated (and, where the UI asks, the human has seen the
+	// fingerprint). Without it the key is recorded inside the callback,
+	// before authentication.
+	Candidate *hostKeyCandidate
+}
+
+// hostKeyCandidate is an unknown host key accepted for one GUI dial but not
+// recorded yet. Its zero value is ready to use; it is safe for concurrent use.
+type hostKeyCandidate struct {
+	mu       sync.Mutex
+	hostname string
+	key      ssh.PublicKey
+}
+
+// withDeferredRecording returns p with a fresh Candidate when p may record
+// an unknown key (GUI origin, not strict), and that candidate (nil
+// otherwise). The dialer calls Commit after authentication succeeded.
+func (p hostKeyPolicy) withDeferredRecording() (hostKeyPolicy, *hostKeyCandidate) {
+	if p.Origin != hostKeyFromGUI || p.Strict {
+		return p, nil
+	}
+	p.Candidate = &hostKeyCandidate{}
+	return p, p.Candidate
+}
+
+func (c *hostKeyCandidate) set(hostname string, key ssh.PublicKey) {
+	c.mu.Lock()
+	c.hostname, c.key = hostname, key
+	c.mu.Unlock()
+}
+
+// Pending reports whether a key is waiting to be recorded.
+func (c *hostKeyCandidate) Pending() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.key != nil
+}
+
+// Fingerprint is the SHA256 fingerprint of the pending key ("" if none), for
+// the GUI to show before or while trusting it.
+func (c *hostKeyCandidate) Fingerprint() string {
+	if c == nil {
+		return ""
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.key == nil {
+		return ""
+	}
+	return ssh.FingerprintSHA256(c.key)
+}
+
+// Commit records the pending key (no-op when there is none). A concurrent
+// dial that recorded a different key for the host first makes it a mismatch.
+func (c *hostKeyCandidate) Commit() error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	hostname, key := c.hostname, c.key
+	c.key = nil
+	c.mu.Unlock()
+	if key == nil {
+		return nil
+	}
+	return recordHostKey(hostname, key)
+}
+
+var (
+	hostKeyMu sync.Mutex
+	// hostKeyGen changes whenever the known_hosts file is written, so a
+	// future connection pool can fold it into its fingerprint (§5.1).
+	hostKeyGen atomic.Uint64
+)
+
+// hostKeyUnknownError: the host is not in any known_hosts file and this dial
+// may not record it. The message deliberately avoids "host key" so the
+// string-based fallback in classifyExecError does not report "hostkey".
+type hostKeyUnknownError struct {
+	Address     string
+	Fingerprint string
+}
+
+func (e *hostKeyUnknownError) Error() string {
+	return fmt.Sprintf("hostkey_unknown: %s is not trusted yet (presented %s); connect once from the ssh-gete GUI to trust it", e.Address, e.Fingerprint)
+}
+
+// hostKeyMismatchError: known_hosts has keys for the host and none matches,
+// or the presented key is revoked.
+type hostKeyMismatchError struct {
+	Address     string
+	Fingerprint string
+	Known       []string
+	Revoked     bool
+}
+
+func (e *hostKeyMismatchError) Error() string {
+	if e.Revoked {
+		return fmt.Sprintf("host key mismatch: %s presented a revoked key %s", e.Address, e.Fingerprint)
+	}
+	return fmt.Sprintf("host key mismatch: %s presented %s, known_hosts has %v", e.Address, e.Fingerprint, e.Known)
+}
+
+// hostKeyErrorKind maps host key failures to the MCP error_kind vocabulary.
+// It returns "" for any other error; classifyExecError should consult it
+// before its string matching.
+func hostKeyErrorKind(err error) string {
+	var unknown *hostKeyUnknownError
+	var mismatch *hostKeyMismatchError
+	switch {
+	case errors.As(err, &unknown):
+		return "hostkey_unknown"
+	case errors.As(err, &mismatch):
+		return "hostkey"
+	}
+	return ""
+}
+
+// HostKeyEntry is one recorded key for an address.
+type HostKeyEntry struct {
+	Type        string `json:"type"`
+	Fingerprint string `json:"fingerprint"`
+}
+
+// HostKeyInfo is what the GUI shows for a connection: the normalized address
+// and the keys ssh-gete has recorded for it (empty when never trusted).
+type HostKeyInfo struct {
+	ConnID  string         `json:"connId"`
+	Address string         `json:"address"`
+	Known   bool           `json:"known"`
+	Keys    []HostKeyEntry `json:"keys"`
+}
+
+// knownHostsPath is appConfigDir()/known_hosts, or "" when there is no
+// config directory (audit #23: never a relative "known_hosts" in the working
+// directory).
+func knownHostsPath() string {
+	dir := appConfigDir()
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, knownHostsFileName)
+}
+
+// appKnownHostsPath is knownHostsPath for readers and writers: no config
+// directory is an error, so no host key is verified, recorded or reset.
+func appKnownHostsPath() (string, error) {
+	path := knownHostsPath()
+	if path == "" {
+		return "", errNoConfigDir
+	}
+	return path, nil
+}
+
+// hostKeyGeneration returns a counter that changes on every known_hosts write.
+func hostKeyGeneration() uint64 {
+	return hostKeyGen.Load()
+}
+
+// hostKeyAddress is the address dialing, recording, lookup and reset all use.
+// The host is lowercased (DNS names are case-insensitive and OpenSSH writes
+// them lowercased), so "Web01" and "web01" share one TOFU identity.
+func hostKeyAddress(conn Connection) string {
+	port := conn.Port
+	if port == 0 {
+		port = 22
+	}
+	return net.JoinHostPort(strings.ToLower(strings.TrimSpace(conn.Host)), strconv.Itoa(port))
+}
+
+// ensureKnownHostsFile creates the file (0600, directory 0700) if missing and
+// tightens the mode of an existing one. Caller holds hostKeyMu.
+func ensureKnownHostsFile(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|os.O_CREATE, 0o600)
+	if err != nil {
+		return err
+	}
+	_ = f.Close()
+	return restrictToOwner(path)
+}
+
+// hostKeyFiles lists the files to verify against. The app file always comes
+// first and always exists afterwards; ~/.ssh/known_hosts is read in strict
+// mode only, because a stale line there could not be reset from the GUI.
+func hostKeyFiles(strict bool) ([]string, error) {
+	path, err := appKnownHostsPath()
+	if err != nil {
+		return nil, err
+	}
+	hostKeyMu.Lock()
+	err = ensureKnownHostsFile(path)
+	hostKeyMu.Unlock()
+	if err != nil {
+		return nil, fmt.Errorf("prepare %s: %w", path, err)
+	}
+	files := []string{path}
+	if strict {
+		user := expandPath("~/.ssh/known_hosts")
+		if _, err := os.Stat(user); err == nil {
+			files = append(files, user)
+		}
+	}
+	return files, nil
+}
+
+// probeKey is never in any known_hosts file; checking it reveals the keys that
+// are known for an address through KeyError.Want.
+var probeKey = sync.OnceValue(func() ssh.PublicKey {
+	pub, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		panic(err)
+	}
+	key, err := ssh.NewPublicKey(pub)
+	if err != nil {
+		panic(err)
+	}
+	return key
+})
+
+// knownKeysFor returns the recorded keys for addr according to check.
+func knownKeysFor(check ssh.HostKeyCallback, addr string) []knownhosts.KnownKey {
+	err := check(addr, &net.TCPAddr{}, probeKey())
+	var keyErr *knownhosts.KeyError
+	if errors.As(err, &keyErr) {
+		return keyErr.Want
+	}
+	return nil
+}
+
+// plainHostKeyAlgos is the library's default host key preference without the
+// certificate algorithms (and without DSA), and certHostKeyAlgo maps each to
+// its certificate form.
+var plainHostKeyAlgos = []string{
+	ssh.KeyAlgoECDSA256,
+	ssh.KeyAlgoECDSA384,
+	ssh.KeyAlgoECDSA521,
+	ssh.KeyAlgoED25519,
+	ssh.KeyAlgoRSASHA256,
+	ssh.KeyAlgoRSASHA512,
+	ssh.KeyAlgoRSA,
+}
+
+var certHostKeyAlgo = map[string]string{
+	ssh.KeyAlgoECDSA256:   ssh.CertAlgoECDSA256v01,
+	ssh.KeyAlgoECDSA384:   ssh.CertAlgoECDSA384v01,
+	ssh.KeyAlgoECDSA521:   ssh.CertAlgoECDSA521v01,
+	ssh.KeyAlgoED25519:    ssh.CertAlgoED25519v01,
+	ssh.KeyAlgoRSASHA256:  ssh.CertAlgoRSASHA256v01,
+	ssh.KeyAlgoRSASHA512:  ssh.CertAlgoRSASHA512v01,
+	ssh.KeyAlgoRSA:        ssh.CertAlgoRSAv01,
+	ssh.KeyAlgoSKECDSA256: ssh.CertAlgoSKECDSA256v01,
+	ssh.KeyAlgoSKED25519:  ssh.CertAlgoSKED25519v01,
+}
+
+// hostKeyAlgorithmsFor decides which host key algorithms to offer when no
+// @cert-authority line covers the host (N18/N31).
+//
+// Plain algorithms always come first, so a server that has both a plain key
+// and a certificate presents the plain key, which TOFU can record and compare.
+// The certificate forms follow only as a fallback for a server that has
+// nothing else; such a certificate is checked by its inner key (see
+// verifyUncertifiedCert), never by its CA.
+//
+// For a known host, negotiation is limited to the recorded key types so a
+// server that also has another key type is not misread as a mismatch. For an
+// unknown host every supported type is offered.
+func hostKeyAlgorithmsFor(known []knownhosts.KnownKey) []string {
+	var plain []string
+	seen := map[string]bool{}
+	add := func(names ...string) {
+		for _, name := range names {
+			if !seen[name] {
+				seen[name] = true
+				plain = append(plain, name)
+			}
+		}
+	}
+	if len(known) == 0 {
+		add(plainHostKeyAlgos...)
+	}
+	for _, k := range known {
+		switch t := k.Key.Type(); t {
+		case ssh.KeyAlgoRSA:
+			add(ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA)
+		default:
+			add(t)
+		}
+	}
+	algos := plain
+	for _, name := range plain {
+		if cert, ok := certHostKeyAlgo[name]; ok {
+			algos = append(algos, cert)
+		}
+	}
+	return algos
+}
+
+// newHostKeyVerifier builds the HostKeyCallback for one dial plus the host key
+// algorithms to offer for addr.
+func newHostKeyVerifier(addr string, policy hostKeyPolicy) (ssh.HostKeyCallback, []string, error) {
+	files, err := hostKeyFiles(policy.Strict)
+	if err != nil {
+		return nil, nil, err
+	}
+	check, err := knownhosts.New(files...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load known_hosts: %w", err)
+	}
+	known := knownKeysFor(check, addr)
+	algos := hostKeyAlgorithmsFor(known)
+	hasCA := anyCertAuthority(known, certAuthorityLines(files))
+	if hasCA {
+		// A @cert-authority entry's key is the CA's, not the host's: limiting
+		// negotiation to its plain type would keep the server from presenting
+		// its certificate. Use the library defaults, which offer cert algorithms.
+		algos = nil
+	}
+	// verifyPlain turns a failed known_hosts check of a plain key into the
+	// mismatch / unknown / record decision.
+	verifyPlain := func(hostname string, key ssh.PublicKey, err error) error {
+		fingerprint := ssh.FingerprintSHA256(key)
+		var revoked *knownhosts.RevokedError
+		if errors.As(err, &revoked) {
+			return &hostKeyMismatchError{Address: knownhosts.Normalize(hostname), Fingerprint: fingerprint, Revoked: true}
+		}
+		var keyErr *knownhosts.KeyError
+		if !errors.As(err, &keyErr) {
+			return err
+		}
+		if len(keyErr.Want) > 0 {
+			return &hostKeyMismatchError{Address: knownhosts.Normalize(hostname), Fingerprint: fingerprint, Known: describeKnownKeys(keyErr.Want)}
+		}
+		if policy.Origin != hostKeyFromGUI || policy.Strict {
+			return &hostKeyUnknownError{Address: knownhosts.Normalize(hostname), Fingerprint: fingerprint}
+		}
+		if policy.Candidate != nil {
+			// Accept for this handshake only; nothing is trusted until the
+			// dialer commits after authentication (N20).
+			policy.Candidate.set(hostname, key)
+			return nil
+		}
+		return recordHostKey(hostname, key)
+	}
+	callback := func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		err := check(hostname, remote, key)
+		if err == nil {
+			return nil
+		}
+		if cert, ok := key.(*ssh.Certificate); ok {
+			return verifyUncertifiedCert(check, hostname, remote, cert, hasCA, known, verifyPlain)
+		}
+		return verifyPlain(hostname, key, err)
+	}
+	return callback, algos, nil
+}
+
+// verifyUncertifiedCert handles a host certificate the known_hosts check did
+// not accept (N18/N31). When a @cert-authority line covers the host, the
+// certificate had to verify against it, so the dial is refused as a mismatch
+// and nothing is recorded. Otherwise the certificate is ignored and its inner
+// key is treated like any plain host key (as OpenSSH does when no CA matches):
+// a recorded key must match, an unknown one follows the TOFU / hostkey_unknown
+// rules, and only the inner key is ever written. A certificate signed by a
+// @revoked key is refused either way.
+func verifyUncertifiedCert(check ssh.HostKeyCallback, hostname string, remote net.Addr, cert *ssh.Certificate,
+	hasCA bool, known []knownhosts.KnownKey, verifyPlain func(string, ssh.PublicKey, error) error) error {
+	address := knownhosts.Normalize(hostname)
+	fingerprint := ssh.FingerprintSHA256(cert.Key)
+	if cert.CertType != ssh.HostCert {
+		return &hostKeyMismatchError{Address: address, Fingerprint: fingerprint, Known: describeKnownKeys(known)}
+	}
+	var revoked *knownhosts.RevokedError
+	if errors.As(check(hostname, remote, cert.SignatureKey), &revoked) {
+		return &hostKeyMismatchError{Address: address, Fingerprint: fingerprint, Revoked: true}
+	}
+	if hasCA {
+		return &hostKeyMismatchError{Address: address, Fingerprint: fingerprint, Known: describeKnownKeys(known)}
+	}
+	err := check(hostname, remote, cert.Key)
+	if err == nil {
+		return nil
+	}
+	return verifyPlain(hostname, cert.Key, err)
+}
+
+func describeKnownKeys(keys []knownhosts.KnownKey) []string {
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, k.Key.Type()+" "+ssh.FingerprintSHA256(k.Key))
+	}
+	return out
+}
+
+// certAuthorityLines returns "file:line" for every @cert-authority line of
+// files, numbered the way knownhosts.KnownKey reports them.
+func certAuthorityLines(files []string) map[string]bool {
+	lines := map[string]bool{}
+	for _, file := range files {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			continue
+		}
+		scanner := bufio.NewScanner(bytes.NewReader(data))
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for n := 1; scanner.Scan(); n++ {
+			if bytes.HasPrefix(bytes.TrimSpace(scanner.Bytes()), []byte("@cert-authority")) {
+				lines[file+":"+strconv.Itoa(n)] = true
+			}
+		}
+	}
+	return lines
+}
+
+func anyCertAuthority(known []knownhosts.KnownKey, caLines map[string]bool) bool {
+	for _, k := range known {
+		if caLines[k.Filename+":"+strconv.Itoa(k.Line)] {
+			return true
+		}
+	}
+	return false
+}
+
+// recordHostKey appends key for hostname unless a concurrent dial already
+// recorded a key for it, in which case the key must match that one.
+func recordHostKey(hostname string, key ssh.PublicKey) error {
+	path, err := appKnownHostsPath()
+	if err != nil {
+		return err
+	}
+	hostKeyMu.Lock()
+	defer hostKeyMu.Unlock()
+	if err := ensureKnownHostsFile(path); err != nil {
+		return err
+	}
+	// Re-check under the lock: another GUI dial may have won the race.
+	check, err := knownhosts.New(path)
+	if err != nil {
+		return err
+	}
+	err = check(hostname, &net.TCPAddr{}, key)
+	if err == nil {
+		return nil
+	}
+	var keyErr *knownhosts.KeyError
+	if !errors.As(err, &keyErr) {
+		return err
+	}
+	if len(keyErr.Want) > 0 {
+		return &hostKeyMismatchError{Address: knownhosts.Normalize(hostname), Fingerprint: ssh.FingerprintSHA256(key)}
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	line := knownhosts.Line([]string{knownhosts.Normalize(hostname)}, key) + "\n"
+	_, writeErr := f.WriteString(line)
+	closeErr := f.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	hostKeyGen.Add(1)
+	return nil
+}
+
+// recordedHostKeys reads the plain (unhashed) lines of the app known_hosts
+// file that name addr.
+func recordedHostKeys(addr string) ([]HostKeyEntry, error) {
+	path, err := appKnownHostsPath()
+	if err != nil {
+		return nil, err
+	}
+	hostKeyMu.Lock()
+	data, err := os.ReadFile(path)
+	hostKeyMu.Unlock()
+	if errors.Is(err, os.ErrNotExist) {
+		return []HostKeyEntry{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	want := knownhosts.Normalize(addr)
+	entries := []HostKeyEntry{}
+	forEachKnownHostsLine(data, func(_ []byte, hosts []string, key ssh.PublicKey) {
+		if key != nil && containsString(hosts, want) {
+			entries = append(entries, HostKeyEntry{Type: key.Type(), Fingerprint: ssh.FingerprintSHA256(key)})
+		}
+	})
+	return entries, nil
+}
+
+// removeHostKeys rewrites the app known_hosts file without the lines that name
+// addr and reports how many were dropped. Other lines are kept byte for byte.
+func removeHostKeys(addr string) (int, error) {
+	path, err := appKnownHostsPath()
+	if err != nil {
+		return 0, err
+	}
+	hostKeyMu.Lock()
+	defer hostKeyMu.Unlock()
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	want := knownhosts.Normalize(addr)
+	var kept bytes.Buffer
+	removed := 0
+	forEachKnownHostsLine(data, func(raw []byte, hosts []string, key ssh.PublicKey) {
+		if key != nil && containsString(hosts, want) {
+			removed++
+			return
+		}
+		kept.Write(raw)
+		kept.WriteByte('\n')
+	})
+	if removed == 0 {
+		return 0, nil
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), knownHostsFileName+".tmp-*")
+	if err != nil {
+		return 0, err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return 0, err
+	}
+	if _, err := tmp.Write(kept.Bytes()); err != nil {
+		_ = tmp.Close()
+		return 0, err
+	}
+	if err := tmp.Close(); err != nil {
+		return 0, err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return 0, err
+	}
+	hostKeyGen.Add(1)
+	return removed, nil
+}
+
+// forEachKnownHostsLine calls fn for every line; key is nil for blank,
+// comment, marker (@revoked/@cert-authority) and unparsable lines.
+func forEachKnownHostsLine(data []byte, fn func(raw []byte, hosts []string, key ssh.PublicKey)) {
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		raw := scanner.Bytes()
+		trimmed := bytes.TrimSpace(raw)
+		if len(trimmed) == 0 || trimmed[0] == '#' {
+			fn(raw, nil, nil)
+			continue
+		}
+		marker, hosts, key, _, _, err := ssh.ParseKnownHosts(trimmed)
+		if err != nil || marker != "" {
+			fn(raw, nil, nil)
+			continue
+		}
+		fn(raw, hosts, key)
+	}
+}
+
+// containsString matches host entries case-insensitively, so a reset also
+// drops a line recorded before hosts were lowercased.
+func containsString(list []string, want string) bool {
+	for _, s := range list {
+		if strings.EqualFold(s, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// hostKeyConnection resolves connID to an SSH connection.
+func (a *App) hostKeyConnection(connID string) (Connection, error) {
+	conn, ok := a.connectionByID(connID)
+	if !ok {
+		return Connection{}, fmt.Errorf("接続先 %s が見つかりません", connID)
+	}
+	if conn.connectionType() == "Serial" {
+		return Connection{}, errors.New("シリアル接続にはホスト鍵がありません")
+	}
+	return conn, nil
+}
+
+// hostKeyFingerprint returns the keys recorded for connID's host:port. It does
+// not touch the network.
+func (a *App) hostKeyFingerprint(connID string) (HostKeyInfo, error) {
+	conn, err := a.hostKeyConnection(connID)
+	if err != nil {
+		return HostKeyInfo{}, err
+	}
+	addr := hostKeyAddress(conn)
+	keys, err := recordedHostKeys(addr)
+	if err != nil {
+		return HostKeyInfo{}, err
+	}
+	return HostKeyInfo{ConnID: conn.ID, Address: knownhosts.Normalize(addr), Known: len(keys) > 0, Keys: keys}, nil
+}
+
+// resetHostKey forgets the recorded keys for connID's host:port so the next
+// GUI connection records the current key. Every connection sharing that
+// host:port is affected. It returns the number of lines removed.
+func (a *App) resetHostKey(connID string) (int, error) {
+	conn, err := a.hostKeyConnection(connID)
+	if err != nil {
+		return 0, err
+	}
+	return removeHostKeys(hostKeyAddress(conn))
+}

@@ -1,0 +1,190 @@
+name: test
+
+# action はコミット SHA に固定する（コメントは対応するタグ）。監査 a6f2706 #25 #43。
+# release.yml からも workflow_call で呼ばれ、テストが通ったときだけリリースのビルドに進む（#27）。
+
+on:
+  push:
+    branches: ['**']
+  pull_request: {}
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+env:
+  # govulncheck の版を固定する（#26 #45）。
+  GOVULNCHECK_VERSION: v1.9.0
+
+jobs:
+  go:
+    name: go (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      # main.go embeds frontend/dist; tests only need the directory to exist.
+      - name: Stub frontend dist
+        shell: bash
+        run: mkdir -p frontend/dist && touch frontend/dist/.keep
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+      # Run govulncheck natively on every OS so that Windows-only
+      # (ssh_agent_windows.go / go-winio / go-webview2) and darwin-only code
+      # paths are analysed too, not just GOOS=linux (#26 #45).
+      - name: govulncheck
+        shell: bash
+        run: |
+          go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
+          govulncheck ./...
+
+  # phase6-headless.md §2 / §10: the headless-only build (no Wails, no cgo)
+  # and the Web admin's shim and login page.
+  headless:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '20'
+      - name: Stub frontend dist
+        run: mkdir -p frontend/dist && touch frontend/dist/.keep
+      - name: No Wails in the headless build
+        run: |
+          if go list -deps -tags headless . | grep -q '^github.com/wailsapp/'; then
+            echo "wailsapp is a dependency of the headless build" >&2
+            exit 1
+          fi
+      - name: Vet (no cgo)
+        run: CGO_ENABLED=0 go vet -tags headless ./...
+      # The headless build must work without a C toolchain (REQ-015).
+      - name: Test (no cgo)
+        run: CGO_ENABLED=0 go test -count=1 -tags headless ./...
+      # -race needs cgo, so only this step runs with it.
+      - name: Test (race)
+        run: CGO_ENABLED=1 go test -race -count=1 -tags headless ./...
+      # GOOS=linux CGO_ENABLED=0 must give a static binary that starts on a
+      # machine without GTK / WebKit (the runner has none installed here).
+      - name: Linux static build
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags headless -trimpath -o ssh-gete-headless .
+          ldd ssh-gete-headless 2>&1 | grep -q 'not a dynamic executable' || { echo "::error::not statically linked"; ldd ssh-gete-headless; exit 1; }
+          ./ssh-gete-headless --version
+          rm -f ssh-gete-headless
+      - name: Cross-build headless
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            echo "== ${target}"
+            GOOS="${target%/*}" GOARCH="${target#*/}" CGO_ENABLED=0 go build -tags headless -trimpath -o /dev/null .
+            GOOS="${target%/*}" GOARCH="${target#*/}" CGO_ENABLED=0 go vet -tags headless .
+          done
+      - run: node --test webadmin/headless-shim.test.mjs webadmin/login.test.mjs
+
+  # deploy/docker/Dockerfile and docs/headless.md §8: build the image from a
+  # linux/amd64 headless binary and start it on a fresh named volume, so a
+  # data dir the nonroot user cannot write is caught here (review of REQ-015).
+  docker:
+    runs-on: ubuntu-latest
+    # The Web admin serves the embedded frontend/dist, so the image needs the
+    # real build from the frontend job, not an empty stub.
+    needs: frontend
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: frontend-dist
+          path: frontend/dist
+      - name: Build the headless binary
+        run: |
+          test -f frontend/dist/index.html
+          mkdir -p dist/linux-amd64
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags headless -trimpath -o dist/linux-amd64/ssh-gete .
+      - name: Build the image
+        run: DOCKER_BUILDKIT=1 docker build --platform linux/amd64 -f deploy/docker/Dockerfile -t ssh-gete:smoke .
+      - name: Smoke run on a fresh named volume
+        run: |
+          set -eu
+          docker volume create ssh-gete-smoke
+          docker run --rm -v ssh-gete-smoke:/data --entrypoint /usr/local/bin/ssh-gete ssh-gete:smoke --version
+          tok="$(docker run --rm -v ssh-gete-smoke:/data ssh-gete:smoke --print-admin-token)"
+          case "${tok}" in sgadm_*) ;; *) echo "::error::--print-admin-token did not print a token"; exit 1 ;; esac
+          # Same port on both sides: a remapped port needs web.publicURL, or the
+          # Host / Origin check answers 403 (docs/headless.md §8).
+          docker run -d --name ssh-gete-smoke -p 127.0.0.1:8788:8788 -v ssh-gete-smoke:/data ssh-gete:smoke
+          ok=""
+          for i in $(seq 1 30); do
+            if curl -fsSk -o /dev/null https://127.0.0.1:8788/login; then ok=1; break; fi
+            sleep 1
+          done
+          docker logs ssh-gete-smoke 2>&1 | grep -v "${tok}" || true
+          [ -n "${ok}" ] || { echo "::error::the container did not serve /login"; exit 1; }
+          [ "$(docker inspect -f '{{.State.Running}}' ssh-gete-smoke)" = true ] || { echo "::error::the container exited"; exit 1; }
+          docker rm -f ssh-gete-smoke
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '20'
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      # frontend/wailsjs is generated (and git-ignored); the build and the
+      # tests import it, so generate it from the Go bindings first.
+      # The Wails CLI version follows github.com/wailsapp/wails/v2 in go.mod.
+      - name: Generate Wails bindings
+        working-directory: .
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev
+          mkdir -p frontend/dist && touch frontend/dist/.keep
+          WAILS_VERSION="$(go list -m -f '{{.Version}}' github.com/wailsapp/wails/v2)"
+          go install "github.com/wailsapp/wails/v2/cmd/wails@${WAILS_VERSION}"
+          wails generate module -tags webkit2_41
+      # No dependency in package-lock.json needs a lifecycle script to build:
+      # rolldown / lightningcss ship native code as per-platform optional
+      # packages, and the only hasInstallScript entry (fsevents, darwin-only,
+      # optional) ships a prebuilt fsevents.node (#44).
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      # The shim's coverage tests compare window.runtime / window.go.main.App
+      # with the generated frontend/wailsjs; they are skipped where it is absent
+      # (the headless job), so run them here, after `wails generate module`.
+      - name: Web admin shim against the generated bindings
+        working-directory: .
+        run: node --test webadmin/headless-shim.test.mjs webadmin/login.test.mjs
+      - run: npm run build
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          if-no-files-found: error
+          retention-days: 1
+      # npm dependency audit (#54).
+      - name: npm audit
+        run: npm audit --audit-level=high

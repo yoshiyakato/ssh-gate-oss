@@ -48,7 +48,7 @@ SSH に加えて、**シリアルポート**の対話コンソールも内蔵し
 
 ## ソースからビルド
 
-必要環境：Go 1.25 以降、Node.js、[Wails v2](https://wails.io/)。
+必要環境：Go 1.26 以降、Node.js、[Wails v2](https://wails.io/)。
 
 ```bash
 # Wails CLI（未導入なら）
