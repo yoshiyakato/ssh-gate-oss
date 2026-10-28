@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 )
 
 // requestIDSeq guarantees per-process uniqueness of command request IDs even
@@ -218,6 +219,9 @@ type CommandRequest struct {
 	// TargetFP is user@host:port of the connection when the request was
 	// made, so the approval screen can show whether the target changed since.
 	TargetFP string `json:"targetFp"`
+	// TimeoutSeconds is the agent's timeout_seconds for the approved run
+	// (1-3600; 0 = the connection's command timeout) (N11).
+	TimeoutSeconds int `json:"timeoutSeconds"`
 }
 
 // AgentPolicy is an approval-bypass grant. It only takes effect for requests
@@ -364,6 +368,9 @@ const (
 type runningExec struct {
 	connID string
 	cancel context.CancelCauseFunc
+	// active is false for a reservation (reserveExec) whose request has not
+	// become running yet: it is cancellable and drained, but not counted.
+	active bool
 }
 
 var (
@@ -393,6 +400,13 @@ type ActionResult struct {
 	// Field names the form field a validation failure is about
 	// (invalid_serial_mode: baudRate, dataBits, parity, stopBits).
 	Field string `json:"field,omitempty"`
+	// Pending is set when an approval was refused before anything changed:
+	// the request is still pending and the edited command should be kept.
+	Pending bool `json:"pending,omitempty"`
+	// Bypass is what happened to the approval bypass an "approve and
+	// bypass" asked for: granted, inactive (granted, but the agent has no
+	// token yet) or failed (not saved). Empty when none was asked for.
+	Bypass string `json:"bypass,omitempty"`
 }
 
 type commandResult struct {
@@ -440,9 +454,15 @@ func NewApp() *App {
 	}
 	app.store = store
 
+	legacyFailed := false
 	if store != nil {
 		if err := migrateLegacyData(store, dbPath, legacyConnections, legacyMCPSettings); err != nil {
+			// Nothing was imported (one transaction) and legacy_migrated is
+			// still pending, so the next start retries; tell the user now
+			// (audit #10).
 			log.Printf("migrate legacy data: %v", err)
+			legacyFailed = true
+			app.storageError = fmt.Sprintf("旧バージョンのデータ（connections.json / mcp-settings.json）を取り込めませんでした。次回の起動で再試行します / Could not import the data of the previous version; it will be retried at the next start: %v", err)
 		}
 		// Before the connections are loaded and before MCP can start, so
 		// nothing reads a row mid-move (phase5-keychain.md §7).
@@ -454,7 +474,7 @@ func NewApp() *App {
 		if err != nil {
 			log.Printf("load connections from sqlite: %v", err)
 		}
-		if len(app.conns) == 0 && store.fresh && os.Getenv("SSH_GETE_NO_SEED") != "1" {
+		if len(app.conns) == 0 && store.fresh && !legacyFailed && os.Getenv("SSH_GETE_NO_SEED") != "1" {
 			for _, conn := range seedConnections() {
 				conn.ID = newID()
 				if err := store.insertConnection(conn); err != nil {
@@ -482,6 +502,14 @@ func NewApp() *App {
 	app.mcpToken = token
 	app.mcpEnvToken = applyMCPEnv(&mcp)
 	app.mcp = sanitizeMCPSettings(mcp, app.effectiveTokenLocked(), "停止中", "")
+	if err := validateMCPPaths(app.mcp); err != nil {
+		// Saved by an older version that did not check: startup must not
+		// register it (http.ServeMux panics, and startup has no recover), so
+		// the listener stays off until the user saves valid paths (audit #1).
+		log.Printf("mcp settings: %v", err)
+		app.mcp.Status = "エラー"
+		app.mcp.LastError = err.Error()
+	}
 
 	if store != nil {
 		app.requests, err = store.loadCommandRequests(500)
@@ -540,56 +568,92 @@ func (a *App) startup(ctx context.Context) {
 		a.watchSerialPresence(a.appCtx)
 	}()
 	a.mu.RLock()
-	enabled := a.mcp.Enabled
+	settings := a.mcp
 	a.mu.RUnlock()
-	if enabled {
-		if err := a.startMCPServer(); err != nil {
-			a.setMCPStatus("エラー", err.Error())
-			log.Printf("start mcp server: %v", err)
-		}
+	if !settings.Enabled {
+		return
+	}
+	if err := validateMCPPaths(settings); err != nil {
+		a.setMCPStatus("エラー", err.Error())
+		return
+	}
+	if err := a.guardMCPStart(a.startMCPServer); err != nil {
+		a.setMCPStatus("エラー", err.Error())
+		log.Printf("start mcp server: %v", err)
 	}
 }
 
-// shutdown follows §5.0: stop accepting MCP calls, interrupt running
-// commands and give them a bounded grace to record "interrupted", close every
-// terminal, stop background loops, then close the store.
+// guardMCPStart runs a listener start and turns a panic (an http.ServeMux
+// pattern it rejects) into an error. Wails runs startup on a goroutine
+// without recover, so a panic there would end the process at every start
+// (audit #1).
+func (a *App) guardMCPStart(start func() error) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("MCPサーバーを起動できません / cannot start the MCP server: %v", r)
+		}
+	}()
+	return start()
+}
+
+// restartMCPServerLocked is restartMCPServer for callers that hold
+// a.lifecycleMu, with guardMCPStart.
+func (a *App) restartMCPServerLocked() error {
+	a.stopMCPServerLocked(context.Background())
+	return a.guardMCPStart(a.startMCPServerLocked)
+}
+
+// shutdown follows §5.0 in order (the user's decision; merge audit #1):
 //
-// appCancel comes first: once appCtx is done trackExec refuses new
-// executions (so intake is already stopped), and running ones (GUI-approved
-// and approval-bypassed) are cancelled with errShuttingDown. Waiting for them
-// first (§5.0 step 2 taken literally) would hold the window open for the
-// whole grace on a long command; cancelling first records them as
-// interrupted at once. stopMCPServer then signals the listener stop, so
-// in-flight execute_command handlers answer instead of holding Shutdown to
-// its deadline, and drainMCPCommands waits for every tracked execution to
-// store its outcome before the store closes.
+//  1. Stop MCP intake: no new execution (trackExec / reserveExec refuse,
+//     MCP execution and long-poll slots are refused), then stop the
+//     listener. Its stop signal makes in-flight execute_command handlers
+//     answer state=auto_running and detach, so Shutdown does not wait for
+//     them.
+//  2. drainMCPCommands: wait up to shutdownExecGrace for running commands
+//     (GUI-approved and approval-bypassed), so one that finishes within the
+//     grace is recorded as completed with its output; then cancel the rest
+//     with errShuttingDown (recorded as interrupted) and wait for them to
+//     store that.
+//  3. Close every terminal, then end appCtx (background loops) and wait for
+//     them.
+//  4. Close the store (and with it the single-instance lock).
+//
+// shutdown may run more than once (tests); later runs find nothing to do.
 func (a *App) shutdown(ctx context.Context) {
-	a.appCancel()
-	a.cancelExecs(func(runningExec) bool { return true }, errShuttingDown)
+	a.closeExecIntake()
 	a.stopMCPServer(ctx)
 	a.drainMCPCommands(shutdownExecGrace)
 	a.CloseAllTerminals()
+	a.appCancel()
 	a.wg.Wait()
 	if err := a.store.Close(); err != nil {
 		log.Printf("close sqlite store: %v", err)
 	}
 }
 
-// drainMCPCommands is shutdown step 2 (§5.0). It closes execution intake
-// (trackExec refuses from now on, and MCP execution / long-poll slots are
-// refused), waits up to grace for every tracked execution, GUI-approved or
-// approval-bypassed, then cancels the rest with errShuttingDown (recorded as
-// interrupted) and waits up to grace again for them to store their outcome.
-// Each tracker is released only after finishRequest, so once execWG is done
-// no request is left running. It reports whether all finished within the
-// first grace.
-func (a *App) drainMCPCommands(grace time.Duration) bool {
+// closeExecIntake is shutdown step 1 for executions: from now on trackExec,
+// beginExec and reserveExec refuse (their context comes back cancelled with
+// errShuttingDown), and the MCP runtime refuses execution and long-poll
+// slots. Executions already registered keep running.
+func (a *App) closeExecIntake() {
 	a.mcpRuntime.close()
 	// trackExec adds to execWG under execMu only while intake is open, so
 	// after this no Add can race with Wait.
 	a.execMu.Lock()
 	a.execsClosed = true
 	a.execMu.Unlock()
+}
+
+// drainMCPCommands is shutdown step 2 (§5.0). It closes execution intake
+// (closeExecIntake), waits up to grace for every tracked execution,
+// GUI-approved or approval-bypassed, then cancels the rest with
+// errShuttingDown (recorded as interrupted) and waits up to grace again for
+// them to store their outcome. Each tracker is released only after
+// finishRequest, so once execWG is done no request is left running. It
+// reports whether all finished within the first grace.
+func (a *App) drainMCPCommands(grace time.Duration) bool {
+	a.closeExecIntake()
 	done := make(chan struct{})
 	go func() {
 		a.execWG.Wait()
@@ -713,7 +777,7 @@ func (a *App) sessionSummaries() []SessionSummary {
 			if baud <= 0 {
 				baud = 115200
 			}
-			s.Label = fmt.Sprintf("%s @%d", conn.SerialPort, baud)
+			s.Label = fmt.Sprintf("%s @%d", serialPortOf(conn), baud)
 		}
 		if !rt.Since.IsZero() {
 			s.ConnectedSince = rt.Since.Format(time.RFC3339)
@@ -750,43 +814,12 @@ func (a *App) trackExec(parent context.Context, connID string) (context.Context,
 	return ctx, done
 }
 
-// beginExec is trackExec reporting whether the execution was accepted.
-// Callers register before the request becomes running (and release after
-// finishRequest), so that a refused execution leaves the request untouched
-// and the drain sees every running request through execWG.
+// beginExec is trackExec reporting whether the execution was accepted: a
+// reservation (reserveExec) activated at once.
 func (a *App) beginExec(parent context.Context, connID string) (context.Context, func(), bool) {
-	ctx, cancel := context.WithCancelCause(parent)
-	// Parents not derived from appCtx still stop on shutdown.
-	stop := context.AfterFunc(a.appCtx, func() { cancel(errShuttingDown) })
-
-	a.execMu.Lock()
-	if a.execsClosed || a.appCtx.Err() != nil {
-		a.execMu.Unlock()
-		stop()
-		cancel(errShuttingDown)
-		return ctx, func() {}, false
-	}
-	a.execSeq++
-	key := a.execSeq
-	a.execs[key] = runningExec{connID: connID, cancel: cancel}
-	a.execWG.Add(1)
-	a.execMu.Unlock()
-	a.runningTotal.Add(1)
-	a.sessionsChanged()
-
-	var once sync.Once
-	return ctx, func() {
-		once.Do(func() {
-			stop()
-			a.execMu.Lock()
-			delete(a.execs, key)
-			a.execMu.Unlock()
-			cancel(context.Canceled)
-			a.runningTotal.Add(-1)
-			a.execWG.Done()
-			a.sessionsChanged()
-		})
-	}, true
+	r, ok := a.reserveExec(parent, connID)
+	r.activate()
+	return r.ctx, r.release, ok
 }
 
 // runningCounts returns the number of executions in flight per connection ID.
@@ -795,7 +828,9 @@ func (a *App) runningCounts() map[string]int {
 	defer a.execMu.Unlock()
 	counts := map[string]int{}
 	for _, exec := range a.execs {
-		counts[exec.connID]++
+		if exec.active {
+			counts[exec.connID]++
+		}
 	}
 	return counts
 }
@@ -884,8 +919,14 @@ func (a *App) TestConnectionWithPassphrase(id string, passphrase string) ActionR
 // password for a saved connection means "use the stored one".
 func (a *App) TestConnectionConfig(conn Connection, passphrase string) ActionResult {
 	conn = normalizeConnection(conn)
-	if conn.ID != "" && conn.usesPassword() && conn.Credential == "" {
+	if conn.ID != "" && conn.usesPassword() && conn.Credential == "" && conn.Type != "Serial" {
 		if saved, ok := a.connectionByID(conn.ID); ok && saved.usesPassword() {
+			if !sameEndpoint(saved, conn) {
+				// The stored password (or one given for this session) belongs
+				// to the saved host/port/user: never send it anywhere else
+				// (audit #36).
+				return passwordRequiredResult(conn.ID)
+			}
 			// A keychain password stays a reference (Credential "",
 			// CredentialSet) until resolveCredential reads it.
 			conn.Credential = saved.Credential
@@ -995,6 +1036,19 @@ func (a *App) recordConnectionTest(tested Connection, result string, message str
 		}
 	}
 	a.mu.Unlock()
+}
+
+// sameEndpoint reports whether x and y reach the same account: transport,
+// host, port and user. A stored password may only be reused while this holds.
+func sameEndpoint(x Connection, y Connection) bool {
+	return x.connectionType() == y.connectionType() && x.Host == y.Host && x.Port == y.Port && x.User == y.User
+}
+
+// passwordRequiredResult refuses to reuse a stored password for a changed
+// host, port or user.
+func passwordRequiredResult(id string) ActionResult {
+	return ActionResult{OK: false, Code: "password_required", Field: "credential", ID: id,
+		Message: "ホスト・ポート・ユーザー名を変えたため、保存済みのパスワードは使いません。パスワードを入力してください / The host, port or user changed, so the saved password is not used; enter the password"}
 }
 
 func sameTarget(x Connection, y Connection) bool {
@@ -1141,6 +1195,11 @@ func (a *App) saveConnection(connection Connection) (ActionResult, func(ActionRe
 
 	previous := a.conns[index]
 	if connection.Type != "Serial" && connection.usesPassword() && previous.usesPassword() && !newPassword {
+		if !sameEndpoint(previous, connection) {
+			// The stored password is bound to the saved host/port/user; a new
+			// endpoint needs it typed again (audit #36).
+			return passwordRequiredResult(connection.ID), nil
+		}
 		// write-only field left blank: keep it (a keychain reference keeps
 		// CredentialSet, a legacy row its plaintext)
 		connection.Credential = previous.Credential
@@ -1172,8 +1231,9 @@ func (a *App) saveConnection(connection Connection) (ActionResult, func(ActionRe
 		delete(a.sshPassphrases, connection.ID)
 	}
 	a.forgetSecretsLocked(connection.ID)
-	if newPassword && a.sessionSecrets != nil {
-		// The saved password now wins over one given for this session.
+	if (newPassword || !sameEndpoint(previous, connection)) && a.sessionSecrets != nil {
+		// The saved password now wins over one given for this session, and a
+		// session password never follows the connection to a new endpoint.
 		_ = a.sessionSecrets.Delete(context.Background(), passwordAccount(connection.ID))
 	}
 	a.conns[index] = connection
@@ -1254,12 +1314,18 @@ func (a *App) DeleteConnection(id string) ActionResult {
 	return ActionResult{OK: true, Message: fmt.Sprintf("%s を削除しました。コマンド履歴は監査用に残しています", conn.Name)}
 }
 
+// SaveMCPSettings validates, persists and applies the listener settings.
+// a.lifecycleMu is held from the save to the restart (lifecycleMu, then a.mu,
+// as on every listener path), so DB, memory and the running listener change
+// together and a concurrent Delete/Generate cannot interleave (audit #21).
 func (a *App) SaveMCPSettings(settings MCPSettings) ActionResult {
 	if a.store == nil {
 		return ActionResult{OK: false, Message: errStoreUnavailable.Error()}
 	}
 	settings.ConfigPath = a.dbPath
 
+	a.lifecycleMu.Lock()
+	defer a.lifecycleMu.Unlock()
 	a.mu.Lock()
 	token := a.mcpToken
 	if strings.TrimSpace(settings.TokenInput) != "" {
@@ -1273,6 +1339,12 @@ func (a *App) SaveMCPSettings(settings MCPSettings) ActionResult {
 		effective = a.mcpEnvToken
 	}
 	settings = sanitizeMCPSettings(settings, effective, "再起動中", "")
+	// Checked before saving: a path ServeMux rejects would otherwise be
+	// stored and crash every later start (audit #1).
+	if err := validateMCPPaths(settings); err != nil {
+		a.mu.Unlock()
+		return ActionResult{OK: false, Code: "invalid_mcp_path", Message: err.Error()}
+	}
 	if err := validateListenSettings(settings, effective); err != nil {
 		a.mu.Unlock()
 		return ActionResult{OK: false, Message: err.Error()}
@@ -1285,7 +1357,7 @@ func (a *App) SaveMCPSettings(settings MCPSettings) ActionResult {
 	a.mcpToken = token
 	a.mu.Unlock()
 
-	if err := a.restartMCPServer(); err != nil {
+	if err := a.restartMCPServerLocked(); err != nil {
 		a.setMCPStatus("エラー", err.Error())
 		return ActionResult{OK: false, Message: fmt.Sprintf("MCPサーバーの再起動に失敗しました: %v", err)}
 	}
@@ -1300,6 +1372,8 @@ func (a *App) GenerateMCPToken() ActionResult {
 		return ActionResult{OK: false, Message: errStoreUnavailable.Error()}
 	}
 	token := newID() + newID()
+	a.lifecycleMu.Lock()
+	defer a.lifecycleMu.Unlock()
 	a.mu.Lock()
 	if a.mcpEnvToken != "" {
 		a.mu.Unlock()
@@ -1308,6 +1382,7 @@ func (a *App) GenerateMCPToken() ActionResult {
 	settings := a.mcp
 	settings.BearerEnabled = true
 	settings = sanitizeMCPSettings(settings, token, "再起動中", "")
+	pathErr := validateMCPPaths(settings)
 	if err := a.store.saveMCPSettings(settings, token); err != nil {
 		a.mu.Unlock()
 		return ActionResult{OK: false, Message: fmt.Sprintf("MCP設定のSQLite保存に失敗しました: %v", err)}
@@ -1316,7 +1391,14 @@ func (a *App) GenerateMCPToken() ActionResult {
 	a.mcpToken = token
 	a.mu.Unlock()
 
-	if err := a.restartMCPServer(); err != nil {
+	if pathErr != nil {
+		// The token is saved; the listener stays off until valid paths are
+		// saved (an older version stored these).
+		a.stopMCPServerLocked(context.Background())
+		a.setMCPStatus("エラー", pathErr.Error())
+		return ActionResult{OK: false, Code: "invalid_mcp_path", Message: pathErr.Error(), Token: token}
+	}
+	if err := a.restartMCPServerLocked(); err != nil {
 		a.setMCPStatus("エラー", err.Error())
 		return ActionResult{OK: false, Message: fmt.Sprintf("MCPサーバーの再起動に失敗しました: %v", err), Token: token}
 	}
@@ -1326,11 +1408,16 @@ func (a *App) GenerateMCPToken() ActionResult {
 // DeleteMCPSettings resets the listener settings to defaults, stopped. The
 // reset is persisted (rather than deleting the row) so a restart does not
 // silently bring the listener back with the enabled-by-default settings.
+// The stop and the reset happen under one a.lifecycleMu hold, so a
+// concurrent Save/Generate restart cannot leave a listener running with the
+// old token after the reset (audit #21).
 func (a *App) DeleteMCPSettings() ActionResult {
 	if a.store == nil {
 		return ActionResult{OK: false, Message: errStoreUnavailable.Error()}
 	}
-	a.stopMCPServer(context.Background())
+	a.lifecycleMu.Lock()
+	defer a.lifecycleMu.Unlock()
+	a.stopMCPServerLocked(context.Background())
 
 	settings := defaultMCPSettings(a.dbPath)
 	settings.Enabled = false
@@ -1758,10 +1845,26 @@ func explainSSHError(conn Connection, err error) string {
 	return message
 }
 
+// liftLegacySerialPort moves the port name of an old serial row, which kept
+// it in Host, into SerialPort, case preserved (/dev/ttyUSB0 must not become
+// /dev/ttyusb0). Without it the editor shows an empty port and a save would
+// clear the port together with Host.
+func liftLegacySerialPort(connection *Connection) {
+	if connection.connectionType() != "Serial" || strings.TrimSpace(connection.SerialPort) != "" {
+		return
+	}
+	if host := strings.TrimSpace(connection.Host); host != "" {
+		connection.SerialPort = host
+		connection.Host = ""
+	}
+}
+
 func normalizeConnection(connection Connection) Connection {
 	connection.ID = strings.TrimSpace(connection.ID)
 	connection.Name = strings.TrimSpace(connection.Name)
 	connection.Type = connection.connectionType()
+	// Before Host is lowercased below.
+	liftLegacySerialPort(&connection)
 	// Lowercased like hostKeyAddress, so the saved host, the dial and the
 	// known_hosts identity agree.
 	connection.Host = strings.ToLower(strings.TrimSpace(connection.Host))
@@ -1806,17 +1909,34 @@ func normalizeConnection(connection Connection) Connection {
 	return connection
 }
 
+// appConfigDir is where the database, known_hosts and backups live. It is
+// "" when no per-user location exists: there is deliberately no TempDir
+// fallback, since a shared /tmp/ssh-gete could be prepared by another local
+// user (audit #23). openStore refuses "" (errNoConfigDir), so the app starts
+// with a storage error instead.
 func appConfigDir() string {
 	if dir := strings.TrimSpace(os.Getenv("SSH_GETE_CONFIG_DIR")); dir != "" {
+		if abs, err := filepath.Abs(dir); err == nil {
+			return abs
+		}
 		return dir
 	}
-	if dir, err := os.UserConfigDir(); err == nil && dir != "" {
+	if dir, err := os.UserConfigDir(); err == nil && filepath.IsAbs(dir) {
 		return filepath.Join(dir, appName)
 	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
+	if home, err := os.UserHomeDir(); err == nil && filepath.IsAbs(home) {
 		return filepath.Join(home, "."+appName)
 	}
-	return filepath.Join(os.TempDir(), appName)
+	return ""
+}
+
+// configFile joins name to appConfigDir, or returns "" when there is none.
+func configFile(name string) string {
+	dir := appConfigDir()
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, name)
 }
 
 // currentUsername resolves the OS login name across platforms. Unix exposes it
@@ -1835,49 +1955,63 @@ func fileExists(path string) bool {
 }
 
 func defaultDatabasePath() string {
-	return filepath.Join(appConfigDir(), "ssh-gete.sqlite")
+	return configFile("ssh-gete.sqlite")
 }
 
 func defaultLegacyConnectionsPath() string {
-	return filepath.Join(appConfigDir(), "connections.json")
+	return configFile("connections.json")
 }
 
 func defaultLegacyMCPSettingsPath() string {
-	return filepath.Join(appConfigDir(), "mcp-settings.json")
+	return configFile("mcp-settings.json")
 }
 
-// migrateLegacyData imports the pre-SQLite JSON files exactly once. Earlier
-// versions re-imported them on every start whenever the table was empty,
-// which resurrected deleted connections and plaintext tokens. The files are
-// renamed to *.migrated afterwards.
+// migrateLegacyData imports the pre-SQLite JSON files exactly once, driven
+// by schema_meta.legacy_migrated (§5.5) rather than by user_version or by
+// whether the database file existed (audits #10, #34):
+//
+//   - pending (a new database): read both files and import them, plus the
+//     move to "rename", in one transaction (Store.importLegacyData). Any
+//     error leaves nothing imported and the state pending, so the next start
+//     retries; the caller reports it as storageError.
+//   - rename (imported, or a database from before v2 that imported them
+//     long ago): rename the files to *.migrated (0600), then mark done. A
+//     failed rename is retried at the next start.
+//   - done: nothing.
+//
+// Earlier versions re-imported on every start whenever the table was empty,
+// which resurrected deleted connections and plaintext tokens.
 func migrateLegacyData(store *Store, dbPath string, connectionsPath string, settingsPath string) error {
-	if store.prevVersion >= 2 {
+	state, err := store.legacyMigrationState()
+	if err != nil {
+		return err
+	}
+	if state == legacyMigrationDone {
 		return nil
 	}
-	// Only a brand-new database imports; an existing pre-v2 database already
-	// imported them earlier and may have had rows deleted since.
-	importData := store.fresh
-	if importData {
+	if state == legacyMigrationPending {
 		legacyConnections, err := loadConnections(connectionsPath)
 		if err != nil {
-			return err
+			return fmt.Errorf("%s: %w", filepath.Base(connectionsPath), err)
 		}
+		conns := make([]Connection, 0, len(legacyConnections))
 		for _, conn := range legacyConnections {
 			conn = normalizeConnection(conn)
 			conn.ID = newID()
-			if err := store.insertConnection(conn); err != nil {
-				return err
-			}
+			conns = append(conns, conn)
 		}
+		var settings *MCPSettings
+		token := ""
 		if fileExists(settingsPath) {
-			settings, token, err := loadMCPSettings(settingsPath)
+			loaded, loadedToken, err := loadMCPSettings(settingsPath)
 			if err != nil {
-				return err
+				return fmt.Errorf("%s: %w", filepath.Base(settingsPath), err)
 			}
-			settings.ConfigPath = dbPath
-			if err := store.saveMCPSettings(settings, token); err != nil {
-				return err
-			}
+			loaded.ConfigPath = dbPath
+			settings, token = &loaded, loadedToken
+		}
+		if _, err := store.importLegacyData(conns, settings, token); err != nil {
+			return err
 		}
 	}
 	for _, path := range []string{connectionsPath, settingsPath} {
@@ -1888,7 +2022,7 @@ func migrateLegacyData(store *Store, dbPath string, connectionsPath string, sett
 			_ = os.Chmod(path+".migrated", 0o600)
 		}
 	}
-	return nil
+	return store.setLegacyMigrationState(legacyMigrationDone)
 }
 
 func (a *App) setMCPStatus(status string, lastErr string) {
@@ -2051,14 +2185,131 @@ func applyMCPEnv(settings *MCPSettings) string {
 	return envToken
 }
 
+// maskToken is the non-secret hint shown as "saved token". A token shorter
+// than 32 characters shows nothing of itself (a typed one is often short, and
+// first+last four would give most of it away); a long one, such as the 64
+// hex characters GenerateMCPToken makes, shows only its last 4 (audit #14).
 func maskToken(token string) string {
 	if token == "" {
 		return "未設定"
 	}
-	if len(token) <= 8 {
+	if len(token) < 32 {
 		return "********"
 	}
-	return token[:4] + "************************" + token[len(token)-4:]
+	return "********" + token[len(token)-4:]
+}
+
+// validateMCPPaths checks the MCP, health and audit paths before they reach
+// http.ServeMux, which panics on a pattern it rejects. Each must start with
+// "/", contain no whitespace, control characters, "{", "}", "?" or "#", and
+// differ from the other two; the exact registrations newMCPHandler makes are
+// then tried on a scratch mux under recover as the last word (audit #1).
+func validateMCPPaths(settings MCPSettings) (err error) {
+	paths := []struct{ label, path string }{
+		{"MCP", settings.MCPPath},
+		{"Health", settings.HealthPath},
+		{"Audit", settings.AuditPath},
+	}
+	invalid := func(label, path string) error {
+		return fmt.Errorf("%s のパス %q は使えません。/ で始まり、空白・制御文字・{ } ? # を含まず、ほかのパスと重ならない値にしてください / The %s path %q is invalid: it must start with /, contain no spaces, control characters or { } ? #, and differ from the other paths",
+			label, path, label, path)
+	}
+	seen := map[string]bool{}
+	for _, p := range paths {
+		if !strings.HasPrefix(p.path, "/") || len(p.path) > 256 {
+			return invalid(p.label, p.path)
+		}
+		for _, r := range p.path {
+			if r < 0x21 || r == 0x7f || unicode.IsSpace(r) || !unicode.IsPrint(r) || strings.ContainsRune("{}?#", r) {
+				return invalid(p.label, p.path)
+			}
+		}
+		if seen[p.path] {
+			return invalid(p.label, p.path)
+		}
+		seen[p.path] = true
+	}
+	var current string
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%w (%v)", invalid("MCP", current), r)
+		}
+	}()
+	mux := http.NewServeMux()
+	for _, p := range paths {
+		current = p.path
+		mux.HandleFunc(p.path, func(http.ResponseWriter, *http.Request) {})
+	}
+	return nil
+}
+
+// errFinalStateNotSaved wraps the store error of finalizeRequest: the final
+// state is shown (memory, events) but SQLite still has the running row.
+type errFinalStateNotSaved struct{ err error }
+
+func (e *errFinalStateNotSaved) Error() string {
+	return "実行結果をデータベースに保存できませんでした / could not save the result: " + e.err.Error()
+}
+
+func (e *errFinalStateNotSaved) Unwrap() error { return e.err }
+
+// finalizeRequest is transitionRequest for the final state of a command that
+// has already run (finishRequest). Unlike a decision, the outcome cannot be
+// refused, so:
+//
+//   - If the SQLite write fails (SQLITE_BUSY past busy_timeout, disk full,
+//     I/O error), the final state is still published in memory and to the
+//     UI, storageError is set, and an *errFinalStateNotSaved is returned so
+//     the caller can answer isError / error_kind "storage" instead of a
+//     still-running request that never ends (audit #37). The next start
+//     turns the stale running row into interrupted.
+//   - If the CAS loses because the stored row changed (another process
+//     wrote it, audit #3), the stored row is adopted in memory instead of
+//     leaving the request running forever, and errStateConflict is
+//     returned.
+//
+// The in-memory state must be `from`; otherwise errStateConflict (or "not
+// found") as with transitionRequest.
+func (a *App) finalizeRequest(id string, from string, mutate func(*CommandRequest)) (CommandRequest, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	index := -1
+	for i := range a.requests {
+		if a.requests[i].ID == id {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return CommandRequest{}, errors.New("request not found")
+	}
+	current := a.requests[index]
+	if current.Status != from {
+		return current, errStateConflict
+	}
+	next := current
+	mutate(&next)
+	var storeErr error
+	if a.store != nil {
+		storeErr = a.store.updateCommandRequestFrom(next, from)
+		if errors.Is(storeErr, errStateConflict) {
+			if row, found, err := a.store.loadCommandRequest(id); err == nil && found && row.Status != from {
+				a.requests[index] = row
+				a.notifyRequestsChangedLocked()
+				return row, errStateConflict
+			}
+		}
+		if storeErr != nil {
+			log.Printf("finish request %s: %v", id, storeErr)
+			a.storageError = fmt.Sprintf("コマンド %s の実行結果を保存できませんでした / Could not save the result of %s: %v", id, id, storeErr)
+		}
+	}
+	a.requests[index] = next
+	a.notifyRequestsChangedLocked()
+	if storeErr != nil {
+		return next, &errFinalStateNotSaved{err: storeErr}
+	}
+	return next, nil
 }
 
 func cloneConnections(in []Connection) []Connection {

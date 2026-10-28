@@ -7,6 +7,8 @@ import (
 	"log"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -329,17 +331,30 @@ func (a *App) approve(id string, command string, allowRiskIncrease bool, grantBy
 		// The grant is only usable through the agent's own token; without
 		// either kind of token there is no way to authenticate the agent.
 		if !a.GetMCPSettings().BypassAllowed && !a.agentHasToken(agentName) {
-			return ActionResult{OK: false, Code: "bearer_required", Message: "承認省略を使うには、先にMCP設定でBearerトークンまたはエージェント専用トークンを発行してください（名乗りだけでは本人確認ができないため）"}
+			return ActionResult{OK: false, Code: "bearer_required", Pending: true, Message: "承認省略を使うには、先にMCP設定でBearerトークンまたはエージェント専用トークンを発行してください（名乗りだけでは本人確認ができないため）"}
 		}
 	}
 
-	// Register the run before it starts so DisconnectConnection can cancel
-	// it and shutdown waits for it (cancelling it as interrupted) instead of
-	// closing the store under it. The tracker is released after finishRequest.
-	execCtx, finishExec, ok := a.beginExec(a.appCtx, conn.ID)
-	defer finishExec()
+	// Reserve the run before the request leaves pending so that a
+	// DisconnectConnection or shutdown arriving between the transition and
+	// the SSH start still cancels it (N2), and shutdown waits for it instead
+	// of closing the store under it. The reservation is not counted as
+	// running and emits no sessions:changed until the transition has
+	// succeeded, so a refused approval never shows up as a running command
+	// (merge audit #2). It is released after finishRequest.
+	timeout := requestTimeoutOf(req)
+	res, ok := a.reserveExec(a.appCtx, conn.ID)
+	defer res.release()
 	if !ok {
-		return ActionResult{OK: false, Message: "終了処理中のため承認できません", Code: "shutting_down"}
+		return ActionResult{OK: false, Message: "終了処理中のため承認できません", Code: "shutting_down", Pending: true}
+	}
+	if cause := stopCauseOf(res.ctx); cause != nil {
+		// Disconnected or shutting down before anything changed: the
+		// request stays pending and nothing runs.
+		if errors.Is(cause, errShuttingDown) {
+			return ActionResult{OK: false, Message: "終了処理中のため承認できません", Code: "shutting_down", Pending: true}
+		}
+		return ActionResult{OK: false, Message: fmt.Sprintf("%s は承認と同時に切断されたため実行しませんでした（承認待ちのままです）", id), Code: "canceled", Pending: true}
 	}
 
 	running, err := a.transitionRequest(id, []string{statePending}, func(r *CommandRequest) {
@@ -359,39 +374,62 @@ func (a *App) approve(id string, command string, allowRiskIncrease bool, grantBy
 	if err != nil {
 		return ActionResult{OK: false, Message: fmt.Sprintf("%s の状態を更新できません: %v", id, err)}
 	}
+	res.activate()
+	execCtx := res.ctx
 
-	bypassNote := ""
+	bypassNote, bypassState := "", ""
 	if grantBypass {
 		if result := a.setAgentApprovalBypass(agentName, true); result.OK {
-			bypassNote = fmt.Sprintf("、%s の承認省略を許可しました", agentName)
+			bypassNote, bypassState = fmt.Sprintf("、%s の承認省略を許可しました", agentName), "granted"
 			if !a.agentHasToken(agentName) {
 				bypassNote += "（エージェント専用トークンを発行するまでは有効になりません）"
+				bypassState = "inactive"
 			}
 		} else {
-			bypassNote = "（承認省略の保存に失敗: " + result.Message + "）"
+			bypassNote, bypassState = "（承認省略の保存に失敗: "+result.Message+"）", "failed"
 		}
+	}
+	// done attaches the bypass outcome so the UI can say it even when it
+	// shows its own text for the code.
+	done := func(r ActionResult) ActionResult {
+		r.Bypass = bypassState
+		return r
 	}
 
 	if !connOK {
-		a.finishRequest(running, stateFailed, commandResult{}, errors.New("対象ホストが接続先一覧にありません"))
-		return ActionResult{OK: false, Message: "対象ホストが接続先一覧にありません" + bypassNote}
+		_, _ = a.finishRequest(running, stateFailed, commandResult{}, errors.New("対象ホストが接続先一覧にありません"))
+		return done(ActionResult{OK: false, Message: "対象ホストが接続先一覧にありません" + bypassNote})
 	}
-	result, execErr := a.executeSSH(execCtx, conn, command, 0, guiCredentialTimeout)
+	// A disconnect or shutdown that came after the transition: record it
+	// and never start the command.
+	if cause := stopCauseOf(execCtx); cause != nil {
+		_, _ = a.finishRequest(running, stateFailed, commandResult{}, cause)
+		if errors.Is(cause, errShuttingDown) {
+			return done(ActionResult{OK: false, Message: fmt.Sprintf("%s は終了処理のため中断されました%s", id, bypassNote)})
+		}
+		return done(ActionResult{OK: false, Code: "canceled", Message: fmt.Sprintf("%s は切断されたため実行しませんでした%s", id, bypassNote)})
+	}
+	result, execErr := a.executeSSH(execCtx, conn, command, timeout, guiCredentialTimeout)
 	if errors.Is(execErr, errShuttingDown) {
 		// finishRequest records it as interrupted.
-		a.finishRequest(running, stateFailed, result, execErr)
-		return ActionResult{OK: false, Message: fmt.Sprintf("%s は終了処理のため中断されました%s", id, bypassNote)}
+		_, _ = a.finishRequest(running, stateFailed, result, execErr)
+		return done(ActionResult{OK: false, Message: fmt.Sprintf("%s は終了処理のため中断されました%s", id, bypassNote)})
 	}
 	if execErr != nil && !isExitError(execErr) {
-		a.finishRequest(running, stateFailed, result, execErr)
-		return ActionResult{OK: false, Message: fmt.Sprintf("%s の実行に失敗しました: %s%s", id, explainSSHError(conn, execErr), bypassNote)}
+		_, _ = a.finishRequest(running, stateFailed, result, execErr)
+		return done(ActionResult{OK: false, Message: fmt.Sprintf("%s の実行に失敗しました: %s%s", id, explainSSHError(conn, execErr), bypassNote)})
 	}
 	state := stateSucceeded
 	if execErr != nil {
 		state = stateFailed
 	}
-	a.finishRequest(running, state, result, execErr)
-	return ActionResult{OK: true, Message: fmt.Sprintf("%s を承認し、実行しました%s", id, bypassNote)}
+	if _, err := a.finishRequest(running, state, result, execErr); err != nil {
+		if r, ok := finalStateNotSaved(id, err); ok {
+			r.Message += bypassNote
+			return done(r)
+		}
+	}
+	return done(ActionResult{OK: true, Message: fmt.Sprintf("%s を承認し、実行しました%s", id, bypassNote)})
 }
 
 // execErrorMarker starts the local execution error that finishRequest
@@ -438,12 +476,16 @@ func agentErrorMessage(errorKind string) string {
 // stopped by app shutdown is recorded as interrupted whatever state the
 // caller picked; one stopped by DisconnectConnection stays failed with
 // ErrorKind "canceled".
-func (a *App) finishRequest(running CommandRequest, state string, result commandResult, execErr error) CommandRequest {
+//
+// The outcome is always published (memory and UI) even when SQLite refuses
+// it (audit #37): the error is then an *errFinalStateNotSaved, which callers
+// report as a storage error instead of success.
+func (a *App) finishRequest(running CommandRequest, state string, result commandResult, execErr error) (CommandRequest, error) {
 	from := running.Status
 	if errors.Is(execErr, errShuttingDown) {
 		state = stateInterrupted
 	}
-	updated, err := a.transitionRequest(running.ID, []string{from}, func(r *CommandRequest) {
+	updated, err := a.finalizeRequest(running.ID, from, func(r *CommandRequest) {
 		r.Status = state
 		r.Stdout = result.Stdout
 		r.Stderr = result.Stderr
@@ -467,7 +509,17 @@ func (a *App) finishRequest(running CommandRequest, state string, result command
 	if err != nil {
 		log.Printf("finish request %s: %v", running.ID, err)
 	}
-	return updated
+	return updated, err
+}
+
+// finalStateNotSaved reports err as the GUI's storage error when the outcome
+// of an approved run could not be written to SQLite (audit #37).
+func finalStateNotSaved(id string, err error) (ActionResult, bool) {
+	var notSaved *errFinalStateNotSaved
+	if !errors.As(err, &notSaved) {
+		return ActionResult{}, false
+	}
+	return ActionResult{OK: false, Code: "storage", Message: fmt.Sprintf("%s は実行しましたが、結果を保存できませんでした / %s ran but its result could not be saved: %v", id, id, notSaved.err)}, true
 }
 
 func (a *App) RejectCommand(id string) ActionResult {
@@ -560,9 +612,128 @@ func (a *App) needsHumanApproval(conn Connection, risk string, command string, c
 }
 
 func (a *App) queueCommand(conn Connection, command string, reason string, requestedBy string, risk string, clientRequestID string) (CommandRequest, error) {
+	return a.queueCommandWithTimeout(conn, command, reason, requestedBy, risk, clientRequestID, 0)
+}
+
+// queueCommandWithTimeout queues a request whose approved run uses
+// timeoutSeconds (1-3600; 0 = the connection's command timeout) (N11). The
+// timeout is attached before the request is published, so no approval can
+// see the request without it.
+func (a *App) queueCommandWithTimeout(conn Connection, command string, reason string, requestedBy string, risk string, clientRequestID string, timeoutSeconds int) (CommandRequest, error) {
 	req := newCommandRequest(conn, command, reason, requestedBy, risk, statePending)
 	req.ClientRequestID = clientRequestID
+	setRequestTimeout(&req, timeoutSeconds)
 	return req, a.recordCommandRequest(req)
+}
+
+// setRequestTimeout attaches the agent's timeout_seconds (capped at 3600;
+// <= 0 = the connection's command timeout) to a request before it is
+// recorded. It is stored in command_requests.timeout_seconds, so it survives
+// a restart.
+func setRequestTimeout(req *CommandRequest, seconds int) {
+	if seconds <= 0 {
+		req.TimeoutSeconds = 0
+		return
+	}
+	req.TimeoutSeconds = min(seconds, 3600)
+}
+
+// requestTimeoutOf is the timeout override (seconds, 0 = connection default)
+// an approved run of req uses.
+func requestTimeoutOf(req CommandRequest) int {
+	return req.TimeoutSeconds
+}
+
+// execReservation is an execution registered in a.execs (so
+// DisconnectConnection cancels it and shutdown's execWG waits for it) before
+// its request becomes running. Until activate it is not added to
+// runningTotal and emits no sessions:changed, so a reservation whose
+// transition fails is never reported as a running command.
+type execReservation struct {
+	a      *App
+	ctx    context.Context
+	key    uint64
+	cancel context.CancelCauseFunc
+	stop   func() bool
+	active atomic.Bool
+	once   sync.Once
+	held   bool
+}
+
+// reserveExec registers an execution without counting it (activate counts
+// it; beginExec does both). ok is false once shutdown has begun; release
+// must still be called (it is a no-op then).
+func (a *App) reserveExec(parent context.Context, connID string) (*execReservation, bool) {
+	ctx, cancel := context.WithCancelCause(parent)
+	// Parents not derived from appCtx still stop on shutdown.
+	stop := context.AfterFunc(a.appCtx, func() { cancel(errShuttingDown) })
+	r := &execReservation{a: a, ctx: ctx, cancel: cancel, stop: stop}
+	a.execMu.Lock()
+	if a.execsClosed || a.appCtx.Err() != nil {
+		a.execMu.Unlock()
+		stop()
+		cancel(errShuttingDown)
+		return r, false
+	}
+	a.execSeq++
+	r.key = a.execSeq
+	a.execs[r.key] = runningExec{connID: connID, cancel: cancel}
+	a.execWG.Add(1)
+	a.execMu.Unlock()
+	r.held = true
+	return r, true
+}
+
+// activate counts the reserved run as running, once its request has become
+// running.
+func (r *execReservation) activate() {
+	if !r.held || !r.active.CompareAndSwap(false, true) {
+		return
+	}
+	r.a.execMu.Lock()
+	if exec, found := r.a.execs[r.key]; found {
+		exec.active = true
+		r.a.execs[r.key] = exec
+	}
+	r.a.execMu.Unlock()
+	r.a.runningTotal.Add(1)
+	r.a.sessionsChanged()
+}
+
+// release ends the run (extra calls are ignored). An activated run is
+// uncounted with a sessions:changed; a never-activated one leaves silently.
+func (r *execReservation) release() {
+	r.once.Do(func() {
+		if !r.held {
+			return
+		}
+		r.stop()
+		r.a.execMu.Lock()
+		delete(r.a.execs, r.key)
+		r.a.execMu.Unlock()
+		r.cancel(context.Canceled)
+		wasActive := r.active.Swap(false)
+		if wasActive {
+			r.a.runningTotal.Add(-1)
+		}
+		r.a.execWG.Done()
+		if wasActive {
+			r.a.sessionsChanged()
+		}
+	})
+}
+
+// stopCauseOf returns why ssh-gete stopped ctx (disconnect, shutdown, gone
+// client), or nil while it runs or for any other end.
+func stopCauseOf(ctx context.Context) error {
+	if ctx.Err() == nil {
+		return nil
+	}
+	cause := context.Cause(ctx)
+	if isStopCause(cause) {
+		return cause
+	}
+	return nil
 }
 
 // credTimeout bounds the keychain read of a stored password

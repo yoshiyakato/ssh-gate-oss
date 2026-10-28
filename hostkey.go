@@ -113,8 +113,25 @@ type HostKeyInfo struct {
 	Keys    []HostKeyEntry `json:"keys"`
 }
 
+// knownHostsPath is appConfigDir()/known_hosts, or "" when there is no
+// config directory (audit #23: never a relative "known_hosts" in the working
+// directory).
 func knownHostsPath() string {
-	return filepath.Join(appConfigDir(), knownHostsFileName)
+	dir := appConfigDir()
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, knownHostsFileName)
+}
+
+// appKnownHostsPath is knownHostsPath for readers and writers: no config
+// directory is an error, so no host key is verified, recorded or reset.
+func appKnownHostsPath() (string, error) {
+	path := knownHostsPath()
+	if path == "" {
+		return "", errNoConfigDir
+	}
+	return path, nil
 }
 
 // hostKeyGeneration returns a counter that changes on every known_hosts write.
@@ -151,9 +168,12 @@ func ensureKnownHostsFile(path string) error {
 // first and always exists afterwards; ~/.ssh/known_hosts is read in strict
 // mode only, because a stale line there could not be reset from the GUI.
 func hostKeyFiles(strict bool) ([]string, error) {
-	path := knownHostsPath()
+	path, err := appKnownHostsPath()
+	if err != nil {
+		return nil, err
+	}
 	hostKeyMu.Lock()
-	err := ensureKnownHostsFile(path)
+	err = ensureKnownHostsFile(path)
 	hostKeyMu.Unlock()
 	if err != nil {
 		return nil, fmt.Errorf("prepare %s: %w", path, err)
@@ -192,19 +212,56 @@ func knownKeysFor(check ssh.HostKeyCallback, addr string) []knownhosts.KnownKey 
 	return nil
 }
 
-// hostKeyAlgorithmsFor limits negotiation to the key types already recorded,
-// so a server that also has another key type is not misread as a mismatch.
-// It returns nil (library default) for an unknown host.
+// plainHostKeyAlgos is the library's default host key preference without the
+// certificate algorithms (and without DSA), and certHostKeyAlgo maps each to
+// its certificate form.
+var plainHostKeyAlgos = []string{
+	ssh.KeyAlgoECDSA256,
+	ssh.KeyAlgoECDSA384,
+	ssh.KeyAlgoECDSA521,
+	ssh.KeyAlgoED25519,
+	ssh.KeyAlgoRSASHA256,
+	ssh.KeyAlgoRSASHA512,
+	ssh.KeyAlgoRSA,
+}
+
+var certHostKeyAlgo = map[string]string{
+	ssh.KeyAlgoECDSA256:   ssh.CertAlgoECDSA256v01,
+	ssh.KeyAlgoECDSA384:   ssh.CertAlgoECDSA384v01,
+	ssh.KeyAlgoECDSA521:   ssh.CertAlgoECDSA521v01,
+	ssh.KeyAlgoED25519:    ssh.CertAlgoED25519v01,
+	ssh.KeyAlgoRSASHA256:  ssh.CertAlgoRSASHA256v01,
+	ssh.KeyAlgoRSASHA512:  ssh.CertAlgoRSASHA512v01,
+	ssh.KeyAlgoRSA:        ssh.CertAlgoRSAv01,
+	ssh.KeyAlgoSKECDSA256: ssh.CertAlgoSKECDSA256v01,
+	ssh.KeyAlgoSKED25519:  ssh.CertAlgoSKED25519v01,
+}
+
+// hostKeyAlgorithmsFor decides which host key algorithms to offer when no
+// @cert-authority line covers the host (N18/N31).
+//
+// Plain algorithms always come first, so a server that has both a plain key
+// and a certificate presents the plain key, which TOFU can record and compare.
+// The certificate forms follow only as a fallback for a server that has
+// nothing else; such a certificate is checked by its inner key (see
+// verifyUncertifiedCert), never by its CA.
+//
+// For a known host, negotiation is limited to the recorded key types so a
+// server that also has another key type is not misread as a mismatch. For an
+// unknown host every supported type is offered.
 func hostKeyAlgorithmsFor(known []knownhosts.KnownKey) []string {
-	var algos []string
+	var plain []string
 	seen := map[string]bool{}
 	add := func(names ...string) {
 		for _, name := range names {
 			if !seen[name] {
 				seen[name] = true
-				algos = append(algos, name)
+				plain = append(plain, name)
 			}
 		}
+	}
+	if len(known) == 0 {
+		add(plainHostKeyAlgos...)
 	}
 	for _, k := range known {
 		switch t := k.Key.Type(); t {
@@ -212,6 +269,12 @@ func hostKeyAlgorithmsFor(known []knownhosts.KnownKey) []string {
 			add(ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA)
 		default:
 			add(t)
+		}
+	}
+	algos := plain
+	for _, name := range plain {
+		if cert, ok := certHostKeyAlgo[name]; ok {
+			algos = append(algos, cert)
 		}
 	}
 	return algos
@@ -230,17 +293,16 @@ func newHostKeyVerifier(addr string, policy hostKeyPolicy) (ssh.HostKeyCallback,
 	}
 	known := knownKeysFor(check, addr)
 	algos := hostKeyAlgorithmsFor(known)
-	if anyCertAuthority(known, certAuthorityLines(files)) {
+	hasCA := anyCertAuthority(known, certAuthorityLines(files))
+	if hasCA {
 		// A @cert-authority entry's key is the CA's, not the host's: limiting
 		// negotiation to its plain type would keep the server from presenting
 		// its certificate. Use the library defaults, which offer cert algorithms.
 		algos = nil
 	}
-	callback := func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-		err := check(hostname, remote, key)
-		if err == nil {
-			return nil
-		}
+	// verifyPlain turns a failed known_hosts check of a plain key into the
+	// mismatch / unknown / record decision.
+	verifyPlain := func(hostname string, key ssh.PublicKey, err error) error {
 		fingerprint := ssh.FingerprintSHA256(key)
 		var revoked *knownhosts.RevokedError
 		if errors.As(err, &revoked) {
@@ -251,18 +313,61 @@ func newHostKeyVerifier(addr string, policy hostKeyPolicy) (ssh.HostKeyCallback,
 			return err
 		}
 		if len(keyErr.Want) > 0 {
-			known := make([]string, 0, len(keyErr.Want))
-			for _, k := range keyErr.Want {
-				known = append(known, k.Key.Type()+" "+ssh.FingerprintSHA256(k.Key))
-			}
-			return &hostKeyMismatchError{Address: knownhosts.Normalize(hostname), Fingerprint: fingerprint, Known: known}
+			return &hostKeyMismatchError{Address: knownhosts.Normalize(hostname), Fingerprint: fingerprint, Known: describeKnownKeys(keyErr.Want)}
 		}
 		if policy.Origin != hostKeyFromGUI || policy.Strict {
 			return &hostKeyUnknownError{Address: knownhosts.Normalize(hostname), Fingerprint: fingerprint}
 		}
 		return recordHostKey(hostname, key)
 	}
+	callback := func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		err := check(hostname, remote, key)
+		if err == nil {
+			return nil
+		}
+		if cert, ok := key.(*ssh.Certificate); ok {
+			return verifyUncertifiedCert(check, hostname, remote, cert, hasCA, known, verifyPlain)
+		}
+		return verifyPlain(hostname, key, err)
+	}
 	return callback, algos, nil
+}
+
+// verifyUncertifiedCert handles a host certificate the known_hosts check did
+// not accept (N18/N31). When a @cert-authority line covers the host, the
+// certificate had to verify against it, so the dial is refused as a mismatch
+// and nothing is recorded. Otherwise the certificate is ignored and its inner
+// key is treated like any plain host key (as OpenSSH does when no CA matches):
+// a recorded key must match, an unknown one follows the TOFU / hostkey_unknown
+// rules, and only the inner key is ever written. A certificate signed by a
+// @revoked key is refused either way.
+func verifyUncertifiedCert(check ssh.HostKeyCallback, hostname string, remote net.Addr, cert *ssh.Certificate,
+	hasCA bool, known []knownhosts.KnownKey, verifyPlain func(string, ssh.PublicKey, error) error) error {
+	address := knownhosts.Normalize(hostname)
+	fingerprint := ssh.FingerprintSHA256(cert.Key)
+	if cert.CertType != ssh.HostCert {
+		return &hostKeyMismatchError{Address: address, Fingerprint: fingerprint, Known: describeKnownKeys(known)}
+	}
+	var revoked *knownhosts.RevokedError
+	if errors.As(check(hostname, remote, cert.SignatureKey), &revoked) {
+		return &hostKeyMismatchError{Address: address, Fingerprint: fingerprint, Revoked: true}
+	}
+	if hasCA {
+		return &hostKeyMismatchError{Address: address, Fingerprint: fingerprint, Known: describeKnownKeys(known)}
+	}
+	err := check(hostname, remote, cert.Key)
+	if err == nil {
+		return nil
+	}
+	return verifyPlain(hostname, cert.Key, err)
+}
+
+func describeKnownKeys(keys []knownhosts.KnownKey) []string {
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, k.Key.Type()+" "+ssh.FingerprintSHA256(k.Key))
+	}
+	return out
 }
 
 // certAuthorityLines returns "file:line" for every @cert-authority line of
@@ -297,7 +402,10 @@ func anyCertAuthority(known []knownhosts.KnownKey, caLines map[string]bool) bool
 // recordHostKey appends key for hostname unless a concurrent dial already
 // recorded a key for it, in which case the key must match that one.
 func recordHostKey(hostname string, key ssh.PublicKey) error {
-	path := knownHostsPath()
+	path, err := appKnownHostsPath()
+	if err != nil {
+		return err
+	}
 	hostKeyMu.Lock()
 	defer hostKeyMu.Unlock()
 	if err := ensureKnownHostsFile(path); err != nil {
@@ -339,7 +447,10 @@ func recordHostKey(hostname string, key ssh.PublicKey) error {
 // recordedHostKeys reads the plain (unhashed) lines of the app known_hosts
 // file that name addr.
 func recordedHostKeys(addr string) ([]HostKeyEntry, error) {
-	path := knownHostsPath()
+	path, err := appKnownHostsPath()
+	if err != nil {
+		return nil, err
+	}
 	hostKeyMu.Lock()
 	data, err := os.ReadFile(path)
 	hostKeyMu.Unlock()
@@ -362,7 +473,10 @@ func recordedHostKeys(addr string) ([]HostKeyEntry, error) {
 // removeHostKeys rewrites the app known_hosts file without the lines that name
 // addr and reports how many were dropped. Other lines are kept byte for byte.
 func removeHostKeys(addr string) (int, error) {
-	path := knownHostsPath()
+	path, err := appKnownHostsPath()
+	if err != nil {
+		return 0, err
+	}
 	hostKeyMu.Lock()
 	defer hostKeyMu.Unlock()
 	data, err := os.ReadFile(path)

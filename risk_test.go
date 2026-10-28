@@ -117,3 +117,89 @@ func TestCommandUsesSudo(t *testing.T) {
 		}
 	}
 }
+
+// TestClassifyRiskWrappersAndOptions covers the third audit: options the
+// classifier does not know fail closed instead of moving the command word.
+func TestClassifyRiskWrappersAndOptions(t *testing.T) {
+	cases := []struct {
+		command string
+		want    string
+	}{
+		// ip -batch runs every command in a file; verbs must be spelled out.
+		{"ip -batch /tmp/x", "Medium"},
+		{"ip -b /tmp/x", "Medium"},
+		{"ip -force -batch /tmp/x", "Medium"},
+		{"ip r f", "Medium"},
+		{"ip route save", "Medium"},
+		{"ip route restore", "Medium"},
+		{"ip route flush", "Medium"},
+		{"ip addr show", "Low"},
+		{"ip -br -c link", "Low"},
+		{"ip -4 route get 1.1.1.1", "Low"},
+		{"ip a", "Low"},
+
+		// file -C writes a compiled magic file.
+		{"file -C -m /tmp/x", "Medium"},
+		{"file -C", "Medium"},
+		{"file --compile", "Medium"},
+		{"file -b /etc/hosts", "Low"},
+
+		// Long option abbreviations are matched like getopt_long does.
+		{"sort --outp=/etc/passwd x", "Medium"},
+		{"date --se=2020-01-01", "Medium"},
+		{"date -us 2020-01-01", "Medium"},
+		{"date -Iseconds", "Low"},
+		{"journalctl --vac=1", "Medium"},
+
+		// NAME+=value is an assignment prefix too.
+		{"a+=1 rm -rf ~", "High"},
+		{"A_+=x rm -rf ~", "High"},
+		{"a+=1 ls", "Medium"},
+
+		// Wrapper options outside the known table are High.
+		{"env -S rm -rf ~", "High"},
+		{"env --split-string=rm -rf ~", "High"},
+		{"/usr/bin/time -o out rm -rf ~", "High"},
+		{"time -o out ls", "High"},
+		{"time -p ls", "Medium"},
+		{"env --chdir /tmp rm -rf ~", "High"},
+		{"env --chdir /tmp ls", "Medium"},
+		{"env --unset X rm -rf ~", "High"},
+		{"timeout --signal KILL 5 rm -rf ~", "High"},
+		{"timeout --signal KILL 5 ls", "Medium"},
+		{"timeout -s KILL 5 ls", "Medium"},
+		{"xargs --max-args 1 rm -rf", "High"},
+		{"xargs -n1 rm", "High"},
+		{"ls | xargs -0 -n 1 ls", "Medium"},
+		{"sudo --user root rm -rf ~", "High"},
+		{"sudo --user=root ls", "Medium"},
+		{"sudo -nu root ls", "Medium"},
+		{"sudo --bogus ls", "High"},
+		{"sudo -s", "High"},
+		{"sudo -e /etc/sudoers", "High"},
+		{"nice -n 5 ls", "Medium"},
+		{"nice -5 ls", "Medium"},
+		{"command -v rm", "Medium"},
+		{"sudo -- rm x", "High"},
+
+		// Printable but invisible characters are opaque.
+		{"cat /etc/host\u034fname", "High"},
+		{"ls x\ufe0f", "High"},
+		{"ls x\U000e0100", "High"},
+		{"ls \u3164", "High"},
+		{"ls \u115f", "High"},
+		{"ls \uffa0", "High"},
+		{"ls \u2800", "High"},
+		{"ls x\u17b4", "High"},
+	}
+	for _, c := range cases {
+		if got := classifyRisk(c.command); got != c.want {
+			t.Errorf("classifyRisk(%q) = %s, want %s", c.command, got, c.want)
+		}
+	}
+	for _, command := range []string{"a+=1 sudo -n id", "A_+=x sudo id", "sudo --user root rm -rf ~"} {
+		if !commandUsesSudo(command) {
+			t.Errorf("commandUsesSudo(%q) = false", command)
+		}
+	}
+}

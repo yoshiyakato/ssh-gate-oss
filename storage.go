@@ -39,7 +39,11 @@ var errStateConflict = errors.New("request state changed")
 type Store struct {
 	db   *sql.DB
 	path string
-	// fresh reports whether the database file did not exist before openStore.
+	// lock holds the single-instance lock (<path>.lock) until Close.
+	lock *sql.DB
+	// fresh reports whether the database held no schema at all before this
+	// open (user_version 0 and an empty sqlite_master), so an empty file left
+	// by an interrupted first start still counts as new (audit #34).
 	fresh bool
 	// prevVersion is the user_version found on open (before migration).
 	prevVersion int
@@ -67,15 +71,36 @@ func newID() string {
 	return hex.EncodeToString(b[:])
 }
 
+// errAnotherInstance is returned by openStore when another ssh-gete process
+// (or another Store in this process) already has the database open. The
+// second instance must not touch it: recoverInterruptedRequests would turn
+// the first one's running commands into interrupted (audit #3).
+var errAnotherInstance = errors.New("別の ssh-gete が同じデータを使用中のため、保存先を開けません。起動中の ssh-gete を使うか、終了してから起動し直してください / Another ssh-gete instance is using the same data; use it, or quit it and start again")
+
+// errNoConfigDir is returned for an empty database path: appConfigDir found
+// no per-user directory and there is no safe fallback (audit #23).
+var errNoConfigDir = errors.New("設定の保存先（ユーザーの設定ディレクトリまたはホームディレクトリ）が見つかりません。SSH_GETE_CONFIG_DIR を指定してください / No per-user config directory or home directory was found; set SSH_GETE_CONFIG_DIR")
+
 func openStore(path string) (*Store, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if strings.TrimSpace(path) == "" || !filepath.IsAbs(path) {
+		return nil, errNoConfigDir
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	fresh := !fileExists(path)
-	if fresh {
+	// MkdirAll leaves an existing directory's mode alone; the database and
+	// its backups hold credentials, so tighten it (audit #12).
+	_ = os.Chmod(dir, 0o700)
+	lock, err := acquireInstanceLock(path)
+	if err != nil {
+		return nil, err
+	}
+	if !fileExists(path) {
 		// Create the file with owner-only permissions before SQLite opens it.
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
+			_ = lock.Close()
 			return nil, err
 		}
 		_ = f.Close()
@@ -84,18 +109,70 @@ func openStore(path string) (*Store, error) {
 	// credential column does not linger in free pages.
 	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(on)&_pragma=secure_delete(on)")
 	if err != nil {
+		_ = lock.Close()
 		return nil, err
 	}
 	// A single connection serializes writes so read-check-write sequences
 	// (state transitions) cannot interleave inside SQLite.
 	db.SetMaxOpenConns(1)
-	store := &Store{db: db, path: path, fresh: fresh}
+	store := &Store{db: db, path: path, lock: lock}
 	if err := store.migrate(); err != nil {
 		_ = db.Close()
+		_ = lock.Close()
 		return nil, err
 	}
 	restrictDBFilePermissions(path)
 	return store, nil
+}
+
+// acquireInstanceLock takes the single-instance lock of dbPath: a small
+// SQLite file <dbPath>.lock held in EXCLUSIVE locking mode. After its first
+// write the connection keeps the exclusive file lock until it is closed (or
+// the process dies, when the OS drops it), so a second process, or a second
+// Store in this one, gets SQLITE_BUSY at once and openStore fails with
+// errAnotherInstance. It works the same on macOS, Linux and Windows.
+func acquireInstanceLock(dbPath string) (*sql.DB, error) {
+	lockPath := dbPath + ".lock"
+	if !fileExists(lockPath) {
+		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			return nil, err
+		}
+		_ = f.Close()
+	}
+	db, err := sql.Open("sqlite", lockPath+"?_pragma=busy_timeout(0)&_pragma=locking_mode(EXCLUSIVE)")
+	if err != nil {
+		return nil, err
+	}
+	// Exactly one connection that is never recycled: closing it would drop
+	// the lock.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+	db.SetConnMaxIdleTime(0)
+	for _, stmt := range []string{
+		`CREATE TABLE IF NOT EXISTS instance (id INTEGER PRIMARY KEY CHECK (id = 1), pid INTEGER NOT NULL, started_at TEXT NOT NULL)`,
+		`INSERT INTO instance (id, pid, started_at) VALUES (1, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET pid = excluded.pid, started_at = excluded.started_at`,
+	} {
+		var args []any
+		if strings.Contains(stmt, "INSERT") {
+			args = []any{os.Getpid(), nowRFC3339()}
+		}
+		if _, err := db.Exec(stmt, args...); err != nil {
+			_ = db.Close()
+			if isSQLiteBusy(err) {
+				return nil, errAnotherInstance
+			}
+			return nil, fmt.Errorf("instance lock: %w", err)
+		}
+	}
+	return db, nil
+}
+
+func isSQLiteBusy(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "SQLITE_BUSY") || strings.Contains(msg, "database is locked")
 }
 
 func restrictDBFilePermissions(path string) {
@@ -106,11 +183,16 @@ func restrictDBFilePermissions(path string) {
 	}
 }
 
+// Close closes the database, then releases the single-instance lock.
 func (s *Store) Close() error {
 	if s == nil || s.db == nil {
 		return nil
 	}
-	return s.db.Close()
+	err := s.db.Close()
+	if s.lock != nil {
+		_ = s.lock.Close()
+	}
+	return err
 }
 
 // backupBeforeMigration writes a complete copy of the database as
@@ -125,11 +207,23 @@ func (s *Store) backupBeforeMigration() (string, error) {
 		backup = fmt.Sprintf("%s.bak-v%d-%d", s.path, s.prevVersion, time.Now().UnixNano())
 	}
 	tmp := fmt.Sprintf("%s.tmp-%d", backup, time.Now().UnixNano())
+	// The copy holds every credential. Create it empty and owner-only first
+	// (O_EXCL: never reuse a file someone else made); VACUUM INTO accepts an
+	// empty target and keeps its mode, so the copy is never readable by
+	// others, not even between the write and a chmod (audit #12).
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return "", err
+	}
+	_ = f.Close()
+	if err := os.Chmod(tmp, 0o600); err != nil { // umask cannot widen it, but be explicit
+		_ = os.Remove(tmp)
+		return "", err
+	}
 	if _, err := s.db.Exec(`VACUUM INTO ?`, tmp); err != nil {
 		_ = os.Remove(tmp)
 		return "", err
 	}
-	_ = os.Chmod(tmp, 0o600)
 	if err := os.Rename(tmp, backup); err != nil {
 		_ = os.Remove(tmp)
 		return "", err
@@ -144,6 +238,11 @@ func (s *Store) migrate() error {
 	if s.prevVersion > schemaVersion {
 		return fmt.Errorf("このデータベースは新しいバージョン(v%d)の ssh-gete で作成されています。アプリを更新してください", s.prevVersion)
 	}
+	var objects int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master`).Scan(&objects); err != nil {
+		return err
+	}
+	s.fresh = s.prevVersion == 0 && objects == 0
 	if _, err := s.db.Exec(`PRAGMA journal_mode=WAL`); err != nil {
 		return err
 	}
@@ -212,18 +311,39 @@ func (s *Store) migrate() error {
 			account TEXT PRIMARY KEY,
 			created_at INTEGER NOT NULL
 		)`,
+		// schema_meta holds one-off migration flags (§5.5), such as
+		// legacy_migrated for the pre-SQLite JSON import.
+		`CREATE TABLE IF NOT EXISTS schema_meta (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		)`,
 	}
-	for _, statement := range statements {
-		if _, err := s.db.Exec(statement); err != nil {
-			return err
-		}
-	}
-
+	// The tables are created inside the migration transaction, so a first
+	// start that dies before the commit leaves no schema behind and the next
+	// start is still fresh (audit #34).
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	for _, statement := range statements {
+		if _, err := tx.Exec(statement); err != nil {
+			return err
+		}
+	}
+	// A new database imports the legacy JSON files (pending); one from before
+	// v2 imported them long ago and only retires them (rename); later
+	// databases are done. An existing row is never overwritten.
+	legacy := legacyMigrationDone
+	switch {
+	case s.fresh:
+		legacy = legacyMigrationPending
+	case s.prevVersion < 2:
+		legacy = legacyMigrationRename
+	}
+	if _, err := tx.Exec(`INSERT INTO schema_meta (key, value) VALUES ('legacy_migrated', ?) ON CONFLICT(key) DO NOTHING`, legacy); err != nil {
+		return err
+	}
 
 	columns := []struct{ table, name, ddl string }{
 		{"connections", "type", `ALTER TABLE connections ADD COLUMN type TEXT NOT NULL DEFAULT 'SSH'`},
@@ -255,6 +375,13 @@ func (s *Store) migrate() error {
 		{"agent_policies", "expires_at", `ALTER TABLE agent_policies ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0`},
 		{"connections", "credential_store", `ALTER TABLE connections ADD COLUMN credential_store TEXT NOT NULL DEFAULT 'db'`},
 		{"connections", "passphrase_saved", `ALTER TABLE connections ADD COLUMN passphrase_saved INTEGER NOT NULL DEFAULT 0`},
+		// deleted_at (ms, 0 = live): deleting from the history hides the row
+		// but keeps it as the audit record (§5.5, audit #4).
+		{"command_requests", "deleted_at", `ALTER TABLE command_requests ADD COLUMN deleted_at INTEGER NOT NULL DEFAULT 0`},
+		// timeout_seconds is the agent's timeout_seconds for a queued run
+		// (0 = the connection's command timeout), so an approval after a
+		// restart still honours it (N11).
+		{"command_requests", "timeout_seconds", `ALTER TABLE command_requests ADD COLUMN timeout_seconds INTEGER NOT NULL DEFAULT 0`},
 	}
 	for _, col := range columns {
 		if err := addColumnIfMissing(tx, col.table, col.name, col.ddl); err != nil {
@@ -290,8 +417,12 @@ func (s *Store) migrate() error {
 
 // legacyStatusCodes maps the Japanese request statuses stored before v2 to
 // the state codes used from v2 on.
+//
+// "承認待ち" is not in the map: before v2, ApproveCommand ran the command while
+// the row still said 承認待ち, so such a row may have run (or be mid-run when
+// the old version died). migrateToV2 never turns it back into an approvable
+// pending request (audit #47).
 var legacyStatusCodes = map[string]string{
-	"承認待ち":   statePending,
 	"実行済み":   stateSucceeded,
 	"実行失敗":   stateFailed,
 	"拒否":     stateRejected,
@@ -322,6 +453,17 @@ func migrateToV2(tx *sql.Tx) error {
 		if _, err := tx.Exec(`UPDATE connections SET id = ? WHERE name = ?`, newID(), name); err != nil {
 			return err
 		}
+	}
+	// A 承認待ち row with any trace of a run (output, a duration) is
+	// interrupted: outcome unknown, never re-approvable. The rest expire, so
+	// the agent has to ask again instead of a stale approval running twice.
+	if _, err := tx.Exec(`UPDATE command_requests SET status = ?, error_kind = 'canceled'
+		WHERE status = '承認待ち' AND (stdout != '' OR stderr != '' OR (duration != '' AND duration != '-'))`,
+		stateInterrupted); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE command_requests SET status = ? WHERE status = '承認待ち'`, stateExpired); err != nil {
+		return err
 	}
 	for legacy, code := range legacyStatusCodes {
 		if _, err := tx.Exec(`UPDATE command_requests SET status = ? WHERE status = ?`, code, legacy); err != nil {
@@ -493,6 +635,7 @@ func (s *Store) loadConnections() ([]Connection, error) {
 		}
 		conn.Type = conn.connectionType()
 		conn.MCPFirstTrust = firstTrust != 0
+		liftLegacySerialPort(&conn)
 		if credStore == credentialStoreKeyring && conn.usesPassword() && conn.Type != "Serial" {
 			conn.Credential = ""
 			conn.CredentialSet = true
@@ -523,6 +666,13 @@ func (s *Store) insertConnection(conn Connection) error {
 		return err
 	}
 	defer tx.Rollback()
+	if err := insertConnectionTx(tx, conn, string(tagsJSON), credStore); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func insertConnectionTx(tx *sql.Tx, conn Connection, tagsJSON string, credStore string) error {
 	if _, err := tx.Exec(`
 		INSERT INTO connections (
 			id, name, type, host, port, user, auth_method, credential, serial_port, baud_rate,
@@ -530,7 +680,7 @@ func (s *Store) insertConnection(conn Connection) error {
 			credential_store, status, last_checked, updated_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?)`,
 		conn.ID, conn.Name, conn.connectionType(), conn.Host, conn.Port, conn.User, conn.AuthMethod, conn.Credential,
-		conn.SerialPort, conn.BaudRate, conn.DataBits, conn.Parity, conn.StopBits, conn.ConnectTimeout, conn.CommandTimeout, string(tagsJSON), conn.Description,
+		conn.SerialPort, conn.BaudRate, conn.DataBits, conn.Parity, conn.StopBits, conn.ConnectTimeout, conn.CommandTimeout, tagsJSON, conn.Description,
 		boolInt(conn.MCPFirstTrust), credStore, nowRFC3339(),
 	); err != nil {
 		return err
@@ -540,7 +690,7 @@ func (s *Store) insertConnection(conn Connection) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 // storedSecretState is what a connections row says about its secrets.
@@ -709,9 +859,7 @@ func (s *Store) loadMCPSettings(path string) (MCPSettings, string, bool, error) 
 }
 
 func (s *Store) saveMCPSettings(settings MCPSettings, token string) error {
-	settings.TokenInput = ""
-	settings.TokenPreview = ""
-	payload, err := json.Marshal(settings)
+	payload, err := mcpSettingsPayload(settings)
 	if err != nil {
 		return err
 	}
@@ -722,14 +870,113 @@ func (s *Store) saveMCPSettings(settings MCPSettings, token string) error {
 			payload_json = excluded.payload_json,
 			token = excluded.token,
 			updated_at = excluded.updated_at`,
-		string(payload), token, nowRFC3339(),
+		payload, token, nowRFC3339(),
 	)
 	return err
 }
 
+func mcpSettingsPayload(settings MCPSettings) (string, error) {
+	settings.TokenInput = ""
+	settings.TokenPreview = ""
+	payload, err := json.Marshal(settings)
+	return string(payload), err
+}
+
+// Values of schema_meta.legacy_migrated.
+const (
+	legacyMigrationPending = "pending" // import the JSON files, then rename them
+	legacyMigrationRename  = "rename"  // imported (or pre-v2): only rename them
+	legacyMigrationDone    = "done"
+)
+
+func (s *Store) legacyMigrationState() (string, error) {
+	var state string
+	err := s.db.QueryRow(`SELECT value FROM schema_meta WHERE key = 'legacy_migrated'`).Scan(&state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return legacyMigrationDone, nil
+	}
+	return state, err
+}
+
+func (s *Store) setLegacyMigrationState(state string) error {
+	_, err := s.db.Exec(`INSERT INTO schema_meta (key, value) VALUES ('legacy_migrated', ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, state)
+	return err
+}
+
+// importLegacyData writes the pre-SQLite connections and MCP settings and
+// moves legacy_migrated to "rename" in one transaction, so a failure (or a
+// crash) imports nothing and the next start tries again (audit #10). Names
+// that collide (with each other after trimming, or with rows made since a
+// failed attempt) get a " (2)", " (3)" suffix instead of aborting. MCP
+// settings are written only when none are stored yet. It returns the names
+// actually used.
+func (s *Store) importLegacyData(conns []Connection, settings *MCPSettings, token string) ([]string, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	used := map[string]bool{}
+	rows, err := tx.Query(`SELECT name FROM connections`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		used[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, conn := range conns {
+		base := conn.Name
+		if base == "" {
+			base = conn.Host
+		}
+		if base == "" {
+			base = "imported"
+		}
+		name := base
+		for n := 2; used[name]; n++ {
+			name = fmt.Sprintf("%s (%d)", base, n)
+		}
+		used[name] = true
+		conn.Name = name
+		tagsJSON, err := json.Marshal(conn.Tags)
+		if err != nil {
+			return nil, err
+		}
+		if err := insertConnectionTx(tx, conn, string(tagsJSON), credentialStoreOf(conn)); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	if settings != nil {
+		payload, err := mcpSettingsPayload(*settings)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(`INSERT INTO mcp_settings (id, payload_json, token, updated_at) VALUES (1, ?, ?, ?)
+			ON CONFLICT(id) DO NOTHING`, payload, token, nowRFC3339()); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := tx.Exec(`UPDATE schema_meta SET value = ? WHERE key = 'legacy_migrated'`, legacyMigrationRename); err != nil {
+		return nil, err
+	}
+	return names, tx.Commit()
+}
+
 const requestColumns = `id, connection_id, host, user, command, executed_command, reason, requested_by, requested_at,
 	risk, approved_risk, status, stdout, stderr, duration, decided_by, decided_at, finished_at, exit_code, error_kind,
-	client_request_id, expires_at, target_fp`
+	client_request_id, expires_at, target_fp, timeout_seconds`
 
 func scanRequest(scanner interface{ Scan(...any) error }) (CommandRequest, error) {
 	var req CommandRequest
@@ -737,7 +984,7 @@ func scanRequest(scanner interface{ Scan(...any) error }) (CommandRequest, error
 	err := scanner.Scan(&req.ID, &req.ConnectionID, &req.Host, &req.User, &req.Command, &req.ExecutedCommand,
 		&req.Reason, &req.RequestedBy, &req.RequestedAt, &req.Risk, &req.ApprovedRisk, &req.Status, &req.Stdout,
 		&req.Stderr, &req.Duration, &req.DecidedBy, &req.DecidedAt, &req.FinishedAt, &exitCode, &req.ErrorKind,
-		&req.ClientRequestID, &req.ExpiresAt, &req.TargetFP)
+		&req.ClientRequestID, &req.ExpiresAt, &req.TargetFP, &req.TimeoutSeconds)
 	if exitCode.Valid {
 		code := int(exitCode.Int64)
 		req.ExitCode = &code
@@ -753,8 +1000,8 @@ func (s *Store) loadCommandRequests(limit int) ([]CommandRequest, error) {
 	}
 	rows, err := s.db.Query(`
 		SELECT `+requestColumns+` FROM command_requests
-		WHERE status IN (?, ?, ?)
-		   OR id IN (SELECT id FROM command_requests ORDER BY created_at DESC LIMIT ?)
+		WHERE deleted_at = 0 AND (status IN (?, ?, ?)
+		   OR id IN (SELECT id FROM command_requests WHERE deleted_at = 0 ORDER BY created_at DESC LIMIT ?))
 		ORDER BY created_at DESC`, statePending, stateRunning, stateAutoRunning, limit)
 	if err != nil {
 		return nil, err
@@ -788,12 +1035,12 @@ func execInsertCommandRequest(db interface {
 		INSERT INTO command_requests (
 			id, connection_id, host, user, command, executed_command, reason, requested_by, requested_at,
 			risk, approved_risk, status, stdout, stderr, duration, decided_by, decided_at, finished_at,
-			exit_code, error_kind, client_request_id, expires_at, target_fp, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			exit_code, error_kind, client_request_id, expires_at, target_fp, timeout_seconds, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		req.ID, req.ConnectionID, req.Host, req.User, req.Command, req.ExecutedCommand, req.Reason, req.RequestedBy,
 		req.RequestedAt, req.Risk, req.ApprovedRisk, req.Status, req.Stdout, req.Stderr, req.Duration, req.DecidedBy,
 		req.DecidedAt, req.FinishedAt, nullableInt(req.ExitCode), req.ErrorKind, req.ClientRequestID, req.ExpiresAt, req.TargetFP,
-		createdAt, nowRFC3339(),
+		req.TimeoutSeconds, createdAt, nowRFC3339(),
 	)
 	return err
 }
@@ -830,11 +1077,17 @@ func (s *Store) updatePendingRequestsConnection(oldName string, connID string, n
 	return err
 }
 
-// deleteCommandRequestUnlessRunning deletes the request unless it is
-// running. errStateConflict means the row is running (or already gone), so
-// nothing was deleted.
+// deleteCommandRequestUnlessRunning removes the request from the history
+// unless it is running. The row is not deleted: deleted_at is set, so it
+// drops out of the GUI list, get_request_status and get_command_history but
+// stays in SQLite as the audit record (audit #4), and a retry with the same
+// client_request_id still finds it instead of running the command again.
+// errStateConflict means the row is running (or already gone or deleted),
+// so nothing changed.
 func (s *Store) deleteCommandRequestUnlessRunning(id string) error {
-	res, err := s.db.Exec(`DELETE FROM command_requests WHERE id = ? AND status NOT IN (?, ?)`, id, stateRunning, stateAutoRunning)
+	res, err := s.db.Exec(`UPDATE command_requests SET deleted_at = ?, updated_at = ?
+		WHERE id = ? AND deleted_at = 0 AND status NOT IN (?, ?)`,
+		time.Now().UnixMilli(), nowRFC3339(), id, stateRunning, stateAutoRunning)
 	if err != nil {
 		return err
 	}
@@ -1212,9 +1465,10 @@ func (s *Store) loadRequestByClientID(agentName string, clientRequestID string, 
 	return req, true, nil
 }
 
-// loadCommandRequest returns one request by ID, including its output.
+// loadCommandRequest returns one request by ID, including its output. A
+// request deleted from the history is not found.
 func (s *Store) loadCommandRequest(id string) (CommandRequest, bool, error) {
-	req, err := scanRequest(s.db.QueryRow(`SELECT `+requestColumns+` FROM command_requests WHERE id = ?`, id))
+	req, err := scanRequest(s.db.QueryRow(`SELECT `+requestColumns+` FROM command_requests WHERE id = ? AND deleted_at = 0`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return CommandRequest{}, false, nil
 	}
@@ -1248,7 +1502,7 @@ func (s *Store) loadCommandHistory(f historyFilter) ([]CommandRequest, error) {
 		limit = defaultHistoryLimit
 	}
 	limit = min(limit, maxHistoryLimit)
-	var where []string
+	where := []string{`deleted_at = 0`}
 	var args []any
 	switch {
 	case f.ConnectionID != "" && f.HostName != "":
@@ -1269,10 +1523,7 @@ func (s *Store) loadCommandHistory(f historyFilter) ([]CommandRequest, error) {
 		where = append(where, `requested_by = ?`)
 		args = append(args, f.RequestedBy)
 	}
-	query := `SELECT ` + historyColumns + ` FROM command_requests`
-	if len(where) > 0 {
-		query += ` WHERE ` + strings.Join(where, " AND ")
-	}
+	query := `SELECT ` + historyColumns + ` FROM command_requests WHERE ` + strings.Join(where, " AND ")
 	query += ` ORDER BY created_at DESC LIMIT ?`
 	args = append(args, limit)
 	rows, err := s.db.Query(query, args...)

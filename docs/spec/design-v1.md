@@ -343,6 +343,8 @@ MCP ● 待受中 127.0.0.1:8787
   - キューに積んだ後、get_request_status で wait_seconds 以内に結果が取れる
   - 同じ client_request_id を再送しても実行は1回だけ
   - 未知のホストに MCP から実行すると hostkey_unknown のエラーになる
+  - 未知のホストが証明書を出し、一致する `@cert-authority` 行がなければ、証明書の中の鍵で TOFU する（OpenSSH と同じ）。CA 行が一致するのに検証できない証明書と、`@revoked` の CA が署名した証明書は拒否する（監査 N18 / N31）
+  - MCP から承認待ちに積んだ要求の timeout_seconds は command_requests.timeout_seconds に保存し、承認後の実行（再起動後を含む）に使う（監査 N11）
   - 鍵が不一致なら常に拒否する
   - 共有トークンだけでは承認省略を名乗れない
 - **テスト**：in-process のサーバーで HostKey を差し替えて検証します。long-poll はタイムアウトと状態変化の両方で戻ることを確認します。

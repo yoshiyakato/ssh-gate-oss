@@ -55,6 +55,20 @@ type serialModeError struct {
 
 func (e *serialModeError) Error() string { return e.Message }
 
+// serialPortOf is the port name of a serial connection. Rows saved before
+// the serialPort field existed kept the port name in Host; those are read
+// from Host so they still open (SaveConnection then moves it to SerialPort,
+// since a serial row is saved without a host).
+func serialPortOf(conn Connection) string {
+	if port := strings.TrimSpace(conn.SerialPort); port != "" {
+		return port
+	}
+	if conn.connectionType() == "Serial" {
+		return strings.TrimSpace(conn.Host)
+	}
+	return ""
+}
+
 // serialSettingsOf reads the line settings of conn, filling the defaults.
 func serialSettingsOf(conn Connection) serialSettings {
 	s := serialSettings{
@@ -438,8 +452,11 @@ func (a *App) serialPresence(goos string, ports []string) map[string]bool {
 	}
 	fresh := make(map[string]serialPresenceEntry, len(stale))
 	for _, key := range stale {
+		// at is when the probe started, so an entry never claims to be newer
+		// than what it saw (serialPresenceTick compares it with serialGone).
+		start := time.Now()
 		present, err := serialPortPresent(goos, key)
-		fresh[key] = serialPresenceEntry{present: present, known: err == nil, at: time.Now()}
+		fresh[key] = serialPresenceEntry{present: present, known: err == nil, at: start}
 		if err == nil {
 			out[key] = present
 		}
@@ -464,7 +481,7 @@ func (a *App) serialConnStates(goos string, conns []Connection) map[string]strin
 		if conn.connectionType() != "Serial" {
 			continue
 		}
-		key := serialReservationKey(goos, conn.SerialPort)
+		key := serialReservationKey(goos, serialPortOf(conn))
 		keys[conn.ID] = key
 		if key != "" {
 			ports = append(ports, key)
@@ -524,7 +541,7 @@ func (a *App) serialPresenceTick(goos string, prev map[string]bool) (next map[st
 	var conns []serialConn
 	for _, conn := range a.conns {
 		if conn.connectionType() == "Serial" {
-			conns = append(conns, serialConn{conn.ID, conn.SerialPort})
+			conns = append(conns, serialConn{conn.ID, serialPortOf(conn)})
 		}
 	}
 	a.mu.RUnlock()
@@ -539,26 +556,60 @@ func (a *App) serialPresenceTick(goos string, prev map[string]bool) (next map[st
 	}
 	next = a.serialPresence(goos, ports)
 	changed = prev != nil && !maps.Equal(prev, next)
+	probedAt := a.serialPresenceProbedAt(keyOf)
 
 	cleared := false
 	a.termMu.Lock()
 	a.ensureMaps()
 	for _, c := range conns {
 		key := keyOf[c.id]
-		// Only a real absent -> present transition counts as plugged back in.
-		// A key missing from prev (first tick, new or re-pointed port) says
-		// nothing about the device, so an open failure such as
-		// permission_denied or port_busy stays visible.
-		if p, ok := prev[key]; !next[key] || !ok || p {
+		if !next[key] {
+			continue
+		}
+		// A device_removed error (recorded only after a probe found the
+		// device absent) is over once a probe that started after it
+		// finds the device: it has been plugged back in, even if no tick saw
+		// it missing (unplug and replug within one interval).
+		if mark, ok := a.serialGone[c.id]; ok {
+			if a.lastErr[c.id] != mark.message {
+				delete(a.serialGone, c.id) // overwritten or cleared since
+			} else if at, ok := probedAt[key]; ok && at.After(mark.at) {
+				delete(a.serialGone, c.id)
+				delete(a.lastErr, c.id)
+				cleared = true
+				continue
+			}
+		}
+		// Otherwise only a real absent -> present transition counts as
+		// plugged back in. A key missing from prev (first tick, new or
+		// re-pointed port) says nothing about the device, so an open failure
+		// such as permission_denied or port_busy stays visible.
+		if p, ok := prev[key]; !ok || p {
 			continue
 		}
 		if _, ok := a.lastErr[c.id]; ok {
 			delete(a.lastErr, c.id)
+			delete(a.serialGone, c.id)
 			cleared = true
 		}
 	}
 	a.termMu.Unlock()
 	return next, changed || cleared
+}
+
+// serialPresenceProbedAt returns, for each reservation key in keyOf's values,
+// when the cached presence probe started (keys whose probe failed are
+// absent). Takes only presenceMu.
+func (a *App) serialPresenceProbedAt(keyOf map[string]string) map[string]time.Time {
+	out := make(map[string]time.Time, len(keyOf))
+	a.presenceMu.Lock()
+	defer a.presenceMu.Unlock()
+	for _, key := range keyOf {
+		if e, ok := a.presence[key]; ok && e.known {
+			out[key] = e.at
+		}
+	}
+	return out
 }
 
 // watchSerialPresence polls the serial devices every serialPresenceInterval
@@ -625,8 +676,8 @@ func (a *App) afterSerialSave(prev Connection, next Connection, r ActionResult) 
 		return r
 	}
 	goos := serialGOOS
-	if serialReservationKey(goos, prev.SerialPort) != serialReservationKey(goos, next.SerialPort) { // S7
-		r.Message += fmt.Sprintf("（開いているターミナルは旧ポート %s のままです。再接続すると反映されます）", prev.SerialPort)
+	if serialReservationKey(goos, serialPortOf(prev)) != serialReservationKey(goos, serialPortOf(next)) { // S7
+		r.Message += fmt.Sprintf("（開いているターミナルは旧ポート %s のままです。再接続すると反映されます）", serialPortOf(prev))
 		r.Code = "reconnect_required"
 		return r
 	}

@@ -1258,7 +1258,7 @@ func TestMigrationFromV0Database(t *testing.T) {
 			t.Fatalf("request not migrated: %+v", r)
 		}
 	}
-	if states["REQ-1700000000000-1"] != statePending || states["REQ-1700000000001-2"] != stateSucceeded {
+	if states["REQ-1700000000000-1"] != stateExpired || states["REQ-1700000000001-2"] != stateSucceeded {
 		t.Fatalf("status codes not migrated: %v", states)
 	}
 	if !fileExists(path + ".bak-v0") {
@@ -1374,6 +1374,8 @@ func TestApprovalTargetShowsResolvedConnectionAndFPChange(t *testing.T) {
 	// Re-pointing the connection after the request shows as a change.
 	moved, _ := app.connectionByID(conn.ID)
 	moved.User = "someone-else"
+	// #36: a changed endpoint must supply its password again.
+	moved.Credential = sshTestPassword
 	if r := app.SaveConnection(moved); !r.OK {
 		t.Fatalf("save: %s", r.Message)
 	}
@@ -1680,7 +1682,7 @@ func TestDeleteRefusesRunningRequest(t *testing.T) {
 	if _, found, err := app.store.loadCommandRequest(req.ID); err != nil || !found {
 		t.Fatalf("running row gone: found=%v err=%v", found, err)
 	}
-	app.finishRequest(func() CommandRequest { r, _ := app.findRequest(req.ID); return r }(), stateSucceeded, commandResult{}, nil)
+	_, _ = app.finishRequest(func() CommandRequest { r, _ := app.findRequest(req.ID); return r }(), stateSucceeded, commandResult{}, nil)
 	if r := app.DeleteCommandRequest(req.ID); !r.OK {
 		t.Fatalf("finished request not deleted: %+v", r)
 	}

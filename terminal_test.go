@@ -804,3 +804,78 @@ func TestSessionsChangedHook(t *testing.T) {
 		t.Fatal("close did not call sessionsChanged")
 	}
 }
+
+// #38 / N22: concurrent ResizeTerminal calls (Wails runs each on its own
+// goroutine) must leave the PTY at the size stored last, not at whichever
+// window change happened to run last.
+func TestResizeAppliesLatestUnderRace(t *testing.T) {
+	a, _ := newTerminalTestApp(t)
+	var mu sync.Mutex
+	var applied [][2]int
+	ts := &terminalSession{
+		id: "TERM-rs", connID: "c1", kind: "ssh", status: terminalStatusOpen,
+		input: make(chan []byte, 1), done: make(chan struct{}), cancel: func() {},
+		out: newOutputBuffer(func([]byte, int) {}),
+		resize: func(cols, rows int) error {
+			// Widen the window between reading the size and applying it.
+			time.Sleep(time.Duration(cols%3) * time.Millisecond)
+			mu.Lock()
+			applied = append(applied, [2]int{cols, rows})
+			mu.Unlock()
+			return nil
+		},
+	}
+	a.termMu.Lock()
+	a.ensureMaps()
+	a.terms[ts.id] = ts
+	a.termMu.Unlock()
+	for round := 0; round < 20; round++ {
+		var wg sync.WaitGroup
+		for i := 1; i <= 16; i++ {
+			wg.Add(1)
+			go func(cols int) {
+				defer wg.Done()
+				if r := a.ResizeTerminal(ts.id, cols, 24); !r.OK {
+					t.Errorf("resize: %+v", r)
+				}
+			}(80 + round*16 + i)
+		}
+		wg.Wait()
+		a.termMu.Lock()
+		want := [2]int{ts.cols, ts.rows}
+		a.termMu.Unlock()
+		mu.Lock()
+		last := applied[len(applied)-1]
+		mu.Unlock()
+		if last != want {
+			t.Fatalf("round %d: last applied %v, stored %v", round, last, want)
+		}
+	}
+}
+
+// A closing tab (reason set, closer not finished) refuses new input instead
+// of queueing it for a writer that may already be closed (N1).
+func TestSendInputRefusedWhileClosing(t *testing.T) {
+	a, _ := newTerminalTestApp(t)
+	ts := &terminalSession{
+		id: "TERM-cl", connID: "c1", kind: "ssh", status: terminalStatusOpen,
+		input: make(chan []byte, 1), done: make(chan struct{}), cancel: func() {},
+		out: newOutputBuffer(func([]byte, int) {}),
+	}
+	a.termMu.Lock()
+	a.ensureMaps()
+	a.terms[ts.id] = ts
+	a.termMu.Unlock()
+	if r := a.SendTerminalInput(ts.id, "a"); !r.OK {
+		t.Fatalf("open tab: %+v", r)
+	}
+	a.termMu.Lock()
+	ts.reason = exitReasonUser
+	a.termMu.Unlock()
+	if r := a.SendTerminalInput(ts.id, "rm -rf ~\n"); r.OK || r.Code != "no_session" {
+		t.Fatalf("closing tab: %+v", r)
+	}
+	if len(ts.input) != 1 {
+		t.Fatalf("queued %d, want only the first", len(ts.input))
+	}
+}

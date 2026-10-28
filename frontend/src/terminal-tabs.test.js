@@ -349,4 +349,121 @@ describe('terminal-tabs', () => {
     expect(mod.setTerminalServerFilter('')).toBe(true);
     for (const entry of tabs.values()) expect(entry.pane.hidden).toBe(false);
   });
+  // audit-2 N6: lost input must not be followed by later keys.
+  it('input_timeout makes the tab read-only, closes the session and offers reconnect', async () => {
+    api.StartTerminal.mockResolvedValue({ ok: true });
+    const { id } = await mod.openTerminalTab('c1');
+    const entry = mod.getTerminalState().tabs.get(id);
+    const x = entry.xterm;
+    const d1 = deferred();
+    const sent = [];
+    api.SendTerminalInput.mockImplementation(async (_id, data) => {
+      sent.push(data);
+      if (sent.length === 1) {
+        await d1.p;
+        return { ok: false, code: 'input_timeout', message: '入力の送信が詰まっています' };
+      }
+      return { ok: true };
+    });
+    x.cb('rm -rf /var/'); await tick();
+    x.cb('tmp/cache'); // pending while the first call hangs
+    d1.r(); await tick(); await tick();
+    expect(sent).toEqual(['rm -rf /var/']);
+    expect(entry.status).toBe('exited');
+    expect(entry.exitReason).toBe('input_dropped');
+    expect(x.options.disableStdin).toBe(true);
+    expect(x.written.join('')).toContain('tabs.inputDropped');
+    expect(ctx.toast).toHaveBeenCalledWith(expect.stringContaining('tabs.inputDropped'));
+    await tick();
+    expect(api.CloseTerminal).toHaveBeenCalledWith(id);
+    // Later keys go nowhere.
+    x.cb('\r'); await tick(); await tick();
+    expect(sent).toEqual(['rm -rf /var/']);
+    // The backend's exit for the closed session keeps the tab.
+    handlers['terminal:exit']({ id, reason: 'user' });
+    expect(mod.getTerminalState().tabs.get(id)).toBe(entry);
+    expect(entry.exitReason).toBe('input_dropped');
+    expect(mod.renderTerminalPage(ctx.state, ctx.t)).toContain('term-reconnect');
+    // Reconnect brings input back on a new session.
+    await mod.reconnectTerminalTab(id);
+    expect(entry.status).toBe('open');
+    expect(entry.exitReason).toBe('');
+    expect(x.options.disableStdin).toBe(false);
+    x.cb('ls\r'); await tick(); await tick();
+    expect(sent).toEqual(['rm -rf /var/', 'ls\r']);
+  });
+
+  it('a rejected SendTerminalInput call also blocks input', async () => {
+    api.StartTerminal.mockResolvedValue({ ok: true });
+    const { id } = await mod.openTerminalTab('c1');
+    const entry = mod.getTerminalState().tabs.get(id);
+    api.SendTerminalInput.mockRejectedValue(new Error('ipc down'));
+    entry.xterm.cb('a'); await tick(); await tick();
+    expect(entry.exitReason).toBe('input_dropped');
+    expect(ctx.toast).toHaveBeenCalledWith(expect.stringContaining('ipc down'));
+  });
+
+  it('no_session does not block or toast (terminal:exit tells the user)', async () => {
+    api.StartTerminal.mockResolvedValue({ ok: true });
+    const { id } = await mod.openTerminalTab('c1');
+    const entry = mod.getTerminalState().tabs.get(id);
+    api.SendTerminalInput.mockResolvedValue({ ok: false, code: 'no_session', message: 'gone' });
+    entry.xterm.cb('a'); await tick(); await tick();
+    expect(entry.status).toBe('open');
+    expect(entry.exitReason).toBe('');
+    expect(ctx.toast).not.toHaveBeenCalled();
+    expect(api.CloseTerminal).not.toHaveBeenCalled();
+  });
+
+  it('has JA and EN text for input_dropped', () => {
+    for (const lang of ['ja', 'en']) {
+      expect(mod.TERMINAL_I18N[lang]['tabs.exit.input_dropped']).toBeTruthy();
+      expect(mod.TERMINAL_I18N[lang]['tabs.inputDropped']).toBeTruthy();
+    }
+  });
+
+  // #38 / N22: one resize in flight per tab; the last one sent is the latest.
+  it('resizes are sent one at a time and collapse to the latest size', async () => {
+    api.StartTerminal.mockResolvedValue({ ok: true });
+    const { id } = await mod.openTerminalTab('c1');
+    const entry = mod.getTerminalState().tabs.get(id);
+    const d1 = deferred();
+    const calls = [];
+    api.ResizeTerminal.mockReset();
+    api.ResizeTerminal.mockImplementation(async (_id, cols) => { calls.push(cols); if (calls.length === 1) await d1.p; return { ok: true }; });
+    const resizeTo = (cols) => { entry.xterm._c = cols; mod.setTerminalPageVisible(false); mod.setTerminalPageVisible(true); };
+    resizeTo(100);
+    resizeTo(110);
+    resizeTo(120);
+    expect(calls).toEqual([100]);
+    d1.r(); await tick(); await tick();
+    expect(calls).toEqual([100, 120]);
+    expect(entry.resizing).toBe(false);
+    resizeTo(130);
+    expect(calls).toEqual([100, 120, 130]);
+    await tick();
+    expect(api.ResizeTerminal).toHaveBeenLastCalledWith(id, 130, 24);
+  });
+  // A failed resize (rejected or ok:false) must not leave lastSize at the
+  // size the PTY never took, or resizing back to it would be skipped.
+  it.each([
+    ['ok:false', () => Promise.resolve({ ok: false, message: 'x' })],
+    ['rejection', () => Promise.reject(new Error('x'))],
+  ])('resends a size whose resize failed (%s)', async (_label, fail) => {
+    api.StartTerminal.mockResolvedValue({ ok: true });
+    const { id } = await mod.openTerminalTab('c1');
+    const entry = mod.getTerminalState().tabs.get(id);
+    const calls = [];
+    api.ResizeTerminal.mockReset();
+    api.ResizeTerminal.mockImplementation((_id, cols) => { calls.push(cols); return calls.length === 1 ? fail() : Promise.resolve({ ok: true }); });
+    const resizeTo = (cols) => { entry.xterm._c = cols; mod.setTerminalPageVisible(false); mod.setTerminalPageVisible(true); };
+    resizeTo(120);
+    await tick(); await tick();
+    expect(entry.lastSize).toBeNull();
+    expect(entry.resizing).toBe(false);
+    resizeTo(120);
+    await tick();
+    expect(calls).toEqual([120, 120]);
+    expect(entry.lastSize).toEqual({ cols: 120, rows: 24 });
+  });
 });

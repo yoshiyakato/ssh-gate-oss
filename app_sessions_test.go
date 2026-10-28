@@ -416,10 +416,18 @@ func TestShutdownInterruptsMCPExec(t *testing.T) {
 		return app.runningTotal.Load() == 1
 	})
 
+	// §5.0: shutdown waits for the grace period, then cancels what is left.
+	oldGrace := shutdownExecGrace
+	shutdownExecGrace = 500 * time.Millisecond
+	t.Cleanup(func() { shutdownExecGrace = oldGrace })
 	start := time.Now()
 	app.shutdown(context.Background())
-	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+	elapsed := time.Since(start)
+	if elapsed > shutdownExecGrace+1500*time.Millisecond {
 		t.Fatalf("shutdown took %s (stalled on the MCP server deadline)", elapsed)
+	}
+	if elapsed < shutdownExecGrace {
+		t.Fatalf("shutdown took %s, want at least the %s grace period", elapsed, shutdownExecGrace)
 	}
 	var got CommandRequest
 	app.mu.RLock()

@@ -48,6 +48,18 @@ type fakeSerialPort struct {
 	closed    atomic.Bool
 	closeOnce sync.Once
 	closedCh  chan struct{}
+	// opsAfterClose counts Write / Drain / SetMode calls that started after
+	// Close: on a real unix port they would hit a reused fd (N1).
+	opsAfterClose atomic.Int32
+	// closeDelay keeps Close running after the port is marked closed, so the
+	// window between the fd close and the end of finishTerminal is wide.
+	closeDelay time.Duration
+}
+
+func (f *fakeSerialPort) checkOpen() {
+	if f.closed.Load() {
+		f.opsAfterClose.Add(1)
+	}
 }
 
 func newFakeSerialPort() *fakeSerialPort {
@@ -73,6 +85,7 @@ func (f *fakeSerialPort) op(name string) {
 }
 
 func (f *fakeSerialPort) Write(p []byte) (int, error) {
+	f.checkOpen()
 	f.op("write-begin")
 	f.mu.Lock()
 	delay, err := f.writeDelay, f.writeErr
@@ -88,6 +101,7 @@ func (f *fakeSerialPort) Write(p []byte) (int, error) {
 }
 
 func (f *fakeSerialPort) Drain() error {
+	f.checkOpen()
 	f.op("drain")
 	f.mu.Lock()
 	d := f.drainDur
@@ -97,6 +111,7 @@ func (f *fakeSerialPort) Drain() error {
 }
 
 func (f *fakeSerialPort) SetMode(mode *serial.Mode) error {
+	f.checkOpen()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ops = append(f.ops, "setmode")
@@ -109,6 +124,7 @@ func (f *fakeSerialPort) SetMode(mode *serial.Mode) error {
 func (f *fakeSerialPort) Close() error {
 	f.closed.Store(true)
 	f.closeOnce.Do(func() { close(f.closedCh) })
+	time.Sleep(f.closeDelay)
 	return nil
 }
 
@@ -1210,5 +1226,217 @@ func TestTestSerialConnectionDoesNotOpen(t *testing.T) {
 	}
 	if len(env.Opened()) != 1 {
 		t.Fatalf("opened = %v", env.Opened())
+	}
+}
+
+// ---- audit-2 N1: no port access after close ----
+
+func TestSerialHandleRefusesAfterClose(t *testing.T) {
+	port := newFakeSerialPort()
+	h := &serialHandle{port: port, settings: settingsOf(115200, 8, "none", "1")}
+	if _, err := h.Write([]byte("a")); err != nil {
+		t.Fatalf("write before close: %v", err)
+	}
+	h.closePort()
+	h.closePort() // idempotent
+	if n, err := h.Write([]byte("rm -rf ~\n")); n != 0 || !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("write after close = %d, %v", n, err)
+	}
+	if got := port.opsAfterClose.Load(); got != 0 {
+		t.Fatalf("port touched after close %d times", got)
+	}
+	if port.written.String() != "a" {
+		t.Fatalf("written = %q", port.written.String())
+	}
+}
+
+// Input queued when the tab is closed must not reach the port once Close has
+// run: on unix the fd number may already be a socket or the DB file.
+func TestSerialCloseStopsQueuedInput(t *testing.T) {
+	for round := 0; round < 5; round++ {
+		port := newFakeSerialPort()
+		port.writeDelay = 2 * time.Millisecond
+		port.closeDelay = 30 * time.Millisecond
+		withFakeSerial(t, "darwin", openFake(port), nil)
+		a, rec := newSerialTestApp(t, serialConn("s1", "board", "/dev/cu.usbserial-10"))
+		id := fmt.Sprintf("TERM-n1-%d", round)
+		mustStart(t, a, id, "s1", 80, 24)
+		for i := 0; i < 20; i++ {
+			mustSend(t, a, id, "x")
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			a.CloseTerminal(id)
+		}()
+		var lateOK atomic.Int32
+		go func() {
+			defer wg.Done()
+			// Keystrokes that race the close: none may be accepted once
+			// the port is closed.
+			for i := 0; i < 50; i++ {
+				if port.closed.Load() {
+					if r := a.SendTerminalInput(id, "rm -rf ~\n"); r.OK {
+						lateOK.Add(1)
+					}
+				} else {
+					_ = a.SendTerminalInput(id, "y")
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}()
+		wg.Wait()
+		a.terminalLoops.Wait()
+		if got := port.opsAfterClose.Load(); got != 0 {
+			t.Fatalf("round %d: %d port operations after Close", round, got)
+		}
+		if got := lateOK.Load(); got != 0 {
+			t.Fatalf("round %d: %d inputs accepted after Close", round, got)
+		}
+		if exits := rec.exits(id); len(exits) != 1 || exits[0].Reason != exitReasonUser {
+			t.Fatalf("round %d: exits = %+v", round, exits)
+		}
+	}
+}
+
+// An in-place settings change racing the close must not SetMode / Drain a
+// closed port.
+func TestSerialApplyAfterCloseDoesNotTouchPort(t *testing.T) {
+	port := newFakeSerialPort()
+	withFakeSerial(t, "linux", openFake(port), nil)
+	a, _ := newSerialTestApp(t, serialConn("s1", "board", "/dev/ttyUSB0"))
+	mustStart(t, a, "TERM-ap", "s1", 80, 24)
+	a.termMu.Lock()
+	ts := a.terms["TERM-ap"]
+	a.termMu.Unlock()
+	ts.serial.closePort()
+	if ok, err := a.applyNow(ts, settingsOf(9600, 8, "none", "1")); ok || !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("applyNow after close = %v, %v", ok, err)
+	}
+	if got := port.opsAfterClose.Load(); got != 0 {
+		t.Fatalf("port touched after close %d times", got)
+	}
+}
+
+// ---- unplug and replug within one watchSerialPresence interval ----
+
+func TestSerialQuickReplugClearsLastError(t *testing.T) {
+	port := newFakeSerialPort()
+	var present atomic.Bool
+	present.Store(true)
+	withFakeSerial(t, "darwin", openFake(port), func(string, string) (bool, error) { return present.Load(), nil })
+	serialPresenceTTL = 0
+	a, rec := newSerialTestApp(t, serialConn("s1", "board", "/dev/cu.usbserial-10"))
+	prev, _ := a.serialPresenceTick("darwin", nil)
+	mustStart(t, a, "TERM-q", "s1", 80, 24)
+	present.Store(false)
+	port.reads <- fakeRead{err: syscall.Errno(6)}
+	waitUntil(t, "exit", func() bool { return len(rec.exits("TERM-q")) > 0 })
+	a.terminalLoops.Wait()
+	if rec.exits("TERM-q")[0].Reason != exitReasonDeviceRemoved || a.terminalRuntime()["s1"].LastError == "" {
+		t.Fatalf("exit = %+v", rec.exits("TERM-q"))
+	}
+	// Plugged back in before the next tick: no tick ever saw it missing.
+	present.Store(true)
+	prev, changed := a.serialPresenceTick("darwin", prev)
+	if !changed || a.terminalRuntime()["s1"].LastError != "" {
+		t.Fatalf("quick replug: changed=%v lastErr=%q", changed, a.terminalRuntime()["s1"].LastError)
+	}
+	conns := []Connection{serialConn("s1", "board", "/dev/cu.usbserial-10")}
+	if st := a.serialConnStates("darwin", conns); st["s1"] != connStateAvailable {
+		t.Fatalf("state = %v", st)
+	}
+	if _, changed = a.serialPresenceTick("darwin", prev); changed {
+		t.Fatal("steady state reported as change")
+	}
+}
+
+// A presence result cached before the removal says nothing about a replug.
+func TestSerialQuickReplugIgnoresStaleCache(t *testing.T) {
+	port := newFakeSerialPort()
+	var present atomic.Bool
+	present.Store(true)
+	withFakeSerial(t, "darwin", openFake(port), func(string, string) (bool, error) { return present.Load(), nil })
+	serialPresenceTTL = time.Hour
+	a, rec := newSerialTestApp(t, serialConn("s1", "board", "/dev/cu.usbserial-10"))
+	prev, _ := a.serialPresenceTick("darwin", nil) // caches present
+	mustStart(t, a, "TERM-st", "s1", 80, 24)
+	present.Store(false)
+	port.reads <- fakeRead{err: syscall.Errno(6)}
+	waitUntil(t, "exit", func() bool { return len(rec.exits("TERM-st")) > 0 })
+	a.terminalLoops.Wait()
+	if _, _ = a.serialPresenceTick("darwin", prev); a.terminalRuntime()["s1"].LastError == "" {
+		t.Fatal("stale cached presence cleared device_removed")
+	}
+	// Once the cache expires, a fresh probe that sees the device clears it.
+	present.Store(true)
+	serialPresenceTTL = 0
+	if _, changed := a.serialPresenceTick("darwin", prev); !changed || a.terminalRuntime()["s1"].LastError != "" {
+		t.Fatalf("fresh probe: changed=%v lastErr=%q", changed, a.terminalRuntime()["s1"].LastError)
+	}
+}
+
+// A newer error that replaced device_removed is not cleared by the mark.
+func TestSerialGoneMarkOnlyForSameError(t *testing.T) {
+	port := newFakeSerialPort()
+	var present atomic.Bool
+	present.Store(true)
+	withFakeSerial(t, "darwin", openFake(port), func(string, string) (bool, error) { return present.Load(), nil })
+	serialPresenceTTL = 0
+	a, rec := newSerialTestApp(t, serialConn("s1", "board", "/dev/cu.usbserial-10"))
+	prev, _ := a.serialPresenceTick("darwin", nil)
+	mustStart(t, a, "TERM-g", "s1", 80, 24)
+	present.Store(false)
+	port.reads <- fakeRead{err: syscall.Errno(6)}
+	waitUntil(t, "exit", func() bool { return len(rec.exits("TERM-g")) > 0 })
+	a.terminalLoops.Wait()
+	present.Store(true)
+	a.termMu.Lock()
+	a.lastErr["s1"] = "permission denied"
+	a.termMu.Unlock()
+	if _, _ = a.serialPresenceTick("darwin", prev); a.terminalRuntime()["s1"].LastError != "permission denied" {
+		t.Fatalf("lastErr = %q", a.terminalRuntime()["s1"].LastError)
+	}
+}
+
+// ---- legacy rows that kept the port name in Host ----
+
+func TestSerialLegacyHostPort(t *testing.T) {
+	port := newFakeSerialPort()
+	env := withFakeSerial(t, "darwin", openFake(port), nil)
+	legacy := Connection{ID: "old", Name: "old board", Type: "Serial", Host: " /dev/tty.usbserial-OLD ", BaudRate: 9600}
+	a, _ := newSerialTestApp(t, legacy)
+	mustStart(t, a, "TERM-legacy", "old", 80, 24)
+	if got := env.Opened(); len(got) != 1 || got[0] != "/dev/cu.usbserial-OLD" {
+		t.Fatalf("opened = %v", got)
+	}
+	infos := a.ListTerminalSessions()
+	if len(infos) != 1 || infos[0].Port != "/dev/tty.usbserial-OLD" {
+		t.Fatalf("infos = %+v", infos)
+	}
+	if r := a.testSerialConnection(legacy); r.Code != "in_use" {
+		t.Fatalf("test = %+v", r)
+	}
+	if st := a.serialConnStates("darwin", []Connection{legacy}); st["old"] == connStateMissing {
+		t.Fatalf("state = %v", st)
+	}
+	// SerialPort wins when both are set; SSH rows never use Host as a port.
+	if got := serialPortOf(Connection{Type: "Serial", Host: "/dev/a", SerialPort: "/dev/b"}); got != "/dev/b" {
+		t.Fatalf("serialPortOf = %q", got)
+	}
+	if got := serialPortOf(Connection{Type: "SSH", Host: "web-01"}); got != "" {
+		t.Fatalf("ssh serialPortOf = %q", got)
+	}
+	if r := a.StartTerminal("TERM-none", "none", 80, 24); r.OK {
+		t.Fatalf("unknown connection = %+v", r)
+	}
+}
+
+func TestSerialEmptyPortStillRejected(t *testing.T) {
+	withFakeSerial(t, "darwin", openFake(newFakeSerialPort()), nil)
+	a, _ := newSerialTestApp(t, Connection{ID: "e", Name: "empty", Type: "Serial"})
+	if r := a.StartTerminal("TERM-e", "e", 80, 24); r.OK || r.Code != "invalid_serial_mode" {
+		t.Fatalf("empty port = %+v", r)
 	}
 }

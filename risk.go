@@ -66,7 +66,7 @@ func opaqueCommand(command string) bool {
 		}
 		for _, r := range field {
 			if r > unicode.MaxASCII {
-				if !unicode.IsPrint(r) || unicode.Is(unicode.Cf, r) || unicode.IsSpace(r) {
+				if !unicode.IsPrint(r) || unicode.Is(unicode.Cf, r) || unicode.IsSpace(r) || invisibleRune(r) {
 					return true
 				}
 				continue
@@ -93,6 +93,21 @@ func opaqueCommand(command string) bool {
 	return strings.Contains(stripped, "&")
 }
 
+// invisibleRune reports characters that unicode.IsPrint accepts but that draw
+// as nothing or as a blank: combining and enclosing marks (variation
+// selectors, U+034F, U+17B4/5 are Mn), Hangul fillers (Lo) and the braille
+// blank (So). The approval screen marks the same set (approvals.js).
+func invisibleRune(r rune) bool {
+	if unicode.In(r, unicode.Mn, unicode.Me) {
+		return true
+	}
+	switch r {
+	case 0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800, 0x034F, 0x17B4, 0x17B5:
+		return true
+	}
+	return (r >= 0xFE00 && r <= 0xFE0F) || (r >= 0xE0100 && r <= 0xE01EF)
+}
+
 // splitSegments splits on ; | && ||. Each segment is one simple command.
 func splitSegments(command string) [][]string {
 	var segments [][]string
@@ -113,20 +128,129 @@ func splitSegments(command string) [][]string {
 	return append(segments, current)
 }
 
-// wrappers run the rest of the line as a command. The value is the set of
-// their options that take a separate argument.
-var wrappers = map[string]map[string]bool{
-	"sudo":    {"-u": true, "-g": true, "-h": true, "-p": true, "-C": true, "-D": true, "-r": true, "-t": true, "-U": true},
-	"doas":    {"-u": true, "-C": true},
-	"env":     {"-u": true, "-C": true, "-S": true},
-	"nice":    {"-n": true},
-	"ionice":  {"-c": true, "-n": true, "-p": true},
+// wrapperSpec lists every option a wrapper is known to accept. args take a
+// value (as the next word, after '=' for long options, or attached to a short
+// option); flags do not; shell options make the wrapper run a shell or edit
+// files, so the line is High. Any option not listed is High: the classifier
+// cannot tell which word is the command that runs (fail closed).
+type wrapperSpec struct {
+	args, flags, shell []string
+}
+
+var wrappers = map[string]wrapperSpec{
+	"sudo": {
+		args: []string{"-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-C", "--close-from",
+			"-D", "--chdir", "-R", "--chroot", "-r", "--role", "-t", "--type", "-U", "--other-user", "-T", "--command-timeout"},
+		flags: []string{"-A", "--askpass", "-b", "--background", "-B", "--bell", "-E", "--preserve-env", "-H", "--set-home",
+			"-k", "--reset-timestamp", "-K", "--remove-timestamp", "-l", "--list", "-n", "--non-interactive",
+			"-N", "--no-update", "-P", "--preserve-groups", "-S", "--stdin", "-v", "--validate", "-V", "--version"},
+		shell: []string{"-s", "--shell", "-i", "--login", "-e", "--edit"},
+	},
+	"doas": {args: []string{"-u", "-C"}, flags: []string{"-n", "-L"}, shell: []string{"-s"}},
+	"env": {
+		args: []string{"-u", "--unset", "-C", "--chdir"},
+		flags: []string{"-", "-i", "--ignore-environment", "-0", "--null", "-v", "--debug",
+			"--default-signal", "--ignore-signal", "--block-signal", "--list-signal-handling"},
+		shell: []string{"-S", "--split-string"},
+	},
+	"nice":    {args: []string{"-n", "--adjustment"}},
+	"ionice":  {args: []string{"-c", "--class", "-n", "--classdata", "-p", "--pid", "-P", "--pgid", "-u", "--uid"}, flags: []string{"-t", "--ignore"}},
 	"nohup":   {},
-	"timeout": {"-s": true, "-k": true},
-	"time":    {},
-	"command": {},
-	"stdbuf":  {"-i": true, "-o": true, "-e": true},
-	"xargs":   {"-I": true, "-n": true, "-P": true, "-L": true, "-d": true, "-E": true, "-s": true, "-a": true},
+	"timeout": {args: []string{"-s", "--signal", "-k", "--kill-after"}, flags: []string{"--preserve-status", "--foreground", "-v", "--verbose"}},
+	// time -o/--output writes a file, so only -p is accepted.
+	"time":    {flags: []string{"-p"}},
+	"command": {flags: []string{"-p"}},
+	"stdbuf":  {args: []string{"-i", "--input", "-o", "--output", "-e", "--error"}},
+	"xargs": {
+		args: []string{"-I", "--replace", "-n", "--max-args", "-P", "--max-procs", "-L", "--max-lines", "-d", "--delimiter",
+			"-E", "-s", "--max-chars", "-a", "--arg-file", "--process-slot-var"},
+		flags: []string{"-0", "--null", "-r", "--no-run-if-empty", "-t", "--verbose", "-p", "--interactive",
+			"-x", "--exit", "-o", "--open-tty", "--show-limits"},
+	},
+}
+
+func contains(list []string, v string) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// peelWrapperOptions consumes the wrapper's own options and returns the words
+// that form the command it runs. ok is false when an option is unknown or
+// runs a shell.
+func peelWrapperOptions(name string, spec wrapperSpec, words []string) (rest []string, ok bool) {
+	for len(words) > 0 {
+		w := words[0]
+		switch {
+		case w == "--":
+			words = words[1:]
+			return finishWrapper(name, words)
+		case name == "env" && isAssignment(w):
+			words = words[1:]
+			continue
+		case name == "nice" && len(w) > 1 && w[0] == '-' && isNumber(w):
+			words = words[1:]
+			continue
+		case name == "command" && (w == "-v" || w == "-V"):
+			// command -v only looks the name up; nothing runs.
+			return nil, true
+		case !strings.HasPrefix(w, "-") || (w == "-" && name != "env"):
+			return finishWrapper(name, words)
+		}
+		words = words[1:]
+		if strings.HasPrefix(w, "--") || w == "-" {
+			key, _, hasValue := strings.Cut(w, "=")
+			switch {
+			case contains(spec.shell, key):
+				return nil, false
+			case contains(spec.args, key):
+				if !hasValue {
+					if len(words) == 0 {
+						return nil, false
+					}
+					words = words[1:]
+				}
+			case contains(spec.flags, key):
+			default:
+				return nil, false
+			}
+			continue
+		}
+		// A short option cluster such as -nu root or -n1.
+		for i := 1; i < len(w); i++ {
+			o := "-" + w[i:i+1]
+			if contains(spec.shell, o) {
+				return nil, false
+			}
+			if contains(spec.args, o) {
+				if i == len(w)-1 {
+					if len(words) == 0 {
+						return nil, false
+					}
+					words = words[1:]
+				}
+				break
+			}
+			if !contains(spec.flags, o) {
+				return nil, false
+			}
+		}
+	}
+	return finishWrapper(name, words)
+}
+
+// finishWrapper takes the operands a wrapper reads before the command.
+func finishWrapper(name string, words []string) ([]string, bool) {
+	if name == "timeout" {
+		if len(words) == 0 || !isDuration(words[0]) {
+			return nil, false
+		}
+		words = words[1:]
+	}
+	return words, true
 }
 
 // interpreters run code given as an argument, a file or stdin.
@@ -164,12 +288,9 @@ func analyzeSegment(words []string) commandAnalysis {
 		}
 		// Running something through a wrapper is never Low on its own.
 		raise("Medium")
-		words = words[1:]
-		for len(words) > 0 && (strings.HasPrefix(words[0], "-") || (name == "env" && isAssignment(words[0])) || (name == "timeout" && isDuration(words[0])) || (name == "nice" && isNumber(words[0]))) {
-			if opts[words[0]] && len(words) > 1 {
-				words = words[1:]
-			}
-			words = words[1:]
+		words, ok = peelWrapperOptions(name, opts, words[1:])
+		if !ok {
+			return commandAnalysis{risk: "High", usesSudo: true}
 		}
 	}
 	if len(words) == 0 {
@@ -195,13 +316,21 @@ func analyzeSegment(words []string) commandAnalysis {
 	return result
 }
 
+// isAssignment reports a shell assignment prefix, NAME=value or NAME+=value
+// (bash and zsh accept both before a command). Shells only accept ASCII
+// names.
 func isAssignment(word string) bool {
 	eq := strings.IndexByte(word, '=')
 	if eq <= 0 {
 		return false
 	}
-	for i, r := range word[:eq] {
-		if !(r == '_' || unicode.IsLetter(r) || (i > 0 && unicode.IsDigit(r))) {
+	name := strings.TrimSuffix(word[:eq], "+")
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if !(c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (i > 0 && c >= '0' && c <= '9')) {
 			return false
 		}
 	}
@@ -217,10 +346,17 @@ func isDuration(word string) bool {
 	return word != "" && strings.Trim(strings.TrimRight(word, "smhd"), "0123456789.") == ""
 }
 
+// hasArg reports any of values among args. A long option also matches its
+// "=value" form and the abbreviations getopt_long accepts (--out for
+// --output), so a shortened spelling cannot slip past.
 func hasArg(args []string, values ...string) bool {
 	for _, a := range args {
+		key, _, _ := strings.Cut(a, "=")
 		for _, v := range values {
-			if a == v || (strings.HasPrefix(v, "--") && strings.HasPrefix(a, v+"=")) {
+			if a == v {
+				return true
+			}
+			if strings.HasPrefix(v, "--") && strings.HasPrefix(a, "--") && len(key) > 2 && strings.HasPrefix(v, key) {
 				return true
 			}
 		}
@@ -285,7 +421,7 @@ func destructiveCommand(name string, args []string) bool {
 func readOnlyCommand(name string, args []string) bool {
 	switch name {
 	case "ls", "cat", "head", "tail", "wc", "df", "du", "free", "uptime", "uname", "whoami", "id",
-		"pwd", "stat", "file", "which", "grep", "egrep", "fgrep", "uniq", "cut", "nl", "echo", "printf",
+		"pwd", "stat", "which", "grep", "egrep", "fgrep", "uniq", "cut", "nl", "echo", "printf",
 		"true", "false", "nproc", "arch", "lsblk", "lscpu", "lsof", "ss", "netstat", "printenv",
 		"basename", "dirname", "realpath", "readlink", "md5sum", "sha1sum", "sha256sum", "sha512sum",
 		"cksum", "tac", "rev", "column", "groups", "users", "who", "w", "last", "vmstat", "iostat",
@@ -295,10 +431,13 @@ func readOnlyCommand(name string, args []string) bool {
 		return !(name == "uniq" && len(nonOptions(args)) > 1)
 	case "hostname":
 		return len(nonOptions(args)) == 0
+	case "file":
+		// file -C / --compile writes a .mgc file.
+		return !hasShortFlag(args, 'C') && !hasArg(args, "--compile")
 	case "date":
-		return !hasArg(args, "-s", "--set") && !hasArgPrefix(args, "--set=")
+		return !hasArg(args, "--set") && !dateSetsClock(args)
 	case "sort":
-		return !hasShortFlag(args, 'o') && !hasArg(args, "--output") && !hasArgPrefix(args, "--compress-program")
+		return !hasShortFlag(args, 'o') && !hasArg(args, "--output", "--compress-program")
 	case "ps", "pgrep", "pidof":
 		return true
 	case "top":
@@ -306,7 +445,8 @@ func readOnlyCommand(name string, args []string) bool {
 	case "find":
 		return !hasArg(args, "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls")
 	case "journalctl":
-		return !hasArgPrefix(args, "--vacuum", "--rotate", "--flush", "--sync", "--relinquish", "--setup-keys", "--update-catalog")
+		return !hasArgPrefix(args, "--vacuum") && !hasArg(args, "--vacuum-size", "--vacuum-time", "--vacuum-files",
+			"--rotate", "--flush", "--sync", "--relinquish-var", "--smart-relinquish-var", "--setup-keys", "--update-catalog")
 	case "systemctl":
 		switch firstOperand(args) {
 		case "status", "is-active", "is-enabled", "is-failed", "list-units", "list-unit-files", "list-timers", "list-sockets", "show", "cat":
@@ -342,13 +482,70 @@ func readOnlyCommand(name string, args []string) bool {
 			return true
 		}
 	case "ip":
-		for _, a := range args {
-			switch a {
-			case "add", "del", "delete", "set", "flush", "change", "replace", "append", "prepend", "exec", "netns":
-				return false
+		return readOnlyIP(args)
+	}
+	return false
+}
+
+// ipObjects are the ip objects whose show/list output is read-only.
+var ipObjects = map[string]bool{
+	"a": true, "addr": true, "address": true, "l": true, "link": true, "r": true, "ro": true, "route": true,
+	"n": true, "neigh": true, "neighbor": true, "neighbour": true, "ru": true, "rule": true,
+	"maddr": true, "maddress": true, "mr": true, "mroute": true, "tunnel": true, "ntable": true, "netconf": true,
+}
+
+// ipOptions are the global options that only change the output format.
+// -batch, -force and -netns are not here: -batch runs every command in a
+// file, which the classifier cannot see.
+var ipOptions = map[string]bool{
+	"-4": true, "-6": true, "-0": true, "-s": true, "-stats": true, "-statistics": true, "-d": true, "-details": true,
+	"-br": true, "-brief": true, "-c": true, "-color": true, "-j": true, "-json": true, "-p": true, "-pretty": true,
+	"-o": true, "-oneline": true, "-h": true, "-human": true, "-human-readable": true, "-r": true, "-resolve": true,
+}
+
+// readOnlyIP accepts `ip [format options] OBJECT [show|list|get ...]`. Verbs
+// are matched in full because ip accepts abbreviations (`ip r f` is route
+// flush), so anything else is not Low.
+func readOnlyIP(args []string) bool {
+	i := 0
+	for ; i < len(args) && strings.HasPrefix(args[i], "-"); i++ {
+		if args[i] == "-f" || args[i] == "-family" {
+			i++
+			continue
+		}
+		if !ipOptions[args[i]] {
+			return false
+		}
+	}
+	if i >= len(args) || !ipObjects[args[i]] {
+		return false
+	}
+	rest := args[i+1:]
+	if len(rest) == 0 {
+		return true
+	}
+	switch rest[0] {
+	case "show", "list", "lst", "get":
+		return true
+	}
+	return false
+}
+
+// dateSetsClock reports -s in a short option cluster (-s, -us). -d, -f, -r
+// and -I take the rest of the cluster as their value.
+func dateSetsClock(args []string) bool {
+	for _, a := range args {
+		if len(a) < 2 || a[0] != '-' || a[1] == '-' {
+			continue
+		}
+		for _, c := range a[1:] {
+			if c == 's' {
+				return true
+			}
+			if strings.ContainsRune("dfrI", c) {
+				break
 			}
 		}
-		return true
 	}
 	return false
 }

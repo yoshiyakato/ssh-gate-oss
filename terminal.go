@@ -53,6 +53,12 @@ type terminalState struct {
 	terms        map[string]*terminalSession // key: session id
 	serialOwners map[string]string           // serialReservationKey -> session id
 	lastErr      map[string]string           // connID -> last abnormal end / failed start
+	// serialGone remembers, per connID, a device_removed lastErr (recorded
+	// only after a probe found the device absent). Any presence probe
+	// that starts after `at` and finds the device means it was plugged back
+	// in, even when watchSerialPresence never saw it missing (an unplug and
+	// replug inside one serialPresenceInterval).
+	serialGone map[string]serialGoneMark
 
 	// terminalLoops counts the input pumps and serial read loops, so tests
 	// can wait for them before restoring package variables.
@@ -72,6 +78,22 @@ func (s *terminalState) ensureMaps() {
 	if s.lastErr == nil {
 		s.lastErr = map[string]string{}
 	}
+	if s.serialGone == nil {
+		s.serialGone = map[string]serialGoneMark{}
+	}
+}
+
+// serialGoneMark is one serialGone entry; it only counts while lastErr still
+// holds message.
+type serialGoneMark struct {
+	message string
+	at      time.Time
+}
+
+// setSerialGoneLocked records that lastErr[connID] = message means the
+// device was absent. Callers hold termMu.
+func (s *terminalState) setSerialGoneLocked(connID, message string) {
+	s.serialGone[connID] = serialGoneMark{message: message, at: time.Now()}
 }
 
 // terminalRuntime aggregates the live tabs of one connection.
@@ -107,12 +129,15 @@ type terminalSession struct {
 	baud                             int           // guarded by termMu (applySerialSettings changes it)
 	startedAt                        time.Time
 	cancel                           context.CancelFunc
-	input                            chan []byte
-	out                              *outputBuffer
-	closeOnce                        sync.Once
-	doneOnce                         sync.Once
-	done                             chan struct{} // closed once the tab is gone
-	stdinWriter                      io.Writer     // set before open; only pumpTerminalInput writes
+	// resizeMu serializes the PTY window changes of this tab, so the size
+	// applied last is the latest one ResizeTerminal stored (#38, N22).
+	resizeMu    sync.Mutex
+	input       chan []byte
+	out         *outputBuffer
+	closeOnce   sync.Once
+	doneOnce    sync.Once
+	done        chan struct{} // closed once the tab is gone
+	stdinWriter io.Writer     // set before open; only pumpTerminalInput writes
 
 	status     string
 	cols, rows int // latest size; applied after the PTY exists
@@ -130,16 +155,41 @@ type serialHandle struct {
 	applyMu sync.Mutex
 	// writeMu is a leaf lock: it is held only around port.Write, port.Drain
 	// and port.SetMode, so input and an in-place SetMode never overlap.
-	writeMu  sync.Mutex
+	writeMu sync.Mutex
+	// closed is guarded by writeMu. Once set, no Write / Drain / SetMode
+	// reaches the port: go.bug.st/serial's unix Write and ioctls use the raw
+	// fd without checking that the port is open, so after Close they would
+	// hit whatever file or socket reused the fd number (N1).
+	closed   bool
 	settings serialSettings  // guarded by termMu: what the port is set to
 	pending  *serialSettings // guarded by termMu: applied while connecting
 }
+
+// errSerialPortClosed is returned by a serialHandle after closePort.
+var errSerialPortClosed = io.ErrClosedPipe
 
 // Write is the serial tab's stdin; only pumpTerminalInput calls it.
 func (h *serialHandle) Write(p []byte) (int, error) {
 	h.writeMu.Lock()
 	defer h.writeMu.Unlock()
+	if h.closed {
+		return 0, errSerialPortClosed
+	}
 	return h.port.Write(p)
+}
+
+// closePort marks the handle closed under writeMu (waiting for a write or
+// SetMode in progress, which still uses the valid fd) and then closes the
+// port. Every later Write / applyNow fails with errSerialPortClosed. Safe to
+// call more than once.
+func (h *serialHandle) closePort() {
+	h.writeMu.Lock()
+	already := h.closed
+	h.closed = true
+	h.writeMu.Unlock()
+	if !already && h.port != nil {
+		_ = h.port.Close()
+	}
 }
 
 func (t *terminalSession) markDone() {
@@ -308,7 +358,7 @@ func (a *App) StartTerminal(id string, connID string, cols int, rows int) Action
 	}
 	if conn.connectionType() == "Serial" {
 		ts.kind = "serial"
-		ts.port = strings.TrimSpace(conn.SerialPort)
+		ts.port = serialPortOf(conn)
 		if ts.port == "" {
 			cancel()
 			return ActionResult{OK: false, Code: "invalid_serial_mode", Message: "シリアルポートが設定されていません", SessionID: id, ID: conn.ID}
@@ -380,6 +430,8 @@ var errTerminalCanceled = errors.New("terminal start canceled")
 // sent: the tab never opened.
 func (a *App) failTerminalStart(ctx context.Context, ts *terminalSession, conn Connection, message string, err error) ActionResult {
 	canceled := errors.Is(err, errTerminalCanceled) || ctx.Err() != nil
+	var serialErr *serialStartError
+	isSerialErr := errors.As(err, &serialErr)
 	ts.cancel()
 	a.termMu.Lock()
 	a.ensureMaps()
@@ -398,7 +450,6 @@ func (a *App) failTerminalStart(ctx context.Context, ts *terminalSession, conn C
 	result := ActionResult{OK: false, Message: message, SessionID: ts.id, ID: conn.ID}
 	var missing *passphraseMissingError
 	var credErr *credentialError
-	var serialErr *serialStartError
 	switch {
 	case canceled:
 		result.Code = "canceled"
@@ -407,7 +458,7 @@ func (a *App) failTerminalStart(ctx context.Context, ts *terminalSession, conn C
 		result.Code = "needs_passphrase"
 	case errors.As(err, &credErr):
 		result.Code = credErr.code
-	case errors.As(err, &serialErr):
+	case isSerialErr:
 		result.Code = serialErr.code
 	default:
 		result.Code = "connect_failed"
@@ -518,7 +569,7 @@ func (a *App) openSSHTerminal(ctx context.Context, ts *terminalSession, conn Con
 	}
 
 	ts.stdinWriter = stdin
-	nowCols, nowRows, ok := a.commitTerminal(ts,
+	_, _, ok := a.commitTerminal(ts,
 		func(cols, rows int) error { return session.WindowChange(rows, cols) },
 		func() {
 			_ = session.Close()
@@ -529,9 +580,17 @@ func (a *App) openSSHTerminal(ctx context.Context, ts *terminalSession, conn Con
 		_ = client.Close()
 		return "", errTerminalCanceled
 	}
+	// A ResizeTerminal may have stored a size while connecting. Read it
+	// under resizeMu so a concurrent ResizeTerminal cannot be overtaken by
+	// this older value.
+	ts.resizeMu.Lock()
+	a.termMu.Lock()
+	nowCols, nowRows := ts.cols, ts.rows
+	a.termMu.Unlock()
 	if nowCols != cols || nowRows != rows {
 		_ = session.WindowChange(nowRows, nowCols)
 	}
+	ts.resizeMu.Unlock()
 
 	go func() {
 		err := session.Wait()
@@ -576,8 +635,8 @@ func (a *App) openSerialTerminal(ctx context.Context, ts *terminalSession) (stri
 	// open (under termMu) also sees the port.
 	h.port = port
 	ts.stdinWriter = h
-	if _, _, ok := a.commitTerminal(ts, nil, func() { _ = port.Close() }); !ok {
-		_ = port.Close()
+	if _, _, ok := a.commitTerminal(ts, nil, h.closePort); !ok {
+		h.closePort()
 		return "", errTerminalCanceled
 	}
 	a.terminalLoops.Add(1)
@@ -680,6 +739,12 @@ func (a *App) applyNow(ts *terminalSession, s serialSettings) (bool, error) {
 	}
 	goos := serialGOOS
 	h.writeMu.Lock()
+	if h.closed {
+		// The tab is closing: the fd may already belong to something else.
+		h.writeMu.Unlock()
+		h.applyMu.Unlock()
+		return false, errSerialPortClosed
+	}
 	drainWithTimeout(h.port, serialDrainTimeout)
 	err := h.port.SetMode(s.mode())
 	if err != nil && goos != "windows" {
@@ -783,6 +848,9 @@ func (a *App) finishTerminal(ts *terminalSession, reason string, exitCode *int, 
 		default:
 			if !a.hasOpenTerminalLocked(ts.connID) {
 				a.lastErr[ts.connID] = message
+				if reason == exitReasonDeviceRemoved {
+					a.setSerialGoneLocked(ts.connID, message)
+				}
 			}
 		}
 		a.termMu.Unlock()
@@ -825,8 +893,11 @@ func (a *App) SendTerminalInput(id string, data string) ActionResult {
 	}
 	a.termMu.Lock()
 	ts := a.terms[id]
+	// A tab that is closing (reason set before its closer runs) takes no
+	// more input: it would only be dropped, or written after the close (N1).
+	closing := ts != nil && ts.reason != ""
 	a.termMu.Unlock()
-	if ts == nil {
+	if ts == nil || closing {
 		return ActionResult{OK: false, Code: "no_session", Message: "ターミナルが接続されていません", SessionID: id}
 	}
 	timer := time.NewTimer(terminalInputTimeout)
@@ -854,7 +925,15 @@ func (a *App) ResizeTerminal(id string, cols int, rows int) ActionResult {
 		return ActionResult{OK: false, Code: "no_session", Message: "ターミナルが接続されていません", SessionID: id}
 	}
 	ts.cols, ts.rows = cols, rows
+	a.termMu.Unlock()
+	// Calls may arrive on separate goroutines in any order. Under resizeMu,
+	// apply whatever size is stored now, so the last window change applied
+	// is always the latest stored size.
+	ts.resizeMu.Lock()
+	defer ts.resizeMu.Unlock()
+	a.termMu.Lock()
 	resize := ts.resize
+	cols, rows = ts.cols, ts.rows
 	a.termMu.Unlock()
 	if resize == nil {
 		return ActionResult{OK: true}
@@ -1051,7 +1130,7 @@ func (a *App) ListSerialPorts() []string {
 // opening toggles DTR, which resets many boards, and fails with EBUSY while
 // our own terminal holds the port. Code is in_use / available / missing.
 func (a *App) testSerialConnection(conn Connection) ActionResult {
-	port := strings.TrimSpace(conn.SerialPort)
+	port := serialPortOf(conn)
 	if port == "" {
 		return ActionResult{OK: false, Message: "シリアルポートが設定されていません", ID: conn.ID}
 	}

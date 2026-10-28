@@ -45,6 +45,8 @@ export const TERMINAL_I18N = {
     'tabs.exit.conn_lost': '接続が切れました',
     'tabs.exit.device_removed': 'デバイスが外れました',
     'tabs.exit.io_error': '入出力エラー',
+    'tabs.exit.input_dropped': '入力の一部を送れませんでした',
+    'tabs.inputDropped': '入力の一部を送れなかったため、このタブへの入力を止めました。途中が欠けた行が実行されないよう、セッションを閉じました。再接続してください',
     'tabs.selectTarget': '接続先',
     'tabs.noConnections': '接続先がありません',
     'tabs.unnamed': '無名',
@@ -69,6 +71,8 @@ export const TERMINAL_I18N = {
     'tabs.exit.conn_lost': 'Connection lost',
     'tabs.exit.device_removed': 'Device removed',
     'tabs.exit.io_error': 'I/O error',
+    'tabs.exit.input_dropped': 'Some input could not be sent',
+    'tabs.inputDropped': 'Some input could not be sent, so this tab no longer accepts input. The session was closed so that a line with missing parts cannot run. Reconnect to continue',
     'tabs.selectTarget': 'Connection',
     'tabs.noConnections': 'No connections',
     'tabs.unnamed': 'Unnamed',
@@ -76,6 +80,9 @@ export const TERMINAL_I18N = {
 };
 
 const EXIT_REASONS = ['user', 'remote_exit', 'conn_lost', 'device_removed', 'io_error'];
+// Local exit reason (never sent by the backend): input was lost, so the tab
+// was made read-only and its session closed (audit-2 N6).
+const INPUT_DROPPED = 'input_dropped';
 // One SendTerminalInput carries at most this many UTF-16 code units (the
 // backend limit is 64KiB of bytes, so 16Ki chars always fits).
 const INPUT_CHUNK = 16 * 1024;
@@ -85,7 +92,7 @@ const INPUT_CHUNK = 16 * 1024;
 const RECONCILE_MISSES = 2;
 
 const terminal = {
-  tabs: new Map(), // id -> { id, connId, kind, baseName, n, label, status, xterm, fit, onDataDisp, sendQueue, pendingInput, sending, lastSize, needsFit, pane, usedSeq, restored, misses }
+  tabs: new Map(), // id -> { id, connId, kind, baseName, n, label, status, xterm, fit, onDataDisp, sendQueue, pendingInput, sending, lastSize, resizing, needsFit, pane, usedSeq, restored, misses }
   order: [],       // id の表示順
   activeId: '',
 };
@@ -253,12 +260,36 @@ function currentSize(entry) {
   return { cols: entry.xterm.cols || 80, rows: entry.xterm.rows || 24 };
 }
 
+// Resizes go out one at a time per tab: Wails runs each call on its own
+// goroutine, so overlapping calls could reach the PTY in any order (#38).
+// While one is in flight, later sizes collapse into the latest.
 function syncSize(entry) {
   if (entry.status !== 'open') return;
   const size = currentSize(entry);
   if (entry.lastSize && entry.lastSize.cols === size.cols && entry.lastSize.rows === size.rows) return;
   entry.lastSize = size;
-  Promise.resolve(ResizeTerminal(entry.id, size.cols, size.rows)).catch(() => {});
+  if (entry.resizing) return;
+  entry.resizing = true;
+  void (async () => {
+    let sent = null;
+    try {
+      while (entry.status === 'open' && entry.lastSize && entry.lastSize !== sent) {
+        sent = entry.lastSize;
+        let failed = false;
+        try {
+          const result = await ResizeTerminal(entry.id, sent.cols, sent.rows);
+          failed = result?.ok === false;
+        } catch (error) {
+          failed = true;
+        }
+        // Forget a size the PTY did not take, so the next syncSize sends it
+        // again instead of matching it and returning early.
+        if (failed && entry.lastSize === sent) entry.lastSize = null;
+      }
+    } finally {
+      entry.resizing = false;
+    }
+  })();
 }
 
 function createTab(id, connId, kind, baseName, n) {
@@ -295,6 +326,7 @@ function createTab(id, connId, kind, baseName, n) {
     pendingInput: '',
     sending: false,
     lastSize: null,
+    resizing: false,
     needsFit: true,
     pane,
     usedSeq: 0,
@@ -449,13 +481,36 @@ async function flushInput(entry) {
       if (!result?.ok) {
         entry.pendingInput = '';
         // no_session: the session is gone and terminal:exit tells the user.
-        if (result?.code !== 'no_session' && result?.message) ctx?.toast?.(result.message);
+        if (result?.code === 'no_session') break;
+        // input_timeout (or a call that failed outright): this chunk and
+        // whatever was typed after it are lost. Sending later keys would
+        // splice them onto the earlier ones and run a line with a hole in
+        // it, so the tab stops taking input and its session is closed
+        // (which also discards the partial line on the remote side).
+        blockInput(entry, result);
         break;
       }
     }
   } finally {
     entry.sending = false;
   }
+}
+
+// blockInput makes the tab read-only after lost input (N6): it is marked
+// exited with reason input_dropped, so the toolbar offers 「再接続」, and the
+// backend session is closed. The terminal:exit(user) that follows is ignored
+// because the tab is already exited.
+function blockInput(entry, result) {
+  if (entry.status === 'exited') return;
+  const id = entry.id;
+  entry.exitReason = INPUT_DROPPED;
+  markExited(entry, `\r\n\x1b[31m[${tr('tabs.inputDropped')}]\x1b[0m\r\n`);
+  const detail = result?.message ? `: ${result.message}` : '';
+  ctx?.toast?.(`${tr('tabs.inputDropped')}${detail}`);
+  renderTabsIfVisible();
+  Promise.resolve()
+    .then(() => CloseTerminal(id))
+    .catch(() => {});
 }
 
 // ---- backend events ------------------------------------------------------
@@ -487,6 +542,9 @@ function markExited(entry, line) {
 function onTerminalExit(payload) {
   const entry = payload && terminal.tabs.get(payload.id);
   if (!entry) return;
+  // Ended here after lost input: the backend's exit for the session we
+  // closed must not remove the tab or overwrite its reason.
+  if (entry.status === 'exited' && entry.exitReason === INPUT_DROPPED) return;
   if (payload.reason === 'user') {
     removeTab(payload.id);
   } else {

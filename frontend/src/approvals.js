@@ -60,6 +60,8 @@ export const APPROVALS_I18N = {
     'appr.code.bearer_required': '承認省略には、MCP設定で発行するBearerトークンかエージェント専用トークンが必要です。要求は承認待ちのままです',
     'appr.code.target_changed': '要求後に実行先が変わったため承認できませんでした。拒否してエージェントに再依頼させてください',
     'appr.code.shutting_down': '終了処理中のため承認できません',
+    'appr.code.canceled': '切断されたため実行しませんでした',
+    'appr.code.storage': '実行しましたが、結果をデータベースに保存できませんでした。表示中の結果は再起動後に残りません',
     'appr.code.serial_not_supported': 'シリアルの接続先では承認・実行できません。この要求は拒否してください',
     'appr.riskCanceled': '承認を取りやめました。修正したコマンドはそのまま残しています',
     'appr.bypassRiskIncreased': '修正でリスクが上がったため、承認省略つきでは承認できません。修正したコマンドは残しています。内容を確認して「承認して実行」を使ってください',
@@ -69,6 +71,13 @@ export const APPROVALS_I18N = {
     'appr.bypass.ask': 'よろしいですか？',
     'appr.bypass.until': '{time} まで',
     'appr.bypass.inactive': '専用トークンが無いため無効',
+    'appr.stillPending': '要求は承認待ちのままです。修正したコマンドは残しています',
+    'appr.bypassResult.granted': 'このエージェントの承認省略を許可しました',
+    'appr.bypassResult.inactive': 'このエージェントの承認省略を許可しました（エージェント専用トークンを発行するまでは有効になりません）',
+    'appr.bypassResult.failed': '承認省略を保存できませんでした',
+    'appr.hidden.warning': 'このコマンドには、見えない文字・表示順を入れ替える文字・ASCII以外の記号が含まれています。画面の見た目と実際に実行される内容が違う可能性があります。該当する文字を <U+XXXX> で示しています',
+    'appr.hidden.fieldWarning': '要求元または理由に見えない文字などが含まれています（<U+XXXX> で表示）',
+    'appr.hidden.preview': '実際の文字（見えない文字を表示）',
   },
   en: {
     'appr.target.title': 'Execution target',
@@ -100,6 +109,8 @@ export const APPROVALS_I18N = {
     'appr.code.bearer_required': 'Approval bypass needs a Bearer token or an agent token (issue one in MCP settings). The request is still pending',
     'appr.code.target_changed': 'Not approved: the target changed after the request. Reject it and have the agent ask again',
     'appr.code.shutting_down': 'Cannot approve while the app is shutting down',
+    'appr.code.canceled': 'Not run: the connection was disconnected',
+    'appr.code.storage': 'The command ran, but its result could not be saved to the database; the shown result will not survive a restart',
     'appr.code.serial_not_supported': 'Commands cannot be approved or run on a serial connection. Reject this request',
     'appr.riskCanceled': 'Approval canceled. Your edited command is kept',
     'appr.bypassRiskIncreased': 'The edit raised the risk, so it cannot be approved with bypass. Your edit is kept; review it and use “Approve & Execute”',
@@ -109,11 +120,18 @@ export const APPROVALS_I18N = {
     'appr.bypass.ask': 'Continue?',
     'appr.bypass.until': 'until {time}',
     'appr.bypass.inactive': 'inactive: no agent token',
+    'appr.stillPending': 'The request is still pending; your edited command is kept',
+    'appr.bypassResult.granted': 'Approval bypass was turned on for this agent',
+    'appr.bypassResult.inactive': 'Approval bypass was turned on for this agent (it does nothing until you issue an agent token)',
+    'appr.bypassResult.failed': 'Approval bypass could not be saved',
+    'appr.hidden.warning': 'This command contains invisible characters, characters that reorder the display, or symbols outside ASCII. What you see may not be what runs. Those characters are shown as <U+XXXX>',
+    'appr.hidden.fieldWarning': 'The agent name or the reason contains invisible or unusual characters (shown as <U+XXXX>)',
+    'appr.hidden.preview': 'Actual characters (invisible ones shown)',
   },
 };
 
 // The ActionResult codes approve can return (approval.go).
-export const APPROVAL_CODES = Object.freeze(['not_pending', 'expired', 'risk_increased', 'bearer_required', 'target_changed', 'shutting_down', 'serial_not_supported']);
+export const APPROVAL_CODES = Object.freeze(['not_pending', 'expired', 'risk_increased', 'bearer_required', 'target_changed', 'shutting_down', 'serial_not_supported', 'canceled', 'storage']);
 
 export function createApprovalsState() {
   return {
@@ -242,10 +260,78 @@ export function resolvedByLabel(resolvedBy, t) {
 
 // approvalResultMessage is the toast for an approve / reject result: the
 // localized text for a known failure code, otherwise the backend message.
+// The localized text keeps what the backend message would have said: that
+// the request is still pending, and what happened to the approval bypass
+// (with the backend detail when it, or saving the result, failed).
 export function approvalResultMessage(result, t) {
-  if (result && !result.ok && APPROVAL_CODES.includes(result.code)) return t(`appr.code.${result.code}`);
-  return String(result?.message ?? '');
+  if (!(result && !result.ok && APPROVAL_CODES.includes(result.code))) return String(result?.message ?? '');
+  const parts = [t(`appr.code.${result.code}`)];
+  if (result.pending && result.code !== 'bearer_required') parts.push(t('appr.stillPending'));
+  if (result.bypass === 'granted' || result.bypass === 'inactive' || result.bypass === 'failed') {
+    parts.push(t(`appr.bypassResult.${result.bypass}`));
+  }
+  const message = String(result.message ?? '').trim();
+  if ((result.code === 'storage' || result.bypass === 'failed') && message) parts.push(`(${message})`);
+  return parts.join(' / ');
 }
+
+// ------------------------------------------------- hidden-character marking
+
+// plainDisplayChar is the one rule for what the approval screen draws as is:
+// printable ASCII and Japanese text (kana, kanji, CJK punctuation, full- and
+// half-width forms). Everything else (control, format and bidi characters,
+// combining marks, fillers, other scripts) is drawn as a <U+XXXX> badge, so
+// nothing can hide or reorder what the approver reads.
+export function plainDisplayChar(cp, { newline = false } = {}) {
+  if (cp >= 0x20 && cp <= 0x7e) return true;
+  if (newline && cp === 0x0a) return true;
+  return (cp >= 0x3001 && cp <= 0x303f)
+    || (cp >= 0x3041 && cp <= 0x3096)
+    || (cp >= 0x309b && cp <= 0x30ff)
+    || (cp >= 0x31f0 && cp <= 0x31ff)
+    || (cp >= 0x3400 && cp <= 0x4dbf)
+    || (cp >= 0x4e00 && cp <= 0x9fff)
+    || (cp >= 0xf900 && cp <= 0xfaff)
+    || (cp >= 0xff01 && cp <= 0xff5e)
+    || (cp >= 0xff61 && cp <= 0xff9f);
+}
+
+export function codePointLabel(cp) {
+  return `<U+${cp.toString(16).toUpperCase().padStart(4, '0')}>`;
+}
+
+export function hasHiddenChars(value, options) {
+  for (const ch of String(value ?? '')) {
+    if (!plainDisplayChar(ch.codePointAt(0), options)) return true;
+  }
+  return false;
+}
+
+// markedText returns DOM nodes for value: plain runs as text nodes, every
+// other character as a badge carrying its code point (all via textContent).
+export function markedText(value, options) {
+  const nodes = [];
+  let run = '';
+  for (const ch of String(value ?? '')) {
+    const cp = ch.codePointAt(0);
+    if (plainDisplayChar(cp, options)) {
+      run += ch;
+      continue;
+    }
+    if (run) nodes.push(document.createTextNode(run));
+    run = '';
+    const badge = document.createElement('span');
+    badge.className = 'badge text-bg-danger hidden-char';
+    badge.textContent = codePointLabel(cp);
+    nodes.push(badge);
+  }
+  if (run) nodes.push(document.createTextNode(run));
+  return nodes;
+}
+
+// Isolates the text from the surrounding direction so any bidi character
+// that is drawn raw (the editable textarea) cannot reorder its neighbours.
+const LTR_STYLE = 'unicode-bidi: plaintext; direction: ltr';
 
 export function riskConfirmText(result, t, lang) {
   // The backend message (JA) carries the "Low → High" detail.
@@ -364,9 +450,9 @@ export function requestRow(request, selectedId, { unknown = false, t }) {
       el('div', { class: 'fw-bold', text: request.id }),
       el('small', {},
         unknown ? unknownBadge(t) : null,
-        `${request.host || '-'} / ${request.requestedBy || t('cmd.unknownAgent')} / ${formatTimestamp(request.requestedAt)}`)),
+        markedText(`${request.host || '-'} / ${request.requestedBy || t('cmd.unknownAgent')} / ${formatTimestamp(request.requestedAt)}`))),
     statusBadge(request.status, t)),
-  el('code', { class: 'd-block mt-2 small text-truncate', text: request.command ?? '' }));
+  el('code', { class: 'd-block mt-2 small text-truncate', dir: 'ltr', style: LTR_STYLE }, markedText(request.command ?? '')));
 }
 
 export function historyTable(requests, selectedId, unknownIds, t) {
@@ -385,12 +471,12 @@ export function historyTable(requests, selectedId, unknownIds, t) {
   el('td', { class: 'text-nowrap', text: formatTimestamp(request.requestedAt) }),
   el('td', {},
     unknownIds?.has(request.id) ? unknownBadge(t) : null,
-    request.host || '-',
+    markedText(request.host || '-'),
     el('br'),
-    el('small', { class: 'text-secondary', text: request.requestedBy || t('cmd.unknownAgent') })),
+    el('small', { class: 'text-secondary' }, markedText(request.requestedBy || t('cmd.unknownAgent')))),
   el('td', {}, statusBadge(request.status, t)),
-  el('td', {}, el('code', { text: request.executedCommand || request.command || '' })),
-  el('td', { text: request.reason || '-' }),
+  el('td', {}, el('code', { dir: 'ltr', style: LTR_STYLE }, markedText(request.executedCommand || request.command || ''))),
+  el('td', {}, markedText(request.reason || '-', { newline: true })),
   el('td', { class: 'text-end' },
     el('button', {
       class: 'btn btn-outline-danger btn-sm',
@@ -403,10 +489,14 @@ export function historyTable(requests, selectedId, unknownIds, t) {
 }
 
 function metaLine(selected, t) {
-  let line = `${selected.host || '-'} · ${formatTimestamp(selected.requestedAt)} · risk ${selected.risk ?? ''}`;
-  if (selected.decidedAt) line += ` · ${t('cmd.decided')} ${formatTimestamp(selected.decidedAt)} (${selected.decidedBy ?? ''})`;
-  if (selected.exitCode !== null && selected.exitCode !== undefined) line += ` · ${t('cmd.exitCode')} ${selected.exitCode}`;
-  return el('div', { class: 'small text-secondary mb-3', text: line });
+  let tail = '';
+  if (selected.decidedAt) tail += ` · ${t('cmd.decided')} ${formatTimestamp(selected.decidedAt)} (${selected.decidedBy ?? ''})`;
+  if (selected.exitCode !== null && selected.exitCode !== undefined) tail += ` · ${t('cmd.exitCode')} ${selected.exitCode}`;
+  const high = selected.risk === 'High';
+  return el('div', { class: 'small text-secondary mb-3' },
+    markedText(`${selected.host || '-'} · ${formatTimestamp(selected.requestedAt)} · `),
+    el('span', { class: high ? 'text-danger fw-bold approval-risk-high' : '', text: `risk ${selected.risk ?? ''}` }),
+    markedText(tail));
 }
 
 function agentLine(selected, ctx) {
@@ -419,7 +509,7 @@ function agentLine(selected, ctx) {
   return el('div', { class: 'command-agent mb-3' },
     el('span', { text: t('cmd.agent') }),
     ' ',
-    el('strong', { text: selected.requestedBy || t('cmd.unknownAgent') }),
+    el('strong', {}, markedText(selected.requestedBy || t('cmd.unknownAgent'))),
     bypassing ? [
       ' ',
       el('em', { text: notes.length ? `${t('cmd.bypassing')} (${notes.join(', ')})` : t('cmd.bypassing') }),
@@ -445,6 +535,7 @@ export function commandDetail(selected, ctx) {
   const pending = selected.status === 'pending';
   const executed = selected.executedCommand || '';
   const edited = executed && executed !== selected.command;
+  const hiddenCommand = hasHiddenChars(selected.command) || hasHiddenChars(executed);
 
   const commandBlock = pending
     ? [
@@ -456,16 +547,27 @@ export function commandDetail(selected, ctx) {
         spellcheck: 'false',
         autocapitalize: 'none',
         autocorrect: 'off',
+        dir: 'ltr',
+        style: LTR_STYLE,
         value: selected.command ?? '',
       }),
       el('div', { class: 'form-text', text: t('cmd.editHint') }),
+      hiddenCommand ? el('div', { class: 'mt-2 approval-hidden-preview' },
+        el('div', { class: 'small fw-bold', text: t('appr.hidden.preview') }),
+        el('pre', { class: 'command-block mb-0' }, el('code', { dir: 'ltr', style: LTR_STYLE }, markedText(selected.command ?? '')))) : null,
     ]
     : [
-      el('pre', { class: 'command-block' }, el('code', { text: executed || selected.command || '' })),
-      edited ? el('div', { class: 'small text-warning-emphasis mt-1' }, `${t('cmd.edited')}: `, el('code', { text: selected.command ?? '' })) : null,
+      el('pre', { class: 'command-block' }, el('code', { dir: 'ltr', style: LTR_STYLE }, markedText(executed || selected.command || ''))),
+      edited ? el('div', { class: 'small text-warning-emphasis mt-1' }, `${t('cmd.edited')}: `, el('code', { dir: 'ltr', style: LTR_STYLE }, markedText(selected.command ?? ''))) : null,
     ];
+  const hiddenFields = hasHiddenChars(selected.requestedBy) || hasHiddenChars(selected.reason, { newline: true });
+  const warnings = [
+    hiddenCommand ? el('div', { class: 'alert alert-danger py-2 approval-hidden-warning', role: 'alert', text: t('appr.hidden.warning') }) : null,
+    hiddenFields ? el('div', { class: 'alert alert-warning py-2 approval-hidden-field-warning', role: 'alert', text: t('appr.hidden.fieldWarning') }) : null,
+  ];
 
   const body = el('div', { class: 'card-body' },
+    warnings,
     agentLine(selected, ctx),
     metaLine(selected, t),
     pending ? targetPanel(selected.id, cachedTarget(state, selected.id), t) : null,
@@ -476,7 +578,7 @@ export function commandDetail(selected, ctx) {
       commandBlock),
     el('div', { class: 'mb-3' },
       el('h5', { class: 'fw-bold', text: t('cmd.reason') }),
-      el('div', { class: 'reason-box', text: selected.reason || t('cmd.reasonEmpty') })),
+      el('div', { class: 'reason-box', dir: 'ltr', style: LTR_STYLE }, markedText(selected.reason || t('cmd.reasonEmpty'), { newline: true }))),
     el('div', { class: 'row g-3' },
       terminalPanel('stdout', selected.stdout || (pending ? t('cmd.stdoutPlaceholder') : t('cmd.stdoutEmpty'))),
       terminalPanel('stderr', selected.stderr || t('cmd.stderrPlaceholder'), true)));
@@ -704,8 +806,10 @@ async function approve(ctx, view, button, { bypass }) {
     ctx.bumpGen();
     result = await ApproveCommandConfirmed(id, command);
   }
-  if (!result?.ok && result?.code === 'bearer_required') {
-    // Nothing changed on the backend; the request is still pending.
+  if (!result?.ok && (result?.code === 'bearer_required' || result?.pending)) {
+    // Nothing changed on the backend (bearer_required, or a disconnect or
+    // shutdown before the request left pending): keep the edited command
+    // rather than redrawing the agent's original over it.
     keepEdit(ctx, button);
     ctx.toast(approvalResultMessage(result, t));
     return;

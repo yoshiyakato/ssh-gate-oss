@@ -441,7 +441,7 @@ func (a *App) executeCommandTool(ctx context.Context, caller mcpCaller, args exe
 
 	risk := classifyRisk(args.Command)
 	if a.needsHumanApproval(conn, risk, args.Command, caller, agentName, args.ForceQueue) {
-		req, err := a.queueCommand(conn, args.Command, args.Reason, agentName, risk, args.ClientRequestID)
+		req, err := a.queueCommandWithTimeout(conn, args.Command, args.Reason, agentName, risk, args.ClientRequestID, args.TimeoutSeconds)
 		if err != nil {
 			return toolError("storage", err.Error(), nil), nil
 		}
@@ -472,9 +472,13 @@ func (a *App) runBypassedCommand(ctx context.Context, conn Connection, args exec
 	// outlive the request after RequestTimeout; clientGone is how an HTTP
 	// disconnect cancels it while the agent still waits.
 	runCtx, clientGone := context.WithCancelCause(a.appCtx)
-	execCtx, finishExec, ok := a.beginExec(runCtx, conn.ID)
+	// Reserved before the auto_running record so a disconnect between the
+	// record and the SSH start cancels it (N2); counted as running only once
+	// the record exists (merge audit #2).
+	reservation, ok := a.reserveExec(runCtx, conn.ID)
+	execCtx := reservation.ctx
 	release := func() {
-		finishExec()
+		reservation.release()
 		clientGone(nil)
 		a.mcpRuntime.releaseExec()
 	}
@@ -492,6 +496,7 @@ func (a *App) runBypassedCommand(ctx context.Context, conn Connection, args exec
 		release()
 		return toolError("storage", err.Error(), nil)
 	}
+	reservation.activate()
 	// Recorded: a retry now finds it by client_request_id.
 	unlockKey()
 
@@ -505,11 +510,19 @@ func (a *App) runBypassedCommand(ctx context.Context, conn Connection, args exec
 			clientGone(errClientGone)
 		}
 	})
-	done := make(chan CommandRequest, 1)
+	done := make(chan finishedRun, 1)
 	go func() {
 		// Released after finishRequest, so the drain sees the stored outcome.
 		defer release()
-		result, execErr := a.executeSSH(execCtx, conn, args.Command, args.TimeoutSeconds, mcpCredentialTimeout)
+		var result commandResult
+		var execErr error
+		if cause := stopCauseOf(execCtx); cause != nil {
+			// Disconnected (or shut down, or the client left) before the
+			// SSH start: record it without running the command.
+			execErr = cause
+		} else {
+			result, execErr = a.executeSSH(execCtx, conn, args.Command, args.TimeoutSeconds, mcpCredentialTimeout)
+		}
 		state := stateAutoSucceeded
 		switch {
 		case execErr == nil:
@@ -520,20 +533,26 @@ func (a *App) runBypassedCommand(ctx context.Context, conn Connection, args exec
 			// errDisconnected stays auto_failed with error_kind canceled.
 			state = stateAutoFailed
 		}
-		final := a.finishRequest(req, state, result, execErr)
+		final, err := a.finishRequest(req, state, result, execErr)
 		if final.ID == "" {
 			final = req
 			final.Status = state
 		}
-		done <- final
+		done <- finishedRun{req: final, err: err}
 	}()
 
 	timer := time.NewTimer(a.syncResponseLimit())
 	defer timer.Stop()
 	select {
-	case final := <-done:
+	case run := <-done:
 		stopWatch()
-		return toolResult(executeView(final), executeFailed(final))
+		var notSaved *errFinalStateNotSaved
+		if errors.As(run.err, &notSaved) {
+			// The command ran but SQLite refused its outcome (audit #37).
+			return toolError("storage", "the command ran but its result could not be saved: "+notSaved.err.Error(),
+				map[string]any{"request_id": run.req.ID, "state": run.req.Status})
+		}
+		return toolResult(executeView(run.req), executeFailed(run.req))
 	case <-timer.C:
 		// Detach: from here on only shutdown cancels the command.
 		stopWatch()
@@ -547,6 +566,12 @@ func (a *App) runBypassedCommand(ctx context.Context, conn Connection, args exec
 		current = latest
 	}
 	return toolResult(executeView(current), false)
+}
+
+// finishedRun is a bypassed run's recorded outcome and finishRequest's error.
+type finishedRun struct {
+	req CommandRequest
+	err error
 }
 
 // syncResponseLimit is how long execute_command waits for a bypassed command

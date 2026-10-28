@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -1099,5 +1100,130 @@ func TestMigrateCredentialsScrubsOnUpgradeWithoutMoves(t *testing.T) {
 		if n := fileContainsAny(t, f, plaintextPasswords); n != "" {
 			t.Fatalf("%s still holds %q", filepath.Base(f), n)
 		}
+	}
+}
+
+// #12: the pre-migration backup holds every credential and is owner-only
+// from the moment it exists; the config directory is tightened too.
+func TestMigrationBackupIsOwnerOnly(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX modes")
+	}
+	path := makeV2Database(t, time.Now().Format(time.RFC3339))
+	if err := os.Chmod(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store, err := openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	info, err := os.Stat(path + ".bak-v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := info.Mode().Perm(); mode != 0o600 {
+		t.Fatalf("backup mode %o, want 600", mode)
+	}
+	if dir, _ := os.Stat(filepath.Dir(path)); dir.Mode().Perm() != 0o700 {
+		t.Fatalf("config dir mode %o, want 700", dir.Mode().Perm())
+	}
+}
+
+// #47: a pre-v2 "承認待ち" row is never migrated into an approvable pending
+// request: with traces of a run it is interrupted, otherwise expired.
+func TestMigrationLegacyAwaitingApprovalIsNotPending(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ssh-gete.sqlite")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE connections (name TEXT PRIMARY KEY, host TEXT NOT NULL, port INTEGER NOT NULL, user TEXT NOT NULL,
+			auth_method TEXT NOT NULL, credential TEXT NOT NULL, connect_timeout INTEGER NOT NULL, command_timeout INTEGER NOT NULL,
+			tags_json TEXT NOT NULL, description TEXT NOT NULL, status TEXT NOT NULL, last_checked TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+		`CREATE TABLE command_requests (id TEXT PRIMARY KEY, host TEXT NOT NULL, user TEXT NOT NULL, command TEXT NOT NULL,
+			reason TEXT NOT NULL, requested_by TEXT NOT NULL, requested_at TEXT NOT NULL, risk TEXT NOT NULL, status TEXT NOT NULL,
+			stdout TEXT NOT NULL, stderr TEXT NOT NULL, duration TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at TEXT NOT NULL)`,
+		`INSERT INTO command_requests VALUES ('REQ-1700000000000-1','old','u','whoami','','a','12:00:00','Low','承認待ち','','','-',1700000000000,'')`,
+		`INSERT INTO command_requests VALUES ('REQ-1700000000001-2','old','u','systemctl restart app','','a','12:00:01','High','承認待ち','','','1.2s',1700000000001,'')`,
+		`INSERT INTO command_requests VALUES ('REQ-1700000000002-3','old','u','rm -rf /tmp/b','','a','12:00:02','High','承認待ち','partial','','-',1700000000002,'')`,
+		`INSERT INTO command_requests VALUES ('REQ-1700000000003-4','old','u','ls','','a','12:00:03','Low','実行済み','out','','1s',1700000000003,'')`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.Close()
+	store, err := openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	reqs, err := store.loadCommandRequests(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, r := range reqs {
+		got[r.ID] = r.Status
+	}
+	want := map[string]string{
+		"REQ-1700000000000-1": stateExpired,
+		"REQ-1700000000001-2": stateInterrupted,
+		"REQ-1700000000002-3": stateInterrupted,
+		"REQ-1700000000003-4": stateSucceeded,
+	}
+	for id, state := range want {
+		if got[id] != state {
+			t.Fatalf("%s: %s, want %s (all: %v)", id, got[id], state, got)
+		}
+	}
+	// A pre-v2 database already imported its JSON long ago: it only renames.
+	if state, _ := store.legacyMigrationState(); state != legacyMigrationRename {
+		t.Fatalf("legacy_migrated=%q", state)
+	}
+}
+
+// #3: the single-instance lock is exclusive and released by Close.
+func TestStoreInstanceLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ssh-gete.sqlite")
+	first, err := openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openStore(path); !errors.Is(err, errAnotherInstance) {
+		first.Close()
+		t.Fatalf("second open: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := openStore(path)
+	if err != nil {
+		t.Fatalf("open after close: %v", err)
+	}
+	second.Close()
+}
+
+// #34: freshness is decided by the content, not by the file existing.
+func TestOpenStoreEmptyFileIsFresh(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ssh-gete.sqlite")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if !store.fresh {
+		t.Fatal("empty database file not treated as new")
+	}
+	if state, _ := store.legacyMigrationState(); state != legacyMigrationPending {
+		t.Fatalf("legacy_migrated=%q", state)
+	}
+	if matches, _ := filepath.Glob(path + ".bak-v*"); len(matches) != 0 {
+		t.Fatalf("backup of an empty database: %v", matches)
 	}
 }
