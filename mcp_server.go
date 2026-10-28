@@ -138,8 +138,9 @@ func (a *App) handleMCP(w http.ResponseWriter, r *http.Request, settings MCPSett
 		writeJSON(w, http.StatusBadRequest, rpcErrorResponse(nil, -32700, "invalid json"))
 		return
 	}
-	if len(req.ID) == 0 {
-		// Notifications (and stray responses) get no JSON-RPC reply.
+	if len(req.ID) == 0 || (req.Method == "" && isRPCResponse(body)) {
+		// Notifications and client responses (id with result or error, no
+		// method) get no JSON-RPC reply.
 		// notifications/cancelled is not handled: a dropped HTTP request is
 		// the cancellation signal.
 		w.WriteHeader(http.StatusAccepted)
@@ -154,6 +155,18 @@ func (a *App) handleMCP(w http.ResponseWriter, r *http.Request, settings MCPSett
 	// cancellation.
 	result, rpcErr := a.dispatchMCP(r.Context(), caller, req)
 	writeJSON(w, http.StatusOK, rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: result, Error: rpcErr})
+}
+
+// isRPCResponse reports a JSON-RPC response object: it carries result or
+// error instead of method.
+func isRPCResponse(body []byte) bool {
+	var probe map[string]json.RawMessage
+	if json.Unmarshal(body, &probe) != nil {
+		return false
+	}
+	_, hasResult := probe["result"]
+	_, hasError := probe["error"]
+	return hasResult || hasError
 }
 
 func (a *App) handleAudit(w http.ResponseWriter, r *http.Request, settings MCPSettings, token string) {
@@ -949,108 +962,4 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("MCP-Protocol-Version", latestProtocolVersion)
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
-}
-
-// classifyRisk rates a command for the approval queue. The command is split
-// into words on whitespace, shell separators (; | & ( ) ` newline), quotes and
-// redirections, so "true;rm x", "a&&rm x" and "sh -c 'rm x'" are seen as
-// containing rm. A word in command position (or under a bin directory) is
-// reduced to its basename, so "/bin/rm x" is rm. The phrases below are then
-// matched against those normalized words.
-func classifyRisk(command string) string {
-	words := riskWords(strings.ToLower(command))
-	normalized := " " + strings.Join(words, " ") + " "
-	highWords := map[string]bool{
-		"rm": true, "shred": true, "shutdown": true, "reboot": true, "halt": true, "poweroff": true,
-		"iptables": true, "ip6tables": true, "nft": true, "ufw": true, "userdel": true, "passwd": true,
-	}
-	highPhrases := []string{
-		" dd if=", " systemctl restart ", " systemctl stop ", " service restart ", " service stop ",
-		" chown -r", " chmod -r", " find -delete ",
-	}
-	mediumWords := map[string]bool{
-		"sudo": true, "apt": true, "apt-get": true, "yum": true, "dnf": true, "brew": true,
-		"mv": true, "truncate": true,
-	}
-	mediumPhrases := []string{" docker rm", " docker stop ", " kubectl delete ", " cp -r"}
-
-	sawFind := false
-	for _, word := range words {
-		if highWords[word] || strings.HasPrefix(word, "mkfs") {
-			return "High"
-		}
-		if word == "find" {
-			sawFind = true
-		}
-		if sawFind && word == "-delete" {
-			return "High"
-		}
-	}
-	for _, phrase := range highPhrases {
-		if strings.Contains(normalized, phrase) {
-			return "High"
-		}
-	}
-	for _, word := range words {
-		if mediumWords[word] {
-			return "Medium"
-		}
-	}
-	for _, phrase := range mediumPhrases {
-		if strings.Contains(normalized, phrase) {
-			return "Medium"
-		}
-	}
-	return "Low"
-}
-
-// riskWords splits a lowercased command into the words classifyRisk matches.
-// A word in command position (the first of a pipeline segment, or after a
-// wrapper such as sudo, env, xargs or find -exec) and any word under a bin
-// directory (/usr/sbin/reboot) are reduced to their basename.
-func riskWords(lower string) []string {
-	wrappers := map[string]bool{
-		"sudo": true, "doas": true, "env": true, "nohup": true, "exec": true, "command": true,
-		"builtin": true, "xargs": true, "time": true, "nice": true, "ionice": true, "timeout": true,
-		"-exec": true, "-execdir": true, "-ok": true, "-okdir": true, "then": true, "do": true,
-		"else": true, "!": true,
-	}
-	var words []string
-	var current strings.Builder
-	commandPosition := true
-	flush := func() {
-		if current.Len() == 0 {
-			return
-		}
-		word := current.String()
-		current.Reset()
-		if commandPosition || strings.Contains(word, "bin/") {
-			if slash := strings.LastIndexByte(word, '/'); slash >= 0 && slash < len(word)-1 {
-				word = word[slash+1:]
-			}
-		}
-		words = append(words, word)
-		switch {
-		case wrappers[word]:
-			commandPosition = true
-		case commandPosition && (strings.Contains(word, "=") || strings.HasPrefix(word, "-")):
-			// VAR=value prefixes and wrapper flags keep the next word in
-			// command position.
-		default:
-			commandPosition = false
-		}
-	}
-	for _, r := range lower {
-		switch r {
-		case ' ', '\t', '\r', '\'', '"', '<', '>':
-			flush()
-		case ';', '|', '&', '(', ')', '`', '\n', '{', '}':
-			flush()
-			commandPosition = true
-		default:
-			current.WriteRune(r)
-		}
-	}
-	flush()
-	return words
 }

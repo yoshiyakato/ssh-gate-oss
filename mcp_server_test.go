@@ -289,6 +289,17 @@ func TestJSONRPCConformance(t *testing.T) {
 	if rec.Code != http.StatusAccepted || rec.Body.Len() != 0 {
 		t.Fatalf("notification: %d %q", rec.Code, rec.Body.String())
 	}
+	// Client responses to server requests carry an id but no method (#51).
+	for _, body := range []string{`{"jsonrpc":"2.0","id":1,"result":{}}`, `{"jsonrpc":"2.0","id":2,"error":{"code":-1,"message":"x"}}`} {
+		rec = app.serveTest(t, mcpCall{body: body})
+		if rec.Code != http.StatusAccepted || rec.Body.Len() != 0 {
+			t.Fatalf("client response %s: %d %q", body, rec.Code, rec.Body.String())
+		}
+	}
+	rec = app.serveTest(t, mcpCall{body: `{"jsonrpc":"2.0","id":3}`})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("id without method, result or error must be invalid: %d", rec.Code)
+	}
 
 	rec = app.serveTest(t, mcpCall{body: `{"jsonrpc":"2.0","id":"p","method":"ping"}`})
 	if out := decode(rec); out["id"] != "p" || out["error"] != nil {
