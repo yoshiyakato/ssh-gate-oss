@@ -306,6 +306,16 @@ func (a *App) approve(id string, command string, allowRiskIncrease bool, grantBy
 			Message: fmt.Sprintf("修正したコマンドのリスクが %s → %s に上がりました。内容を確認のうえ、再度承認してください", req.Risk, approvedRisk),
 		}
 	}
+	conn, _, connOK := a.resolveRequestTarget(req)
+	// A request is approved for the user@host:port the agent asked about. If
+	// the connection was edited since, refuse; the agent has to ask again.
+	if connOK && req.TargetFP != "" && targetFingerprint(conn) != req.TargetFP {
+		return ActionResult{
+			OK:      false,
+			Code:    "target_changed",
+			Message: fmt.Sprintf("要求後に実行先が変わったため承認できません（%s → %s）。拒否して、エージェントに再度依頼させてください", req.TargetFP, targetFingerprint(conn)),
+		}
+	}
 	agentName := strings.TrimSpace(req.RequestedBy)
 	if grantBypass {
 		if agentName == "" {
@@ -317,7 +327,6 @@ func (a *App) approve(id string, command string, allowRiskIncrease bool, grantBy
 			return ActionResult{OK: false, Code: "bearer_required", Message: "承認省略を使うには、先にMCP設定でBearerトークンまたはエージェント専用トークンを発行してください（名乗りだけでは本人確認ができないため）"}
 		}
 	}
-	conn, _, connOK := a.resolveRequestTarget(req)
 
 	// Register the run before it starts so shutdown waits for it (and
 	// cancels it after the grace period) instead of closing the store under it.

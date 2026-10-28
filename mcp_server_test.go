@@ -1201,6 +1201,21 @@ func TestApprovalTargetShowsResolvedConnectionAndFPChange(t *testing.T) {
 	if !target.FPChanged || target.RequestedFP != wantFP || !strings.HasPrefix(target.CurrentFP, "someone-else@") {
 		t.Fatalf("fp change not reported: %+v", target)
 	}
+	// ...and approval is refused, for every approve path.
+	execsBefore := len(srv.Execs())
+	for name, approve := range map[string]func(string, string) ActionResult{
+		"plain": app.ApproveCommand, "confirmed": app.ApproveCommandConfirmed, "bypass": app.ApproveCommandAndBypassAgent,
+	} {
+		if r := approve(req.ID, ""); r.OK || r.Code != "target_changed" {
+			t.Fatalf("%s approve after target change: %+v", name, r)
+		}
+	}
+	if n := len(srv.Execs()); n != execsBefore {
+		t.Fatalf("execs=%d after refused approve, want %d", n, execsBefore)
+	}
+	if got, _ := app.findRequest(req.ID); got.Status != statePending {
+		t.Fatalf("refused approve changed state to %s", got.Status)
+	}
 
 	// A deleted connection is not replaced by a new one with the same name.
 	if r := app.DeleteConnection(conn.ID); !r.OK {
