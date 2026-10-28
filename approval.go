@@ -538,7 +538,7 @@ func (a *App) needsHumanApproval(conn Connection, risk string, command string, c
 	if settings.RequireApprovalWriteOp && risk != "Low" {
 		return true
 	}
-	if settings.RequireApprovalSudo && containsWord(command, "sudo") {
+	if settings.RequireApprovalSudo && commandUsesSudo(command) {
 		return true
 	}
 	if settings.RequireApprovalProd {
@@ -547,17 +547,6 @@ func (a *App) needsHumanApproval(conn Connection, risk string, command string, c
 			if tag == "prod" || tag == "production" || tag == "本番" {
 				return true
 			}
-		}
-	}
-	return false
-}
-
-func containsWord(command string, word string) bool {
-	for _, field := range strings.FieldsFunc(command, func(r rune) bool {
-		return r == ' ' || r == '\t' || r == ';' || r == '|' || r == '&' || r == '(' || r == ')' || r == '\n'
-	}) {
-		if field == word {
-			return true
 		}
 	}
 	return false
