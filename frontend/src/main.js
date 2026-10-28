@@ -12,6 +12,7 @@ import {
   GenerateMCPToken,
   GetInitialData,
   SaveMCPSettings,
+  SendTerminalSignal,
 } from '../wailsjs/go/main/App';
 import { Environment, EventsOn } from '../wailsjs/runtime/runtime';
 
@@ -76,6 +77,7 @@ import {
   aiSessionsBusy, disposeAISessionViewer, handleAISessionsClick, onAISessionData, onAISessionsChanged,
   renderAILineContext, renderAISessionsPage,
 } from './aisessions.js';
+import { confirmSignalDialog, createSignalSender, renderSignalMenu, signalResultToast } from './signals.js';
 
 document.body.className = 'layout-fixed sidebar-expand-lg bg-body-tertiary';
 
@@ -440,6 +442,7 @@ function renderTerminalScreen(view) {
         ${note ? `<span class="term-active-note${exited ? ' text-danger-emphasis' : ' text-warning-emphasis'}" role="status"><i class="bi ${exited ? 'bi-exclamation-octagon' : 'bi-exclamation-triangle'} me-1" aria-hidden="true"></i>${escapeHtml(note)}</span>` : ''}
         ${exited ? `<button class="btn btn-sm btn-primary" type="button" data-action="term-reconnect" data-term-id="${id}"><i class="bi bi-arrow-repeat me-1"></i>${escapeHtml(t('tabs.reconnect'))}</button>` : ''}
         ${stale ? `<button class="btn btn-sm btn-warning" type="button" data-action="restart-terminal" data-term-id="${id}"><i class="bi bi-arrow-repeat me-1"></i>${escapeHtml(t('tabs.reconnect'))}</button>` : ''}
+        <div class="term-signal-slot"></div>
         <button class="btn btn-sm btn-outline-secondary" type="button" data-action="term-close" data-term-id="${id}" aria-label="${escapeHtml(t('tabs.closeTab', { label: entry.label }))}"><i class="bi bi-x-lg me-1"></i>${escapeHtml(t('tabs.close'))}</button>
       </div>`;
   }
@@ -452,6 +455,57 @@ function renderTerminalScreen(view) {
   `;
 }
 
+// REQ-017 signal menu (req017-signals-wiring.md §5.3). #page-root is redrawn
+// with innerHTML on every poll, so one menu is made once and moved into each
+// freshly drawn .term-signal-slot; an open menu survives the redraw.
+let signalMenu = null;
+
+function signalMenuOptions() {
+  const entry = getTerminalState().tabs.get(currentView().activeTermId);
+  return {
+    kind: entry?.kind === 'serial' ? 'serial' : 'ssh',
+    target: entry?.id ?? '',
+    disabled: !entry || entry.status !== 'open',
+    t,
+    lang: state.lang,
+  };
+}
+
+function mountSignalMenu(root) {
+  const slot = root.querySelector('.term-signal-slot');
+  if (!slot) {
+    // No active tab: an open menu must not keep acting on a tab that is gone.
+    signalMenu?.update({ disabled: true, target: '' });
+    return;
+  }
+  if (!signalMenu) {
+    signalMenu = renderSignalMenu(slot, {
+      ...signalMenuOptions(),
+      // Control characters go xterm.input -> onData -> queueInput, behind
+      // keystrokes and the rest of a paste; SSH signals and BREAK go to
+      // SendTerminalSignal.
+      onSend: createSignalSender({
+        getEntry: (id) => getTerminalState().tabs.get(id),
+        sendSignal: (id, wire) => SendTerminalSignal(id, wire),
+      }),
+      confirm: (o) => confirmSignalDialog({ ...o, t }),
+      focusTerminal: () => {
+        const entry = getTerminalState().tabs.get(currentView().activeTermId);
+        if (entry && entry.status !== 'exited') entry.xterm?.focus();
+      },
+      // Failures are warnings; a sent SSH signal is reported too (an
+      // interactive shell ignores TERM / INT, so silence would look broken).
+      onResult: (result, item) => {
+        const toast = signalResultToast(result, item, t);
+        if (toast) showToast(toast.text, { variant: toast.variant });
+      },
+    });
+  } else {
+    signalMenu.mount(slot);
+    signalMenu.update(signalMenuOptions());
+  }
+}
+
 // renderPage redraws #page-root only. The terminal panes live in
 // #terminal-dock and are only shown or hidden here.
 function renderPage() {
@@ -460,7 +514,10 @@ function renderPage() {
   const view = applyTerminalFilter();
   if (state.active === 'connections') root.innerHTML = renderConnectionsPage(state, ctx);
   else if (state.active === 'commands') renderCommandsPage(root, ctx, view);
-  else if (state.active === 'terminal') root.innerHTML = renderTerminalScreen(view);
+  else if (state.active === 'terminal') {
+    root.innerHTML = renderTerminalScreen(view);
+    mountSignalMenu(root);
+  }
   else if (state.active === 'aisessions') renderAISessionsPage(root, ctx);
   else {
     root.innerHTML = renderSettings();
@@ -493,7 +550,11 @@ function pageIsBusy() {
   if (state.active === 'commands') return state.dirty.approval;
   // The toolbar (close / reconnect, the new-shell picker) is plain
   // innerHTML: redrawing it under the user drops focus and the picked value.
-  if (state.active === 'terminal') return Boolean(document.activeElement?.closest?.('#page-root .term-toolbar'));
+  // The signal menu also counts while a KILL / TERM confirm or a send is
+  // pending (signals.js isBusy); a pointer-opened menu does not.
+  if (state.active === 'terminal') {
+    return Boolean(document.activeElement?.closest?.('#page-root .term-toolbar')) || Boolean(signalMenu?.isBusy());
+  }
   if (state.active === 'aisessions') return aiSessionsBusy();
   return false;
 }

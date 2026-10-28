@@ -20,7 +20,7 @@
 |---|---|---|
 | `main.go` | `//go:embed all:frontend/dist` の `assets` と `wails.Run(...)`。`OnStartup: app.startup` / `OnShutdown: app.shutdown` / `Bind: app` | Wails を import しているのは `main.go` と `events.go` の2ファイルだけ |
 | `events.go` | `emitEvent` は `a.emit`（テスト用フック）が nil でなければそれを呼び、なければ `a.ctx != nil` のとき `wruntime.EventsEmit(a.ctx, ...)` | `a.ctx` を使うのは `events.go` だけ（`app.go:534` で代入）。イベントは `terminal:data` / `terminal:exit` / `sessions:changed` の3種 |
-| `*App` の公開メソッド | 46個。`frontend/wailsjs/go/main/App.js` の46関数と完全に一致 | 許可リストはこの46個（§3）。フェーズ7（REQ-016）の AI セッション8個を含む |
+| `*App` の公開メソッド | 48個。`frontend/wailsjs/go/main/App.js` の48関数と完全に一致 | 許可リストはこの48個（§3）。フェーズ7（REQ-016）の AI セッション8個と、REQ-017 のシグナル送信2個を含む |
 | 非公開のライフサイクル | `startup(ctx)`：シリアル監視と MCP 起動。`shutdown(ctx)`：§5.0 の順序（appCancel → cancelExecs → stopMCPServer → drainMCPCommands → CloseAllTerminals → wg.Wait → store.Close） | headless でもこの2つをそのまま呼ぶ |
 | `NewApp()` | DB を開き、キーチェーン移行（`migrateKeychain(store, app.secrets)`）を行い、期限切れ掃除と secret GC の goroutine を起動する。`secrets: defaultSecretStore()` | 秘密情報の保存先は `NewApp` の**前に**決まっている必要がある（§7） |
 | `SaveMCPSettings` | 保存の後に `restartMCPServer()`。`startMCPServerLocked` は既存サーバーの有無を見ない | startup の前に呼ぶと、startup が2回目の Listen をして失敗する。設定ファイルの反映には別の経路が要る（§1.5） |
@@ -294,7 +294,7 @@ Cookie: <セッション>
 - App のメソッドには ctx が無い。ブラウザが切断しても呼び出しは最後まで走る（Wails と同じ）。
 - 呼び出しの前後で監査ログに記録する（§6.9）。
 
-### 3.3 許可リスト（`frontend/wailsjs/go/main/App.js` の46個 = `*App` の公開メソッドの全部）
+### 3.3 許可リスト（`frontend/wailsjs/go/main/App.js` の48個 = `*App` の公開メソッドの全部）
 
 | メソッド | 許可 | 監査 | 監査に残す引数 | 備考 |
 |---|---|---|---|---|
@@ -327,6 +327,8 @@ Cookie: <セッション>
 | `CloseTerminal(id)` / `CloseTerminalsByConnection(connID)` / `CloseAllTerminals()` | ○ | ○ | id / connID | 閉じるときに、そのタブで送った入力のバイト数の合計も残す |
 | `SendTerminalInput(id, data)` | ○ | 個別には残さない | — | 量が多い。バイト数だけ数えて Close の監査に含める |
 | `ResizeTerminal(id, cols, rows)` | ○ | — | — | |
+| `SendTerminalSignal(id, sig)` | ○ | ○ | id（detail: `sig=<名前>`） | REQ-017。TERM / KILL / HUP / INT（SSH の signal リクエスト）と BREAK（シリアル）。KILL / TERM の確認ダイアログは既存の UI のまま。ツールバーの制御文字（Ctrl-C など）は xterm の入力として `SendTerminalInput` を通るので、ここには来ない |
+| `TerminalSignalNames()` | ○ | — | — | REQ-017。受け付ける `sig` の一覧 |
 | `ListAISessions()` / `GetAISession(id)` / `ReadAISessionRaw(id, since)` / `GetAISessionLineContext(requestId)` / `GetAISessionSettings()` | ○ | — | — | AI セッション（REQ-016）の一覧と読み取り専用の閲覧。人が AI セッションに入力するメソッドは GUI にも Web にも無い |
 | `CloseAISession(id)` / `CloseAllAISessions()` | ○ | ○ | id | 強制終了（`human_closed`）。AI セッション側の `closed_by` は GUI と同じ `gui` になり、誰が閉じたかは Web の監査に残る |
 | `SaveAISessionSettings(settings)` | ○ | ○ | 変更したフィールド名 | 無効にすると開いている AI セッションをすべて閉じる |

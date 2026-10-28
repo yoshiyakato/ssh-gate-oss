@@ -716,6 +716,52 @@ body {
   padding-bottom: .4rem;
 }
 
+/* REQ-017 signal menu (signals.js). Bootstrap dropdown classes without
+   Bootstrap's JS: shown with the hidden attribute and .show. */
+.term-signal {
+  position: relative;
+  display: inline-block;
+}
+
+.term-signal-menu {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 1000; /* above xterm, below Bootstrap's modal (1055) and backdrop (1050) */
+  min-width: 14rem;
+  margin-top: .125rem;
+}
+
+.term-signal-menu[hidden] {
+  display: none !important;
+}
+
+.term-signal-menu.show {
+  display: block;
+}
+
+.term-signal-item {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+}
+
+.term-signal-key {
+  min-width: 4.25rem;
+  font-size: .78rem;
+  text-align: center;
+}
+
+.term-signal-label {
+  margin-left: .25rem;
+}
+
+@media (max-width: 576px) {
+  .term-signal-label {
+    display: none; /* icon only; the name stays in title and aria */
+  }
+}
+
 .term-active-note {
   font-size: .86rem;
   font-weight: 700;

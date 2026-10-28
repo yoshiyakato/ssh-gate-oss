@@ -15,6 +15,7 @@ import { SHORTCUTS_I18N } from './shortcuts.js';
 import { CREDENTIALS_I18N } from './credentials.js';
 import { RESULT_I18N } from './result-message.js';
 import { AI_SESSIONS_I18N } from './aisessions.js';
+import { SIGNALS_I18N } from './signals.js';
 
 export const BASE_I18N = {
   ja: {
@@ -326,4 +327,5 @@ export const I18N = mergeI18n(
   CREDENTIALS_I18N,
   RESULT_I18N,
   AI_SESSIONS_I18N,
+  SIGNALS_I18N,
 );

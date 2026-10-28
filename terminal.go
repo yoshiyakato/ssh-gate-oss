@@ -641,6 +641,9 @@ func (a *App) openSSHTerminal(ctx context.Context, ts *terminalSession, conn Con
 	}
 
 	ts.stdinWriter = stdin
+	// REQ-017: lets SendTerminalSignal send RFC 4254 "signal" requests on
+	// this session; the entry goes away when ts.done closes.
+	registerTerminalSignaler(ts, session)
 	_, _, ok := a.commitTerminal(ts,
 		func(cols, rows int) error { return session.WindowChange(rows, cols) },
 		func() {

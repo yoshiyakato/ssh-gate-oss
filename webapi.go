@@ -60,7 +60,7 @@ type callSpec struct {
 	diff func(a *App, args []json.RawMessage) string
 }
 
-// webCallable is the allowlist: the 46 functions of
+// webCallable is the allowlist: the 48 functions of
 // frontend/wailsjs/go/main/App.js, i.e. every public *App method today.
 var webCallable = map[string]callSpec{
 	// Reads (not audited).
@@ -74,6 +74,7 @@ var webCallable = map[string]callSpec{
 	"GetHostKeyInfo":            {},
 	"PlaintextBackups":          {},
 	"ResizeTerminal":            {},
+	"TerminalSignalNames":       {},
 	// SendTerminalInput is counted per tab and reported on close.
 	"SendTerminalInput": {},
 
@@ -111,6 +112,10 @@ var webCallable = map[string]callSpec{
 	"CloseTerminal":              {Audit: true, Target: webArgStr(0)},
 	"CloseTerminalsByConnection": {Audit: true, Target: webArgStr(0)},
 	"CloseAllTerminals":          {Audit: true},
+	// REQ-017: each signal is audited (KILL / TERM / HUP end the shell).
+	// The control characters from the toolbar go through xterm and
+	// SendTerminalInput instead (signals.js createSignalSender).
+	"SendTerminalSignal": {Audit: true, Target: webArgStr(0), Detail: webArgStrDetail(1, "sig")},
 
 	// AI sessions (REQ-016, phase7-ai-session.md §8): list, read-only
 	// viewing and force close. There is no input method: humans cannot write

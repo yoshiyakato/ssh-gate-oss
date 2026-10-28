@@ -10,6 +10,7 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -710,4 +711,43 @@ func TestWebCallAISessions(t *testing.T) {
 	}
 	postCall(t, h, "CloseAllAISessions", "[]")
 	log.last(t, "CloseAllAISessions")
+}
+
+// REQ-017: SendTerminalSignal is reachable from the Web and every call is
+// audited with the tab id and the signal name; TerminalSignalNames is a read.
+func TestWebCallTerminalSignal(t *testing.T) {
+	old := terminalBreakDuration
+	terminalBreakDuration = time.Millisecond
+	t.Cleanup(func() { terminalBreakDuration = old })
+	app, h, log := newWebTestHandler(t)
+	t.Cleanup(func() { app.CloseAllTerminals() })
+	bp := &sigBreakPort{sigFakePort: newSigFakePort()}
+	newSerialSignalTab(app, "web-ser-1", bp, terminalStatusOpen)
+
+	before := len(log.all())
+	var names struct{ Result []string }
+	if rec := postCall(t, h, "TerminalSignalNames", "[]"); rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &names) != nil || !slices.Contains(names.Result, "BREAK") {
+		t.Fatalf("TerminalSignalNames: %d %s", rec.Code, rec.Body)
+	}
+	if got := len(log.all()); got != before {
+		t.Fatalf("TerminalSignalNames must not be audited: %d new records", got-before)
+	}
+
+	var res struct{ Result ActionResult }
+	if rec := postCall(t, h, "SendTerminalSignal", `["web-ser-1","BREAK"]`); json.Unmarshal(rec.Body.Bytes(), &res) != nil || !res.Result.OK {
+		t.Fatalf("SendTerminalSignal: %d %s", rec.Code, rec.Body)
+	}
+	if r := log.last(t, "SendTerminalSignal"); r.Target != "web-ser-1" || r.Detail != "sig=BREAK" || !r.OK {
+		t.Fatalf("signal audit: %+v", r)
+	}
+	if got := bp.Events(); !slices.Contains(got, "break") {
+		t.Fatalf("port events = %v, want a break", got)
+	}
+
+	if rec := postCall(t, h, "SendTerminalSignal", `["web-ser-1","KILL"]`); json.Unmarshal(rec.Body.Bytes(), &res) != nil || res.Result.Code != "signal_not_applicable" {
+		t.Fatalf("KILL on serial: %d %s", rec.Code, rec.Body)
+	}
+	if r := log.last(t, "SendTerminalSignal"); r.Detail != "sig=KILL" || r.OK || r.Code != "signal_not_applicable" {
+		t.Fatalf("refused signal audit: %+v", r)
+	}
 }
