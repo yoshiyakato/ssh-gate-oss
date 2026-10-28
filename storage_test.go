@@ -637,7 +637,7 @@ func TestMigrationV3ToV4KeepsCredentialsUntilMoved(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if store.prevVersion != 3 || userVersion(t, path) != 4 || !fileExists(path+".bak-v3") {
+	if store.prevVersion != 3 || userVersion(t, path) != schemaVersion || !fileExists(path+".bak-v3") {
 		t.Fatalf("v3 -> v4 migration: prev=%d version=%d", store.prevVersion, userVersion(t, path))
 	}
 	if !tableExists(t, path, "secret_gc") {

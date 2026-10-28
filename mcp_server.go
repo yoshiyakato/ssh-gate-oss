@@ -255,7 +255,7 @@ func (a *App) dispatchMCP(ctx context.Context, caller mcpCaller, req rpcRequest)
 				"name":    appName,
 				"version": "0.3.0",
 			},
-			"instructions": "ssh-gete は人間の承認を挟む SSH ゲートウェイです。execute_command は原則として承認キューに入り、結果は get_request_status(request_ids, wait_seconds) で待って取得します。再送には同じ client_request_id を付けてください。",
+			"instructions": "ssh-gete は人間の承認を挟む SSH ゲートウェイです。execute_command は原則として承認キューに入り、結果は get_request_status(request_ids, wait_seconds) で待って取得します。再送には同じ client_request_id を付けてください。cd や環境変数を保ったまま複数の行を順に送るときは、open_session / send_line / read_output / close_session（AI 専用セッション。GUI で有効にしたときだけ使えます）を使います。",
 		}, nil
 	case "ping":
 		return map[string]any{}, nil
@@ -316,6 +316,9 @@ func (a *App) callMCPTool(ctx context.Context, caller mcpCaller, params toolCall
 		}
 		return a.executeCommandTool(ctx, caller, args)
 	default:
+		if result, rpcErr, handled := a.callAISessionTool(ctx, caller, params); handled { // REQ-016
+			return result, rpcErr
+		}
 		return nil, invalidParams("unknown tool: " + params.Name)
 	}
 }
@@ -656,7 +659,7 @@ func (a *App) requestStatusTool(ctx context.Context, caller mcpCaller, args requ
 	}
 	var views []map[string]any
 	if len(ids) > 0 {
-		views = a.requestStatus(ctx, ids, wait, includeOutput)
+		views = a.requestStatus(ctx, caller, ids, wait, includeOutput)
 	}
 	if len(foreign) == 0 {
 		return toolResult(map[string]any{"requests": views}, false), nil
@@ -710,6 +713,10 @@ func requestView(req CommandRequest, includeOutput bool) map[string]any {
 	}
 	if req.ClientRequestID != "" {
 		out["client_request_id"] = req.ClientRequestID
+	}
+	if req.SessionID != "" { // a line of an AI session (REQ-016)
+		out["session_id"] = req.SessionID
+		out["session_seq"] = req.SessionSeq
 	}
 	if req.DecidedBy != "" {
 		out["decided_by"] = req.DecidedBy
@@ -800,7 +807,10 @@ func (a *App) commandHistoryTool(caller mcpCaller, args historyArgs) (any, *rpcE
 		return nil, invalidParams("agent_name is required (or all_agents with Bearer authentication)")
 	}
 
-	filter := historyFilter{HostName: strings.TrimSpace(args.Host), State: args.State, RequestedBy: agent, Limit: limit}
+	// AI session lines of other agents stay hidden even with all_agents
+	// (REQ-016 isolation: only the owner's token sees them).
+	filter := historyFilter{HostName: strings.TrimSpace(args.Host), State: args.State, RequestedBy: agent, Limit: limit,
+		HideSessionLines: true, SessionViewer: caller.Agent}
 	if filter.HostName != "" {
 		if conn, _, ok := a.resolveConnection(filter.HostName); ok {
 			filter.ConnectionID = conn.ID
@@ -898,6 +908,8 @@ func mcpTools() []map[string]any {
 		"requested_by":      str("要求元エージェント名"),
 		"requested_at":      str("要求日時（RFC3339）"),
 		"client_request_id": str("冪等キー"),
+		"session_id":        str("AI セッションの行なら、その session_id（AIS-…）"),
+		"session_seq":       map[string]any{"type": "integer", "description": "AI セッション内の何行目か"},
 		"decided_by":        str("承認・拒否した主体（gui / bypass:<agent>）"),
 		"decided_at":        str("承認・拒否の日時"),
 		"expires_at":        str("承認待ちの期限"),
@@ -967,7 +979,7 @@ func mcpTools() []map[string]any {
 		"pending_approvals": map[string]any{"type": "integer"},
 		"in_use":            boolean("serial: このアプリのターミナルで使用中か"),
 	}
-	return []map[string]any{
+	return append([]map[string]any{
 		{
 			"name":        "list_hosts",
 			"title":       "接続先一覧",
@@ -1041,7 +1053,7 @@ func mcpTools() []map[string]any {
 				"agent":    str("絞り込んだエージェント名（all_agents のときは *）"),
 			}),
 		},
-	}
+	}, aiSessionTools()...)
 }
 
 // toolResult wraps a tool's output. structuredContent carries the object;

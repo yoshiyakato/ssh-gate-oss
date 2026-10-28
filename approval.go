@@ -312,6 +312,9 @@ func (a *App) ApproveCommandAndBypassAgent(id string, command string) ActionResu
 func (a *App) approve(id string, command string, allowRiskIncrease bool, grantBypass bool) ActionResult {
 	id = strings.TrimSpace(id)
 	command = strings.TrimSpace(command)
+	if link, ok := a.aiLineLink(id); ok { // REQ-016: a line of an AI session (§3.6)
+		return a.approveAISessionLine(id, command, grantBypass, link)
+	}
 	req, ok := a.findRequest(id)
 	if !ok {
 		return ActionResult{OK: false, Code: "not_found", Message: "承認対象のリクエストが見つかりません"}
@@ -586,6 +589,9 @@ func (a *App) RejectCommand(id string) ActionResult {
 // drop a request that has just started running (its audit row would vanish).
 func (a *App) DeleteCommandRequest(id string) ActionResult {
 	id = strings.TrimSpace(id)
+	if refused, ok := a.aiLineDeleteRefusal(id); ok {
+		return refused
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	index := -1

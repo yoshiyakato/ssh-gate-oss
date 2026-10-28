@@ -40,6 +40,13 @@ export const RESULT_I18N = {
     'result.code.port_unavailable': 'シリアルポートを確認できません',
     'result.code.port_in_use': 'シリアルポートは使用中です',
     'result.code.input_timeout': '入力の送信が詰まっています',
+    // AI sessions (REQ-016).
+    'result.code.session_not_found': 'AI セッションが見つかりません',
+    'result.code.session_closed': 'この行の AI セッションは終了しています',
+    'result.code.edit_not_allowed': 'AI セッション内の行は修正して承認できません',
+    'result.code.target_changed': '実行先が変わったため承認できません',
+    'result.code.ai_session_open': '開いている AI セッションの行は削除できません',
+    'result.code.invalid_settings': '設定値が範囲外です',
   },
   en: {
     'result.done': 'Done',
@@ -75,6 +82,13 @@ export const RESULT_I18N = {
     'result.code.port_unavailable': 'The serial port cannot be checked',
     'result.code.port_in_use': 'The serial port is in use',
     'result.code.input_timeout': 'Sending input is stuck',
+    // AI sessions (REQ-016).
+    'result.code.session_not_found': 'AI session not found',
+    'result.code.session_closed': 'The AI session of this line has ended',
+    'result.code.edit_not_allowed': 'A line of an AI session cannot be edited before approval',
+    'result.code.target_changed': 'Cannot approve: the target changed',
+    'result.code.ai_session_open': 'A line of an open AI session cannot be deleted',
+    'result.code.invalid_settings': 'A setting is out of range',
   },
 };
 

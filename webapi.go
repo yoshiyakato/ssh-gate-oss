@@ -60,7 +60,7 @@ type callSpec struct {
 	diff func(a *App, args []json.RawMessage) string
 }
 
-// webCallable is the allowlist: the 38 functions of
+// webCallable is the allowlist: the 46 functions of
 // frontend/wailsjs/go/main/App.js, i.e. every public *App method today.
 var webCallable = map[string]callSpec{
 	// Reads (not audited).
@@ -111,6 +111,18 @@ var webCallable = map[string]callSpec{
 	"CloseTerminal":              {Audit: true, Target: webArgStr(0)},
 	"CloseTerminalsByConnection": {Audit: true, Target: webArgStr(0)},
 	"CloseAllTerminals":          {Audit: true},
+
+	// AI sessions (REQ-016, phase7-ai-session.md §8): list, read-only
+	// viewing and force close. There is no input method: humans cannot write
+	// to a session from the GUI or the Web either.
+	"ListAISessions":          {},
+	"GetAISession":            {},
+	"ReadAISessionRaw":        {},
+	"GetAISessionLineContext": {},
+	"GetAISessionSettings":    {},
+	"CloseAISession":          {Audit: true, Target: webArgStr(0)},
+	"CloseAllAISessions":      {Audit: true},
+	"SaveAISessionSettings":   {Audit: true, diff: webAISessionSettingsDiff},
 }
 
 // webDenied lists public *App methods deliberately not reachable from the
@@ -872,6 +884,13 @@ func webMCPDiff(a *App, args []json.RawMessage) string {
 		return ""
 	}
 	return webChangedFields(args[0], a.GetMCPSettings(), true)
+}
+
+func webAISessionSettingsDiff(a *App, args []json.RawMessage) string {
+	if len(args) == 0 {
+		return ""
+	}
+	return webChangedFields(args[0], a.GetAISessionSettings(), true)
 }
 
 func webJoinDetail(parts ...string) string {

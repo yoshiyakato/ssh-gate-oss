@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -652,4 +653,61 @@ func TestWebCallRequiresSessionFailClosed(t *testing.T) {
 	if rec.Code != http.StatusOK || len(got) != 1 {
 		t.Fatalf("with session: %d %s, audit %+v", rec.Code, rec.Body, got)
 	}
+}
+
+// The headless Web admin lists, views and force-closes AI sessions
+// (REQ-016) through the same allowlist; reads are not audited, closes are.
+func TestWebCallAISessions(t *testing.T) {
+	app, h, log := newWebTestHandler(t)
+	f := &fakeAIFactory{script: execLikeScript}
+	app.aiMgr().transports[aiModeExec] = f.open
+	conn := addTestConnection(t, app, Connection{Name: "web-01", Type: "SSH", Host: "10.0.0.9", Port: 22, User: "deploy",
+		AuthMethod: "パスワード保管", Credential: "pw", ConnectTimeout: 5, CommandTimeout: 10, Tags: []string{}})
+	issueAgentToken(t, app, aiTestAgent)
+
+	settings := defaultAISessionSettings()
+	settings.Enabled = true
+	argsJSON, _ := json.Marshal([]any{settings})
+	var saved struct{ Result ActionResult }
+	if rec := postCall(t, h, "SaveAISessionSettings", string(argsJSON)); json.Unmarshal(rec.Body.Bytes(), &saved) != nil || !saved.Result.OK {
+		t.Fatalf("save settings: %d %s", rec.Code, rec.Body)
+	}
+	if r := log.last(t, "SaveAISessionSettings"); !strings.Contains(r.Detail, "changed=enabled") {
+		t.Fatalf("settings audit: %+v", r)
+	}
+	open, err := app.aiSessionMCPOpen(context.Background(), aiTestAgent, aiTestCaller(app),
+		openSessionArgs{Host: conn.Name, Reason: "調査", Mode: aiModeExec, Shell: aiShellSh})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	before := len(log.all())
+
+	var list struct{ Result []AISessionInfo }
+	if rec := postCall(t, h, "ListAISessions", "[]"); rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &list) != nil || len(list.Result) != 1 || list.Result[0].ID != open.SessionID {
+		t.Fatalf("ListAISessions: %d %s", rec.Code, rec.Body)
+	}
+	var detail struct{ Result AISessionDetail }
+	if rec := postCall(t, h, "GetAISession", `["`+open.SessionID+`"]`); rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &detail) != nil || !detail.Result.OK {
+		t.Fatalf("GetAISession: %d %s", rec.Code, rec.Body)
+	}
+	var raw struct{ Result AISessionRawRead }
+	if rec := postCall(t, h, "ReadAISessionRaw", `["`+open.SessionID+`", 0]`); rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &raw) != nil || !raw.Result.OK {
+		t.Fatalf("ReadAISessionRaw: %d %s", rec.Code, rec.Body)
+	}
+	if got := len(log.all()); got != before {
+		t.Fatalf("reads must not be audited: %d new records", got-before)
+	}
+
+	var closed struct{ Result ActionResult }
+	if rec := postCall(t, h, "CloseAISession", `["`+open.SessionID+`"]`); json.Unmarshal(rec.Body.Bytes(), &closed) != nil || !closed.Result.OK {
+		t.Fatalf("CloseAISession: %d %s", rec.Code, rec.Body)
+	}
+	if r := log.last(t, "CloseAISession"); r.Target != open.SessionID || !r.OK {
+		t.Fatalf("close audit: %+v", r)
+	}
+	if d := app.GetAISession(open.SessionID); d.Session.CloseReason != aiCloseHuman {
+		t.Fatalf("session after close: %+v", d.Session)
+	}
+	postCall(t, h, "CloseAllAISessions", "[]")
+	log.last(t, "CloseAllAISessions")
 }
