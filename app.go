@@ -2091,6 +2091,10 @@ func explainSSHError(conn Connection, err error) string {
 	if errors.As(err, &missing) {
 		return "SSH鍵がパスフレーズで保護されています。パスフレーズを入力するか、ssh-agent に鍵を登録してください。"
 	}
+	var skMissing *securityKeyNotInAgentError
+	if errors.As(err, &skMissing) {
+		return fmt.Sprintf("%s はセキュリティキー（Secure Enclave / FIDO）の鍵で、署名は ssh-agent 経由でしか行えません。ターミナルで ssh-add %s を実行して agent に登録してから、もう一度お試しください（Secure Enclave の鍵は SSH_SK_PROVIDER=/usr/lib/ssh-keychain.dylib を付けて ssh-add します）。", skMissing.keyPath, skMissing.keyPath)
+	}
 	if strings.Contains(lower, "no such file") || strings.Contains(lower, "read ssh key") {
 		return fmt.Sprintf("SSH鍵ファイルを読めません。鍵ファイルパスを確認してください。詳細: %v", err)
 	}
