@@ -196,6 +196,24 @@ describe('main.js integration', () => {
     expect(document.querySelectorAll('.term-pane')).toHaveLength(before - 1);
   });
 
+  // N9: the terminal toolbar is innerHTML; a poll or sessions:changed must
+  // not replace it while the user is on it.
+  it('keeps the new-shell picker, its focus and value through a poll and sessions:changed', async () => {
+    const select = document.querySelector('[data-action="term-new-select"]');
+    expect(select).not.toBeNull();
+    select.focus();
+    select.value = 'c2';
+    await poll();
+    handlers['sessions:changed']({ sessions: [session('c1', 'web-01', { connState: 'error', lastError: 'x' })], terminals: [], runningTotal: 0, sessionsSeq: 12 });
+    await flush();
+    expect(document.querySelector('[data-action="term-new-select"]')).toBe(select);
+    expect(document.activeElement).toBe(select);
+    expect(select.value).toBe('c2');
+    select.blur();
+    await poll();
+    expect(document.querySelector('[data-action="term-new-select"]')).not.toBe(select);
+  });
+
   it('switches language without rebuilding the terminal dock', async () => {
     const dock = document.querySelector('#terminal-dock');
     const panes = [...document.querySelectorAll('.term-pane')];
@@ -303,5 +321,63 @@ describe('main.js integration', () => {
     backend.approve = [];
     await click('[data-action="approve-command"]');
     expect(backend.approve).toEqual([['REQ-A', 'echo a-edited']]);
+  });
+
+  // N25 / N5: a language switch redraws the page in the new language and
+  // keeps what the user typed there.
+  it('keeps an edited approval command through a language switch and approves the edit', async () => {
+    await poll();
+    await typeInto('#approval-command', 'echo a-lang');
+    await click('[data-lang="en"]');
+    expect(document.querySelector('#page-title').textContent).not.toBe('コマンド履歴・承認');
+    expect(document.querySelector('#approval-command').value).toBe('echo a-lang');
+    backend.approve = [];
+    await click('[data-action="approve-command"]');
+    expect(backend.approve).toEqual([['REQ-A', 'echo a-lang']]);
+    await click('[data-lang="ja"]');
+  });
+
+  it('keeps unsaved settings input through a language switch', async () => {
+    await click('[data-nav="settings"]');
+    await typeInto('#mcp-form [name="listenAddress"]', '0.0.0.0');
+    await click('[data-lang="en"]');
+    expect(document.querySelector('#page-title').textContent).not.toBe('MCPサーバー待受設定');
+    expect(document.querySelector('#mcp-form [name="listenAddress"]').value).toBe('0.0.0.0');
+    await click('[data-lang="ja"]');
+    expect(document.querySelector('#mcp-form [name="listenAddress"]').value).toBe('0.0.0.0');
+  });
+
+  // E7: one shape for both ~/.claude.json examples, labeled, no Japanese
+  // placeholder in English.
+  it('labels the shared-Bearer example and localizes its placeholder', async () => {
+    backend.data = { ...backend.data, mcp: { status: '停止中', port: 8790, bearerEnabled: true }, sessionsSeq: 60 };
+    // Drops the unsaved form of the previous case, then reloads.
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    await click('[data-action="delete-mcp"]');
+    confirm.mockRestore();
+    await click('[data-lang="en"]');
+    const usage = document.querySelector('#mcp-usage-note').closest('.card-body');
+    const code = usage.querySelector('pre code').textContent;
+    expect(code).toContain('<issued token>');
+    expect(code).not.toMatch(/[\u3040-\u30ff\u4e00-\u9fff]/);
+    expect(JSON.parse(code).mcpServers['ssh-gete'].url).toBe('http://127.0.0.1:8790/mcp');
+    expect(document.querySelector('#mcp-usage-note').textContent).toContain('shared Bearer token');
+    await click('[data-lang="ja"]');
+  });
+
+  // E6: in English a Japanese-only backend message is not shown.
+  it('shows English for a backend result without a known code', async () => {
+    await click('[data-lang="en"]');
+    await click('[data-nav="connections"]');
+    backend.save = async () => ({ ok: false, message: '接続先名は必須です' });
+    await typeInto('#connection-form [name="name"]', 'x');
+    document.querySelector('#connection-form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    await flush();
+    backend.save = null;
+    const toast = document.querySelector('#toast-root, .ssh-toast')?.textContent ?? '';
+    expect(document.body.textContent).not.toContain('接続先名は必須です');
+    expect(toast).toContain('The operation failed');
+    await click('[data-action="edit-cancel"]');
+    await click('[data-lang="ja"]');
   });
 });

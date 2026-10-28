@@ -46,6 +46,78 @@ const (
 type hostKeyPolicy struct {
 	Origin hostKeyOrigin
 	Strict bool
+	// Candidate, when set, defers TOFU recording (N20): an unknown key that a
+	// GUI dial may trust is only kept here during the key exchange, and is
+	// written to known_hosts by Candidate.Commit once the dialer has
+	// authenticated (and, where the UI asks, the human has seen the
+	// fingerprint). Without it the key is recorded inside the callback,
+	// before authentication.
+	Candidate *hostKeyCandidate
+}
+
+// hostKeyCandidate is an unknown host key accepted for one GUI dial but not
+// recorded yet. Its zero value is ready to use; it is safe for concurrent use.
+type hostKeyCandidate struct {
+	mu       sync.Mutex
+	hostname string
+	key      ssh.PublicKey
+}
+
+// withDeferredRecording returns p with a fresh Candidate when p may record
+// an unknown key (GUI origin, not strict), and that candidate (nil
+// otherwise). The dialer calls Commit after authentication succeeded.
+func (p hostKeyPolicy) withDeferredRecording() (hostKeyPolicy, *hostKeyCandidate) {
+	if p.Origin != hostKeyFromGUI || p.Strict {
+		return p, nil
+	}
+	p.Candidate = &hostKeyCandidate{}
+	return p, p.Candidate
+}
+
+func (c *hostKeyCandidate) set(hostname string, key ssh.PublicKey) {
+	c.mu.Lock()
+	c.hostname, c.key = hostname, key
+	c.mu.Unlock()
+}
+
+// Pending reports whether a key is waiting to be recorded.
+func (c *hostKeyCandidate) Pending() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.key != nil
+}
+
+// Fingerprint is the SHA256 fingerprint of the pending key ("" if none), for
+// the GUI to show before or while trusting it.
+func (c *hostKeyCandidate) Fingerprint() string {
+	if c == nil {
+		return ""
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.key == nil {
+		return ""
+	}
+	return ssh.FingerprintSHA256(c.key)
+}
+
+// Commit records the pending key (no-op when there is none). A concurrent
+// dial that recorded a different key for the host first makes it a mismatch.
+func (c *hostKeyCandidate) Commit() error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	hostname, key := c.hostname, c.key
+	c.key = nil
+	c.mu.Unlock()
+	if key == nil {
+		return nil
+	}
+	return recordHostKey(hostname, key)
 }
 
 var (
@@ -161,7 +233,7 @@ func ensureKnownHostsFile(path string) error {
 		return err
 	}
 	_ = f.Close()
-	return os.Chmod(path, 0o600)
+	return restrictToOwner(path)
 }
 
 // hostKeyFiles lists the files to verify against. The app file always comes
@@ -317,6 +389,12 @@ func newHostKeyVerifier(addr string, policy hostKeyPolicy) (ssh.HostKeyCallback,
 		}
 		if policy.Origin != hostKeyFromGUI || policy.Strict {
 			return &hostKeyUnknownError{Address: knownhosts.Normalize(hostname), Fingerprint: fingerprint}
+		}
+		if policy.Candidate != nil {
+			// Accept for this handshake only; nothing is trusted until the
+			// dialer commits after authentication (N20).
+			policy.Candidate.set(hostname, key)
+			return nil
 		}
 		return recordHostKey(hostname, key)
 	}

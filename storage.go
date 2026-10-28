@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -90,8 +91,12 @@ func openStore(path string) (*Store, error) {
 		return nil, err
 	}
 	// MkdirAll leaves an existing directory's mode alone; the database and
-	// its backups hold credentials, so tighten it (audit #12).
-	_ = os.Chmod(dir, 0o700)
+	// its backups hold credentials, so tighten it (audit #12). On Windows
+	// this also sets a protected owner+SYSTEM DACL that files created in it
+	// later (-wal, -shm, backups) inherit (N41).
+	if err := restrictToOwner(dir); err != nil {
+		log.Printf("restrict %s: %v", dir, err)
+	}
 	lock, err := acquireInstanceLock(path)
 	if err != nil {
 		return nil, err
@@ -104,6 +109,9 @@ func openStore(path string) (*Store, error) {
 			return nil, err
 		}
 		_ = f.Close()
+		if err := restrictToOwner(path); err != nil {
+			log.Printf("restrict %s: %v", path, err)
+		}
 	}
 	// secure_delete zero-fills freed content, so a password removed from the
 	// credential column does not linger in free pages.
@@ -175,12 +183,45 @@ func isSQLiteBusy(err error) bool {
 	return strings.Contains(msg, "SQLITE_BUSY") || strings.Contains(msg, "database is locked")
 }
 
+// restrictDBFilePermissions makes the database and every file next to it
+// that holds the same data (WAL, shared memory, lock, pre-migration backups)
+// owner-only. The shared MCP token and the bypass grants stay in the
+// database, so on Windows, where 0600 means nothing, each also gets a
+// protected owner+SYSTEM DACL instead of inheriting the parent's (N41).
 func restrictDBFilePermissions(path string) {
-	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+	paths := []string{path, path + "-wal", path + "-shm", path + ".lock"}
+	backups, _ := filepath.Glob(globEscape(path) + ".bak-v*")
+	paths = append(paths, backups...)
+	for _, p := range paths {
 		if fileExists(p) {
-			_ = os.Chmod(p, 0o600)
+			if err := restrictToOwner(p); err != nil {
+				log.Printf("restrict %s: %v", p, err)
+			}
 		}
 	}
+}
+
+// restrictACL sets a protected DACL granting only the current user and
+// SYSTEM (directories: inherited by what is created in them). It is a no-op
+// except on Windows (storage_windows.go), where mode bits do not restrict
+// access.
+var restrictACL = func(path string, isDir bool) error { return nil }
+
+// restrictToOwner limits path to the current user: mode 0600 (0700 for a
+// directory), and on Windows a protected DACL (restrictACL).
+func restrictToOwner(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	mode := os.FileMode(0o600)
+	if info.IsDir() {
+		mode = 0o700
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		return err
+	}
+	return restrictACL(path, info.IsDir())
 }
 
 // Close closes the database, then releases the single-instance lock.
@@ -216,7 +257,9 @@ func (s *Store) backupBeforeMigration() (string, error) {
 		return "", err
 	}
 	_ = f.Close()
-	if err := os.Chmod(tmp, 0o600); err != nil { // umask cannot widen it, but be explicit
+	// umask cannot widen the mode, but be explicit; on Windows this is also
+	// where the copy gets its owner-only DACL, before any data is in it (N41).
+	if err := restrictToOwner(tmp); err != nil {
 		_ = os.Remove(tmp)
 		return "", err
 	}
@@ -517,6 +560,9 @@ func migrateToV2(tx *sql.Tx) error {
 // already expired after the upgrade; one with an unreadable updated_at
 // starts at the migration.
 func migrateToV3(tx *sql.Tx, now time.Time) error {
+	if err := fillPendingTargetFP(tx); err != nil {
+		return err
+	}
 	type grant struct {
 		name    string
 		updated string
@@ -545,6 +591,43 @@ func migrateToV3(tx *sql.Tx, now time.Time) error {
 		}
 		if _, err := tx.Exec(`UPDATE agent_policies SET granted_at = ?, expires_at = ? WHERE agent_name = ?`,
 			start, start+defaultBypassTTL.Milliseconds(), g.name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// fillPendingTargetFP gives pending requests written before target_fp existed
+// (v2) the user@host:port of their connection as it is at the upgrade, which
+// is what the agent asked about: the older version could not change it
+// afterwards without the app running. approve() then refuses them if the
+// connection is edited later, like any newer request (N21). A row whose
+// connection is gone or is serial keeps "", which approve() refuses.
+func fillPendingTargetFP(tx *sql.Tx) error {
+	rows, err := tx.Query(`SELECT r.id, c.type, c.host, c.port, c.user FROM command_requests r
+		JOIN connections c ON c.id = r.connection_id
+		WHERE r.status = ? AND r.target_fp = '' AND r.connection_id != ''`, statePending)
+	if err != nil {
+		return err
+	}
+	fps := map[string]string{}
+	for rows.Next() {
+		var id string
+		var conn Connection
+		if err := rows.Scan(&id, &conn.Type, &conn.Host, &conn.Port, &conn.User); err != nil {
+			rows.Close()
+			return err
+		}
+		if fp := targetFingerprint(conn); fp != "" {
+			fps[id] = fp
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for id, fp := range fps {
+		if _, err := tx.Exec(`UPDATE command_requests SET target_fp = ? WHERE id = ? AND target_fp = ''`, fp, id); err != nil {
 			return err
 		}
 	}
@@ -1559,7 +1642,8 @@ func rfc3339Millis(ts string) int64 {
 }
 
 // parseRequestIDMillis extracts the millisecond timestamp from a request ID.
-// IDs are "REQ-<millis>-<seq>"; legacy IDs are "REQ-<millis>" (no seq).
+// IDs are "REQ-<millis>-<seq>-<random hex>"; older ones "REQ-<millis>-<seq>"
+// and legacy ones "REQ-<millis>" (no seq).
 func parseRequestIDMillis(id string) (int64, error) {
 	rest := strings.TrimPrefix(id, "REQ-")
 	if idx := strings.IndexByte(rest, '-'); idx >= 0 {

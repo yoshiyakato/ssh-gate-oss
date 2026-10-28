@@ -17,6 +17,7 @@ import { Environment, EventsOn } from '../wailsjs/runtime/runtime';
 
 import { connStateLabelKey, escapeHtml, interpolate } from './model.js';
 import { I18N } from './i18n.js';
+import { resultMessage as formatResultMessage } from './result-message.js';
 import { pageTitle, renderNav as navHtml, renderSkeleton } from './shell.js';
 import { handleSidebarClick, updateSidebarStatus } from './sidebar.js';
 import {
@@ -60,6 +61,8 @@ import {
 import {
   agentsSectionBusy,
   forgetIssuedAgentToken,
+  mcpConfigJSON,
+  mcpEndpoint,
   handleAgentsClick,
   handleAgentsInput,
   handleAgentsSubmit,
@@ -107,7 +110,32 @@ function setLang(lang) {
   } catch {
     // Persisting language is best-effort.
   }
+  // The page is redrawn in the new language, so unsaved input there is
+  // carried over: the approval textarea is not kept in state, and the
+  // settings form draws from state.settingsMcp.
+  const kept = keepPageInput();
   renderAll();
+  restorePageInput(kept);
+}
+
+function keepPageInput() {
+  if (state.active === 'commands' && state.dirty.approval) {
+    const textarea = document.querySelector('#approval-command');
+    if (textarea) return { requestId: textarea.dataset.requestId ?? '', value: textarea.value };
+  }
+  if (state.active === 'settings' && state.dirty.settings && document.querySelector('#mcp-form')) {
+    const form = collectMCPForm();
+    const names = new Set([...document.querySelectorAll('#mcp-form [name]')].map((element) => element.name));
+    const shown = Object.fromEntries(Object.entries(form).filter(([key]) => names.has(key)));
+    state.settingsMcp = { ...state.settingsMcp, ...shown };
+  }
+  return null;
+}
+
+function restorePageInput(kept) {
+  if (!kept) return;
+  const textarea = document.querySelector('#approval-command');
+  if (textarea && (textarea.dataset.requestId ?? '') === kept.requestId) textarea.value = kept.value;
 }
 
 const state = {
@@ -198,6 +226,7 @@ const ctx = {
   // needs_password / keyring_unavailable (phase5-keychain §8).
   recoverCredential: (conn, result, opts) => recoverCredential(ctx, conn, result, opts),
   startErrorMessage: (result) => startErrorMessage(result),
+  resultMessage: (result) => resultMessage(result),
   terminalKeyHandler: null, // set below, before initTerminalTabs
 };
 
@@ -226,16 +255,16 @@ function mcpStatusBadge(status, className = '') {
   return `<span class="badge ${mcpStatusClass(value)} ${className}">${escapeHtml(mcpStatusLabel(value))}</span>`;
 }
 
-function mcpEndpoint(mcp) {
-  return mcp.localURL || `http://127.0.0.1:${mcp.port || 8787}${mcp.mcpPath || '/mcp'}`;
+// agentConfig is the shared-Bearer variant of the ~/.claude.json example;
+// the per-agent one lives in the agents section. Both come from agents.js
+// mcpConfigJSON so their shape and endpoint cannot drift.
+function agentConfig(mcp) {
+  const authorization = mcp.bearerEnabled ? `Bearer ${state.issuedToken || t('mcp.config.placeholder')}` : '';
+  return mcpConfigJSON(mcp, authorization);
 }
 
-function agentConfig(mcp) {
-  const server = { type: 'http', url: mcpEndpoint(mcp) };
-  if (mcp.bearerEnabled) {
-    server.headers = { Authorization: `Bearer ${state.issuedToken || '<発行したトークン>'}` };
-  }
-  return JSON.stringify({ mcpServers: { 'ssh-gete': server } }, null, 2);
+function resultMessage(result) {
+  return formatResultMessage(result, { lang: state.lang, t, dict: I18N.en });
 }
 
 async function copyText(text) {
@@ -450,6 +479,9 @@ function pageIsBusy() {
   if (state.active === 'connections') return editorHasFocus();
   if (state.active === 'settings') return state.dirty.settings || agentsSectionBusy();
   if (state.active === 'commands') return state.dirty.approval;
+  // The toolbar (close / reconnect, the new-shell picker) is plain
+  // innerHTML: redrawing it under the user drops focus and the picked value.
+  if (state.active === 'terminal') return Boolean(document.activeElement?.closest?.('#page-root .term-toolbar'));
   return false;
 }
 
@@ -657,7 +689,9 @@ async function fetchData({ silent = false } = {}) {
   if (!pageIsBusy()) renderPage();
   else {
     // The tab bar is outside #page-root: it always follows the data.
-    renderServerTabsBar(applyTerminalFilter());
+    const view = applyTerminalFilter();
+    if (state.active === 'terminal') setTerminalPageVisible(view.stackVisible);
+    renderServerTabsBar(view);
     if (state.active === 'connections') refreshEditorChrome(ctx);
   }
   // Startup restore runs on the first refresh that succeeds, so a failed
@@ -693,9 +727,11 @@ EventsOn('sessions:changed', (payload) => {
   reconcileServerFilter({ reason: 'sessions' });
   renderSidebar();
   // The sub-tabs show live tab states and serial line settings.
-  if (state.active === 'terminal') renderPage();
+  if (state.active === 'terminal' && !pageIsBusy()) renderPage();
   else {
-    renderServerTabsBar(applyTerminalFilter());
+    const view = applyTerminalFilter();
+    if (state.active === 'terminal') setTerminalPageVisible(view.stackVisible);
+    renderServerTabsBar(view);
     // The editor's connection badge and disconnect button follow the
     // sessions; the inputs are left alone.
     if (state.active === 'connections') refreshEditorChrome(ctx);
@@ -876,6 +912,7 @@ function renderSettings() {
             </div>
           </div>
           <div class="card-body">
+            <div class="form-text mt-0 mb-2" id="mcp-usage-note">${escapeHtml(t('mcp.usage.sharedNote'))}</div>
             <pre class="command-block"><code>${escapeHtml(config)}</code></pre>
             <div class="usage-list mt-3">
               ${usageRow('list_hosts', t('mcp.usage.listHosts'))}
@@ -1026,7 +1063,7 @@ async function handleCommonClick(event) {
     }
     state.deleteCommand = { open: false, requestId: '' };
     renderModals();
-    showToast(result.message);
+    showToast(resultMessage(result));
     await refreshData({ silent: true });
     return;
   }
@@ -1061,7 +1098,7 @@ async function handleCommonClick(event) {
   if (action === 'generate-token') {
     ctx.bumpGen();
     const result = await GenerateMCPToken();
-    showToast(result.message);
+    showToast(resultMessage(result));
     if (result.token) state.issuedToken = result.token;
     state.dirty.settings = false;
     await refreshData({ silent: true });
@@ -1090,7 +1127,7 @@ async function handleCommonClick(event) {
     }
     ctx.bumpGen();
     const result = await DeleteMCPSettings();
-    showToast(result.message);
+    showToast(resultMessage(result));
     state.dirty.settings = false;
     await refreshData({ silent: true });
   }
@@ -1132,7 +1169,7 @@ app.addEventListener('submit', async (event) => {
     const form = collectMCPForm();
     ctx.bumpGen();
     const result = await SaveMCPSettings(form);
-    showToast(result.message);
+    showToast(resultMessage(result));
     if (!result.ok) {
       state.settingsMcp = { ...state.settingsMcp, ...form, lastError: result.message };
       renderPage();

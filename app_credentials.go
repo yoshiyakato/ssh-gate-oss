@@ -221,16 +221,16 @@ func (a *App) UseCredentialForSession(id string, secret string) ActionResult {
 		return ActionResult{OK: false, Code: "not_found", Message: "接続先が見つかりません"}
 	}
 	if conn.connectionType() == "Serial" || !conn.usesPassword() {
-		return ActionResult{OK: false, Message: "パスワード認証の接続先ではありません", ID: conn.ID}
+		return ActionResult{OK: false, Code: "not_password_auth", Message: "パスワード認証の接続先ではありません", ID: conn.ID}
 	}
 	if secret == "" {
-		return ActionResult{OK: false, Message: "パスワードを入力してください", ID: conn.ID}
+		return ActionResult{OK: false, Code: "password_required", Message: "パスワードを入力してください", ID: conn.ID}
 	}
 	if a.sessionSecrets == nil {
 		return ActionResult{OK: false, Code: "keyring_unavailable", Message: "このセッション用の保存先がありません", ID: conn.ID}
 	}
 	if err := a.sessionSecrets.Set(context.Background(), passwordAccount(conn.ID), secret); err != nil {
-		return ActionResult{OK: false, Message: fmt.Sprintf("パスワードを保持できません: %v", err), ID: conn.ID}
+		return ActionResult{OK: false, Code: "keyring_unavailable", Message: fmt.Sprintf("パスワードを保持できません: %v", err), ID: conn.ID}
 	}
 	a.forgetSecrets(conn.ID)
 	return ActionResult{OK: true, Message: fmt.Sprintf("%s のパスワードをこのセッションだけ使います（アプリを終了すると消えます）", conn.Name), ID: conn.ID}
@@ -294,11 +294,11 @@ func (a *App) PlaintextBackups() []PlaintextBackup {
 // PlaintextBackups reports right now are removed.
 func (a *App) DeletePlaintextBackups(paths []string) ActionResult {
 	if a.dbPath == "" {
-		return ActionResult{OK: false, Message: errStoreUnavailable.Error()}
+		return ActionResult{OK: false, Code: "storage", Message: errStoreUnavailable.Error()}
 	}
 	removed, err := removePlaintextBackups(a.dbPath, paths, a.legacyConnections+".migrated")
 	if err != nil {
-		return ActionResult{OK: false, Message: fmt.Sprintf("%d 件を削除しましたが、削除できないファイルがあります: %v", len(removed), err)}
+		return ActionResult{OK: false, Code: "storage", Message: fmt.Sprintf("%d 件を削除しましたが、削除できないファイルがあります: %v", len(removed), err)}
 	}
 	return ActionResult{OK: true, Message: fmt.Sprintf("平文のパスワードを含むバックアップを %d 件削除しました", len(removed))}
 }

@@ -48,6 +48,9 @@ export const APPROVALS_I18N = {
     'appr.target.changed': '要求後に実行先が変わりました（{from} → {to}）。この要求は承認できません',
     'appr.target.changedAction': '拒否してエージェントに再依頼させてください',
     'appr.blocked.changed': '実行先が変わったため承認できません',
+    'appr.blocked.unknown': '実行先が記録されていないため承認できません',
+    'appr.target.unknown': '要求時の実行先が記録されていない古い要求です。承認できないので、拒否してエージェントに再度依頼させてください',
+    'appr.code.target_unknown': '要求時の実行先が記録されていない古い要求のため承認できません。拒否してエージェントに再度依頼させてください',
     'appr.blocked.notExecutable': 'シリアルの接続先では実行できません',
     'appr.unknownConnection': '不明な接続先',
     'appr.hiddenPending': 'ほかの接続先に承認待ちが {n} 件あります',
@@ -97,6 +100,9 @@ export const APPROVALS_I18N = {
     'appr.target.changed': 'The target changed after the request ({from} → {to}). This request cannot be approved',
     'appr.target.changedAction': 'Reject it and have the agent ask again',
     'appr.blocked.changed': 'Cannot approve: the target changed',
+    'appr.blocked.unknown': 'Cannot approve: the target was not recorded',
+    'appr.target.unknown': 'This older request has no recorded target, so it cannot be approved. Reject it and have the agent ask again',
+    'appr.code.target_unknown': 'Not approved: this older request has no recorded target. Reject it and have the agent ask again',
     'appr.blocked.notExecutable': 'Cannot run on a serial connection',
     'appr.unknownConnection': 'Unknown connection',
     'appr.hiddenPending': '{n} more awaiting approval on other connections',
@@ -131,7 +137,7 @@ export const APPROVALS_I18N = {
 };
 
 // The ActionResult codes approve can return (approval.go).
-export const APPROVAL_CODES = Object.freeze(['not_pending', 'expired', 'risk_increased', 'bearer_required', 'target_changed', 'shutting_down', 'serial_not_supported', 'canceled', 'storage']);
+export const APPROVAL_CODES = Object.freeze(['not_pending', 'expired', 'risk_increased', 'bearer_required', 'target_changed', 'target_unknown', 'shutting_down', 'serial_not_supported', 'canceled', 'storage']);
 
 export function createApprovalsState() {
   return {
@@ -247,6 +253,9 @@ export function bypassAvailability(state, request) {
 // (phase4-ui-integration §3.3: the backend records it as failed).
 export function approvalBlock(target) {
   if (!target) return { blocked: false, reasonKey: '' };
+  // targetUnknown (N21): an older request without a recorded target; the
+  // backend refuses it as target_unknown (fpChanged is also true).
+  if (target.targetUnknown) return { blocked: true, reasonKey: 'appr.blocked.unknown' };
   if (target.fpChanged) return { blocked: true, reasonKey: 'appr.blocked.changed' };
   if (target.found && target.executable === false) return { blocked: true, reasonKey: 'appr.blocked.notExecutable' };
   return { blocked: false, reasonKey: '' };
@@ -640,7 +649,9 @@ function fillTargetPanel(panel, target, t) {
   } else if (!target.found) {
     children.push(el('div', { class: 'alert alert-warning py-2 mb-0 approval-target-missing', role: 'alert', text: t('appr.target.notFound') }));
   } else {
-    if (target.fpChanged) {
+    if (target.targetUnknown) {
+      children.push(el('div', { class: 'alert alert-danger py-2 approval-target-unknown', role: 'alert', text: t('appr.target.unknown') }));
+    } else if (target.fpChanged) {
       children.push(el('div', { class: 'alert alert-danger py-2 approval-target-changed', role: 'alert' },
         el('div', { class: 'fw-bold', text: t('appr.target.changed', { from: target.requestedFp || '-', to: target.currentFp || '-' }) }),
         el('div', { text: t('appr.target.changedAction') })));
@@ -742,7 +753,7 @@ function keepEdit(ctx, button) {
 
 async function finishApproval(ctx, request, result) {
   const { state, t } = ctx;
-  if (result?.code === 'target_changed') await loadApprovalTarget(ctx, request.id);
+  if (result?.code === 'target_changed' || result?.code === 'target_unknown') await loadApprovalTarget(ctx, request.id);
   // Keep the request selected so its stdout/stderr (or new state) shows.
   state.selectedRequestId = request.id ?? '';
   ctx.toast(approvalResultMessage(result, t));
@@ -772,7 +783,11 @@ async function approve(ctx, view, button, { bypass }) {
   }
   const block = approvalBlock(target);
   if (block.blocked) {
-    ctx.toast(t(block.reasonKey === 'appr.blocked.changed' ? 'appr.code.target_changed' : 'appr.target.notExecutable'));
+    const toastKey = {
+      'appr.blocked.changed': 'appr.code.target_changed',
+      'appr.blocked.unknown': 'appr.code.target_unknown',
+    }[block.reasonKey] ?? 'appr.target.notExecutable';
+    ctx.toast(t(toastKey));
     return;
   }
   if (bypass) {
@@ -868,7 +883,7 @@ export async function handleApprovalsClick(event, ctx, view) {
   if (action === 'revoke-bypass') {
     ctx.bumpGen();
     const result = await RevokeAgentApprovalBypass(actionElement.dataset.agentName ?? '');
-    ctx.toast(result?.message ?? '');
+    ctx.toast(ctx.resultMessage ? ctx.resultMessage(result) : (result?.message ?? ''));
     await ctx.refresh({ silent: true });
     return true;
   }

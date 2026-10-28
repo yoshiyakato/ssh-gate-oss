@@ -175,7 +175,8 @@ func (a *App) handleAudit(w http.ResponseWriter, r *http.Request, settings MCPSe
 		writeJSON(w, http.StatusMethodNotAllowed, rpcErrorResponse(nil, -32600, "GET only"))
 		return
 	}
-	if _, ok := a.authenticateMCP(r, settings, token); !ok {
+	caller, ok := a.authenticateMCP(r, settings, token)
+	if !ok {
 		writeUnauthorized(w)
 		return
 	}
@@ -184,17 +185,30 @@ func (a *App) handleAudit(w http.ResponseWriter, r *http.Request, settings MCPSe
 		limit = min(v, 500)
 	}
 	a.mu.RLock()
-	requests := cloneRequests(a.requests[:min(limit, len(a.requests))])
+	var requests []CommandRequest
+	for _, req := range a.requests {
+		if len(requests) >= limit {
+			break
+		}
+		// An agent token sees only its own agent's requests, as in
+		// get_request_status (N12).
+		if caller.Agent != "" && req.RequestedBy != caller.Agent {
+			continue
+		}
+		requests = append(requests, req)
+	}
 	agents := a.connectedAgentsLocked()
 	a.mu.RUnlock()
-	// The listener is reachable by agents: withhold the target address and
-	// the local error detail, as list_hosts and get_request_status do.
-	for i := range requests {
-		requests[i].Stderr = agentStderr(requests[i].Stderr, requests[i].ErrorKind)
-		requests[i].TargetFP = ""
+	// The listener is reachable by agents: answer in the agent-facing shape
+	// of get_request_status (requestView), which withholds the SSH login
+	// user, the connection ID, the target address and the local error
+	// detail (N13).
+	views := make([]map[string]any, 0, len(requests))
+	for _, req := range requests {
+		views = append(views, requestView(req, true))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"requests":         requests,
+		"requests":         views,
 		"connected_agents": agents,
 	})
 }
@@ -294,7 +308,7 @@ func (a *App) callMCPTool(ctx context.Context, caller mcpCaller, params toolCall
 		if err := decodeToolArgs(params.Arguments, &args); err != nil {
 			return nil, err
 		}
-		return a.requestStatusTool(ctx, args)
+		return a.requestStatusTool(ctx, caller, args)
 	case "execute_command", "request_command_execution":
 		var args executeCommandArgs
 		if err := decodeToolArgs(params.Arguments, &args); err != nil {
@@ -410,6 +424,13 @@ func (a *App) executeCommandTool(ctx context.Context, caller mcpCaller, args exe
 	}
 	if agentName == "" {
 		return nil, invalidParams("agent_name is required")
+	}
+	// A name bound to an agent token can only be used with that token (N14):
+	// otherwise the shared token (or no token) could queue requests in its
+	// name and take its client_request_id first, so the real agent's retry
+	// would be answered with someone else's request (deduplicated).
+	if caller.Agent == "" && a.agentHasToken(agentName) {
+		return toolError("unauthorized_bypass", "this agent_name has its own agent token; authenticate with that token", nil), nil
 	}
 
 	// The key lock spans lookup and creation so concurrent retries with the
@@ -565,7 +586,14 @@ func (a *App) runBypassedCommand(ctx context.Context, conn Connection, args exec
 	if latest, ok := a.findRequest(req.ID); ok {
 		current = latest
 	}
-	return toolResult(executeView(current), false)
+	out := executeView(current)
+	if current.Status == stateAutoRunning {
+		// §5.3 and the tool description: a detached run answers
+		// state=running; get_request_status then reports auto_running until
+		// it ends (N27).
+		out["state"] = stateRunning
+	}
+	return toolResult(out, false)
 }
 
 // finishedRun is a bypassed run's recorded outcome and finishRequest's error.
@@ -588,7 +616,7 @@ func busyResult() any {
 		map[string]any{"retry_after_ms": busyRetryAfter.Milliseconds()})
 }
 
-func (a *App) requestStatusTool(ctx context.Context, args requestStatusArgs) (any, *rpcError) {
+func (a *App) requestStatusTool(ctx context.Context, caller mcpCaller, args requestStatusArgs) (any, *rpcError) {
 	if len(args.RequestIDs) == 0 || len(args.RequestIDs) > 20 {
 		return nil, invalidParams("request_ids must contain 1-20 ids")
 	}
@@ -597,6 +625,25 @@ func (a *App) requestStatusTool(ctx context.Context, args requestStatusArgs) (an
 	}
 	includeOutput := args.IncludeOutput == nil || *args.IncludeOutput
 	wait := time.Duration(args.WaitSeconds) * time.Second
+	// An agent token may only read its own agent's requests (N12): another
+	// agent's request answers not_found, exactly as an unknown ID would (so
+	// it also ends a long-poll at once). The shared token and an
+	// unauthenticated loopback client keep seeing every request.
+	ids := args.RequestIDs
+	foreign := map[string]bool{}
+	if caller.Agent != "" {
+		ids = nil
+		for _, id := range args.RequestIDs {
+			if owner, ok := a.requestOwner(id); ok && owner != caller.Agent {
+				foreign[id] = true
+				continue
+			}
+			ids = append(ids, id)
+		}
+		if len(foreign) > 0 {
+			wait = 0
+		}
+	}
 	// A listener stop answers a long-poll with the current state instead of
 	// cutting it off without a response.
 	ctx, cancel := withListenerStop(ctx)
@@ -607,7 +654,41 @@ func (a *App) requestStatusTool(ctx context.Context, args requestStatusArgs) (an
 		}
 		defer a.mcpRuntime.releaseWaiter()
 	}
-	return toolResult(map[string]any{"requests": a.requestStatus(ctx, args.RequestIDs, wait, includeOutput)}, false), nil
+	var views []map[string]any
+	if len(ids) > 0 {
+		views = a.requestStatus(ctx, ids, wait, includeOutput)
+	}
+	if len(foreign) == 0 {
+		return toolResult(map[string]any{"requests": views}, false), nil
+	}
+	// Put the not_found entries back in the order the agent asked.
+	out := make([]map[string]any, 0, len(args.RequestIDs))
+	next := 0
+	for _, id := range args.RequestIDs {
+		if foreign[id] {
+			out = append(out, map[string]any{"request_id": id, "error_kind": "not_found", "message": "request not found"})
+			continue
+		}
+		out = append(out, views[next])
+		next++
+	}
+	return toolResult(map[string]any{"requests": out}, false), nil
+}
+
+// requestOwner returns the agent that made request id (memory first, then
+// SQLite); ok=false when the request is unknown.
+func (a *App) requestOwner(id string) (string, bool) {
+	if req, ok := a.findRequest(id); ok {
+		return req.RequestedBy, true
+	}
+	if a.store == nil {
+		return "", false
+	}
+	req, ok, err := a.store.loadCommandRequest(id)
+	if err != nil || !ok {
+		return "", false
+	}
+	return req.RequestedBy, true
 }
 
 // requestView is the agent-facing shape of a request (get_request_status and,
@@ -923,7 +1004,7 @@ func mcpTools() []map[string]any {
 		{
 			"name":        "get_request_status",
 			"title":       "要求の状態を取得",
-			"description": "request_id の状態と結果を返します。wait_seconds を指定すると、いずれかの要求が終了状態（succeeded / failed / rejected など）になるかその秒数が経つまで待ってから返します。",
+			"description": "request_id の状態と結果を返します。エージェント用トークンで認証した場合、ほかのエージェントの要求は not_found になります。wait_seconds を指定すると、いずれかの要求が終了状態（succeeded / failed / rejected など）になるかその秒数が経つまで待ってから返します。",
 			"annotations": map[string]any{"title": "要求の状態を取得", "readOnlyHint": true, "idempotentHint": true, "openWorldHint": false},
 			"inputSchema": map[string]any{
 				"type": "object",

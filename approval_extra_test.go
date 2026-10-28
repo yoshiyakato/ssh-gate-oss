@@ -100,7 +100,7 @@ func TestBypassDisconnectInGapDoesNotRun(t *testing.T) {
 	app.setAgentApprovalBypass("trusted", true)
 	issueAgentToken(t, app, "trusted")
 
-	out, _ := app.executeCommandTool(context.Background(), mcpCaller{Agent: "trusted"},
+	out, _ := app.executeCommandTool(context.Background(), agentCaller(app, "trusted"),
 		executeCommandArgs{Host: "lab", Command: "echo gap", AgentName: "trusted"})
 	if execs := srv.Execs(); len(execs) != 0 {
 		t.Fatalf("command reached the host after disconnect: %v (%v)", execs, out)
@@ -320,7 +320,7 @@ func TestBypassReportsUnsavedResult(t *testing.T) {
 		}
 		_ = app.store.db.Close()
 	}()
-	out, rpcErr := app.executeCommandTool(context.Background(), mcpCaller{Agent: "trusted"},
+	out, rpcErr := app.executeCommandTool(context.Background(), agentCaller(app, "trusted"),
 		executeCommandArgs{Host: "lab", Command: "sleep 1", AgentName: "trusted"})
 	if rpcErr != nil {
 		t.Fatal(rpcErr)

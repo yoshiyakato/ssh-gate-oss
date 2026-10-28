@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -1438,5 +1439,165 @@ func TestSerialEmptyPortStillRejected(t *testing.T) {
 	a, _ := newSerialTestApp(t, Connection{ID: "e", Name: "empty", Type: "Serial"})
 	if r := a.StartTerminal("TERM-e", "e", 80, 24); r.OK || r.Code != "invalid_serial_mode" {
 		t.Fatalf("empty port = %+v", r)
+	}
+}
+
+// ---- §9.6 A11 / M2 ----
+
+// TestSaveConnectionNoDeadlock (A11): SaveConnection, opening and closing the
+// tab, in-place apply and the read paths that take a.mu and termMu run in
+// parallel. If any path held a.mu while waiting for termMu (or the other way
+// round) this would hang; the watchdog fails the test with a goroutine dump.
+// Run it with -race -count=20.
+func TestSaveConnectionNoDeadlock(t *testing.T) {
+	withFakeSerial(t, "linux", func(string, *serial.Mode) (serialPort, error) { return newFakeSerialPort(), nil }, nil)
+	app := newTestApp(t)
+	conn := addTestConnection(t, app, Connection{Name: "uart", Type: "Serial", SerialPort: "/dev/ttyUSB3", BaudRate: 115200})
+	t.Cleanup(func() {
+		app.CloseAllTerminals()
+		app.terminalLoops.Wait()
+	})
+
+	const rounds = 30
+	parities := []string{"none", "even", "odd"}
+	var wg sync.WaitGroup
+	run := func(f func(i int)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range rounds {
+				f(i)
+			}
+		}()
+	}
+	run(func(i int) { // save: in-place apply on the open tab, or nothing
+		edit := conn
+		edit.Parity = parities[i%len(parities)]
+		edit.BaudRate = []int{9600, 115200}[i%2]
+		if r := app.SaveConnection(edit); !r.OK {
+			t.Errorf("save %d: %+v", i, r)
+		}
+	})
+	run(func(i int) { // save a rename, which also rewrites a.conns
+		edit := conn
+		edit.Description = fmt.Sprintf("round %d", i)
+		_ = app.SaveConnection(edit)
+	})
+	run(func(i int) { // open / close the tab
+		id := fmt.Sprintf("TERM-nd-%d", i)
+		if r := app.StartTerminal(id, conn.ID, 80, 24); r.OK {
+			_ = app.SendTerminalInput(id, "x")
+			app.CloseTerminal(id)
+		}
+	})
+	run(func(i int) { // open a second tab and close everything by connection
+		if r := app.StartTerminal(fmt.Sprintf("TERM-nd2-%d", i), conn.ID, 80, 24); r.OK {
+			app.CloseTerminalsByConnection(conn.ID)
+		}
+	})
+	run(func(i int) {
+		_, _ = app.applySerialSettings(conn.ID, settingsOf([]int{19200, 115200}[i%2], 8, "none", "1"))
+	})
+	run(func(int) {
+		_ = app.ListTerminalSessions()
+		_ = app.GetInitialData()
+	})
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		// t.Fatalf, or a panic here, would run the cleanups, which need the
+		// same locks and hang. Dump every goroutine and crash the process
+		// from a goroutine tRunner does not recover.
+		buf := make([]byte, 1<<22)
+		n := runtime.Stack(buf, true)
+		fmt.Fprintf(os.Stderr, "%s\n", buf[:n])
+		go panic("TestSaveConnectionNoDeadlock: SaveConnection / tab open-close / apply deadlocked")
+		select {}
+	}
+	// The app is still usable afterwards.
+	if r := app.SaveConnection(conn); !r.OK {
+		t.Fatalf("save after the race: %+v", r)
+	}
+}
+
+// TestMCPNeverReturnsTerminalOutput (M2): what a serial tab prints, and what
+// is typed into it, never reaches an MCP agent through any tool.
+func TestMCPNeverReturnsTerminalOutput(t *testing.T) {
+	const marker = "secret-xyz"
+	port := newFakeSerialPort()
+	withFakeSerial(t, "linux", openFake(port), nil)
+	isolateEnv(t)
+	t.Setenv("SSH_GETE_NO_SEED", "1") // only the two rows below
+	app := NewApp()
+	t.Cleanup(func() { app.shutdown(context.Background()) })
+	rec := &eventRecorder{}
+	app.emit = rec.emit
+	conn := addTestConnection(t, app, Connection{Name: "uart", Type: "Serial", SerialPort: "/dev/ttyUSB4", BaudRate: 115200,
+		Description: "board console", Tags: []string{"lab"}})
+	ssh := addTestConnection(t, app, Connection{Name: "web", Host: "10.9.9.9", User: "u"})
+	pending := queueOn(t, app, ssh, "uptime", "agent-m2")
+	t.Cleanup(func() {
+		app.CloseAllTerminals()
+		app.terminalLoops.Wait()
+	})
+
+	id := "TERM-m2"
+	if r := app.StartTerminal(id, conn.ID, 80, 24); !r.OK {
+		t.Fatalf("open: %+v", r)
+	}
+	port.reads <- fakeRead{data: []byte("login: " + marker + "\r\n")}
+	mustSend(t, app, id, "echo "+marker+"\r")
+	waitUntil(t, "output reaches the tab", func() bool { return strings.Contains(rec.data(id), marker) })
+	waitUntil(t, "input reaches the port", func() bool {
+		port.mu.Lock()
+		defer port.mu.Unlock()
+		return strings.Contains(port.written.String(), marker)
+	})
+
+	calls := []struct{ name, args string }{
+		{"list_hosts", `{}`},
+		{"list_hosts", `{"connected_only":true}`},
+		{"list_hosts", `{"tag":"lab"}`},
+		{"execute_command", `{"host":"uart","command":"cat /proc/version","agent_name":"agent-m2"}`},
+		{"request_command_execution", `{"host":"uart","command":"cat /proc/version","agent_name":"agent-m2"}`},
+		{"get_request_status", `{"request_ids":["` + pending.ID + `"]}`},
+		{"get_command_history", `{"agent_name":"agent-m2"}`},
+		{"get_command_history", `{"host":"uart","agent_name":"agent-m2"}`},
+	}
+	seen := map[string]bool{}
+	for _, c := range calls {
+		resp := app.serveTest(t, mcpCall{body: toolCall(c.name, c.args)})
+		if resp.Code != 200 {
+			t.Fatalf("%s: status=%d body=%s", c.name, resp.Code, resp.Body.String())
+		}
+		body := resp.Body.String()
+		if !strings.Contains(body, `"result"`) {
+			t.Fatalf("%s %s: no result: %s", c.name, c.args, body)
+		}
+		if strings.Contains(body, marker) {
+			t.Fatalf("%s %s returned terminal output: %s", c.name, c.args, body)
+		}
+		seen[c.name] = true
+	}
+	// The open serial tab is visible to list_hosts (so the tool did look at
+	// the terminal state), just never its contents.
+	out, _ := callTool(t, app, "list_hosts", `{"connected_only":true}`)
+	if hosts, _ := out["hosts"].([]any); len(hosts) != 1 {
+		t.Fatalf("connected hosts = %v, want the open serial tab", out["hosts"])
+	}
+	for _, method := range []string{"tools/list", "initialize"} {
+		resp := app.serveTest(t, mcpCall{body: `{"jsonrpc":"2.0","id":1,"method":"` + method + `","params":{}}`})
+		if strings.Contains(resp.Body.String(), marker) {
+			t.Fatalf("%s returned terminal output", method)
+		}
+		seen[method] = true
+	}
+	for _, name := range []string{"list_hosts", "execute_command", "request_command_execution", "get_request_status", "get_command_history"} {
+		if !seen[name] {
+			t.Fatalf("tool %s not called", name)
+		}
 	}
 }

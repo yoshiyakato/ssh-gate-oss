@@ -173,6 +173,8 @@ describe('pure helpers', () => {
     expect(approvalBlock(okTarget({ fpChanged: true }))).toEqual({ blocked: true, reasonKey: 'appr.blocked.changed' });
     expect(approvalBlock(okTarget({ executable: false, type: 'Serial' }))).toEqual({ blocked: true, reasonKey: 'appr.blocked.notExecutable' });
     expect(approvalBlock({ found: false }).blocked).toBe(false);
+    // N21: an older request without a recorded target cannot be approved.
+    expect(approvalBlock(okTarget({ targetUnknown: true, fpChanged: true }))).toEqual({ blocked: true, reasonKey: 'appr.blocked.unknown' });
   });
 
   it('bypassAvailability needs an agent name and the shared or the agent token', () => {
@@ -240,6 +242,20 @@ describe('renderCommandsPage', () => {
     await render();
     expect(root.querySelector('.approval-hostkey-unknown')).not.toBeNull();
     expect(root.querySelector('#approval-target').textContent).toContain('IDの無い古い要求');
+  });
+
+  it('disables approve for an older request without a recorded target (N21)', async () => {
+    for (const lang of ['ja', 'en']) {
+      makeCtx(lang);
+      state.data.requests = [request('R1')];
+      backend.target = okTarget({ targetUnknown: true, fpChanged: true, requestedFp: '' });
+      await render();
+      expect(root.querySelector('.approval-target-unknown').textContent).toBe(tFor(lang)('appr.target.unknown'));
+      expect(root.querySelector('.approval-target-changed')).toBeNull();
+      expect(root.querySelector('[data-action="approve-command"]').disabled).toBe(true);
+      expect(root.querySelector('[data-action="approve-command"]').title).toBe(tFor(lang)('appr.blocked.unknown'));
+      expect(root.querySelector('[data-action="reject-command"]').disabled).toBe(false);
+    }
   });
 
   it('disables approve and bypass when the target changed, and tells the user to reject (REQ-011)', async () => {

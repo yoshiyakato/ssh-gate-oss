@@ -190,6 +190,19 @@
 - 同時実行の上限を超えたときは、同期では `server_busy` と `retry_after_ms` を返します。
 - HTTP が切断されたらキャンセルとみなします（notifications/cancelled は扱いません）。
 - 同じ agent_name と client_request_id の組が24時間以内にあれば、新しく作らずに既存の request_id を返します。
+- request_id は `REQ-<ミリ秒>-<連番>-<12桁の16進乱数>` です。推測で他人の要求を引けないようにするためです（監査 N12）。
+- エージェント用トークンで認証した呼び出しは、`get_request_status` でも自分のエージェントの要求しか見えません。ほかのエージェントの要求は、存在しない ID と同じく `error_kind:"not_found"` で返し、long-poll もすぐ終えます。共有 Bearer トークンと未認証（ループバックで Bearer OFF）の呼び出しは、従来どおり全件見えます（監査 N12）。
+- エージェント用トークンが発行されている agent_name は、そのトークンでしか名乗れません。共有トークンや未認証の呼び出しがその名前で `execute_command` を呼ぶと、承認キューには入れず `unauthorized_bypass` で拒否します。共有トークンがその名前で client_request_id を先取りし、本物のエージェントの再試行に別人の要求を返すのを防ぐためです（監査 N14）。
+- 承認省略の判定では、認証に使ったトークンがそのエージェントの現行トークンかを確かめます。トークンを再発行すると、古いトークンは承認省略を失います（監査 N28）。
+- 新しく発行するエージェント用トークンの承認省略は、既定で無効です。そのエージェントの承認省略がすでに許可されているときだけ有効にし、許可・取り消しに合わせて現行トークンの値も切り替えます（監査 E4）。
+- 承認省略で実行中に応答を切り離した場合（RequestTimeout 超過、待ち受けの再起動）、その時点の応答は `state:"running"` です。その後の `get_request_status` は終わるまで `auto_running` を返します（監査 N27）。
+
+#### `/audit/events`（GET）
+
+- 返す `requests[]` の各要素は、`get_request_status` の要素（requestView）と同じ形です。キーは `request_id`、`connection`、`state`、`risk`、`requested_command`、`executed_command`、`modified_by_human`、`requested_by`、`requested_at`、`decided_by?`、`decided_at?`、`exit_code?`、`error_kind?`、`stdout`、`stderr` などです。
+- SSH のログインユーザー（`user`）、接続先 ID（`connectionId`）、実行先（`targetFp`）は返しません。stderr のローカルなエラー詳細も、get_request_status と同じく伏せます（監査 N13）。
+- 以前の版は CommandRequest をそのまま返していたので、キー名が変わっています（例：`command` → `requested_command`、`status` → `state`）。
+- エージェント用トークンで呼んだ場合は、そのエージェントの要求だけを返します（監査 N12/N13）。
 
 ### 5.4 状態モデル（保存と接続を分ける）
 
@@ -344,6 +357,8 @@ MCP ● 待受中 127.0.0.1:8787
   - 同じ client_request_id を再送しても実行は1回だけ
   - 未知のホストに MCP から実行すると hostkey_unknown のエラーになる
   - 未知のホストが証明書を出し、一致する `@cert-authority` 行がなければ、証明書の中の鍵で TOFU する（OpenSSH と同じ）。CA 行が一致するのに検証できない証明書と、`@revoked` の CA が署名した証明書は拒否する（監査 N18 / N31）
+  - GUI 起点の TOFU は、ハンドシェイク中は鍵を候補（`hostKeyCandidate`）として持つだけにし、SSH 認証が成功してから known_hosts に書く。接続テスト・ターミナル起動のどちらも同じで、認証に失敗した接続先の鍵は信頼しない（監査 N20）
+  - 設定ディレクトリ、DB と `-wal`/`-shm`/`.lock`、移行時のバックアップ、known_hosts は本人だけが読み書きできるようにする。Unix では 0700/0600、Windows では本人と SYSTEM だけの保護 DACL（監査 #41）
   - MCP から承認待ちに積んだ要求の timeout_seconds は command_requests.timeout_seconds に保存し、承認後の実行（再起動後を含む）に使う（監査 N11）
   - 鍵が不一致なら常に拒否する
   - 共有トークンだけでは承認省略を名乗れない

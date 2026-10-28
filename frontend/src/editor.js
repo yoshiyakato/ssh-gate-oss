@@ -88,6 +88,7 @@ export const EDITOR_I18N = {
     'edit.delete.body': 'を接続先一覧から削除します。',
     'edit.delete.history': 'コマンド履歴は監査用に残します。',
     'edit.deleteWithTabs': '開いているターミナル {k} タブも閉じます。',
+    'edit.deleteWithRunning': '実行中のコマンド {j} 件も中止します。',
     'edit.disconnect.title': '接続を切断',
     'edit.disconnect.body': '{name} への接続を切断します。',
     'edit.disconnectConfirm': 'ターミナル {k} タブと実行中コマンド {j} 件も終了します。',
@@ -196,6 +197,7 @@ export const EDITOR_I18N = {
     'edit.delete.body': 'will be removed from the connection list.',
     'edit.delete.history': 'Command history is kept for auditing.',
     'edit.deleteWithTabs': 'This also closes {k} open terminal tab(s).',
+    'edit.deleteWithRunning': 'This also stops {j} running command(s).',
     'edit.disconnect.title': 'Disconnect',
     'edit.disconnect.body': 'Disconnect from {name}.',
     'edit.disconnectConfirm': 'This also closes {k} terminal tab(s) and stops {j} running command(s).',
@@ -254,6 +256,8 @@ const DATA_BITS = [5, 6, 7, 8];
 const PARITIES = ['none', 'odd', 'even', 'mark', 'space'];
 const STOP_BITS = ['1', '1.5', '2'];
 const SERIAL_FIELDS = ['dataBits', 'parity', 'stopBits'];
+// Text inputs SaveConnection may name in result.field (E5).
+const TEXT_ERROR_FIELDS = ['name', 'host', 'user', 'credential'];
 
 function emptyTest() {
   return { ok: null, message: '', target: '', connId: '' };
@@ -387,6 +391,26 @@ function currentSaveState(state) {
 function rowIsDirty(state, connection) {
   const draft = state.editor.draft;
   return Boolean(draft && draft.id === connection.id && isEditorDirty(state));
+}
+
+// A connection with only running commands (no tab) reports connState
+// 'disconnected' from the backend, yet it still has something to cut.
+function canDisconnectConn(ctx, id) {
+  if (!id) return false;
+  if (DISCONNECTABLE.includes(connStateFor(ctx, id))) return true;
+  const session = ctx.sessionFor?.(id);
+  return (session?.running ?? 0) > 0 || (session?.shells ?? 0) > 0 || (session?.connecting ?? 0) > 0;
+}
+
+// resultText is the text shown for a backend result (main.js resultMessage:
+// English from the code in EN mode, the backend message in JA).
+function resultText(ctx, result) {
+  return ctx.resultMessage ? ctx.resultMessage(result) : String(result?.message || '');
+}
+
+function toastResult(ctx, result) {
+  const message = resultText(ctx, result);
+  if (message) ctx.toast(message);
 }
 
 function connStateFor(ctx, id) {
@@ -739,7 +763,7 @@ function renderActions(state, ctx) {
   const dirty = saveState !== 'saved';
   const code = connStateFor(ctx, connection?.id);
   const canOpen = saveState === 'saved' && Boolean(connection?.id);
-  const canDisconnect = Boolean(connection?.id) && DISCONNECTABLE.includes(code);
+  const canDisconnect = canDisconnectConn(ctx, connection?.id);
   const saveFirst = canOpen ? '' : escapeHtml(t('edit.saveFirst'));
   const notConnected = canDisconnect ? '' : escapeHtml(t('edit.notConnected'));
   const busy = editor.busy;
@@ -820,7 +844,7 @@ function renderForm(state, ctx) {
       <div class="card-body">
         <div id="editor-alert">${renderAlert(state)}</div>
         <div class="row g-3">
-          ${inputCol(t('edit.name'), 'name', connection.name)}
+          ${inputCol(t('edit.name'), 'name', connection.name, 'text', undefined, state)}
           ${typeCol(t, connection.type)}
           ${isSerial ? serialDropsSSHNotice(state, t, connection) : ''}
           ${isSerial ? serialFields(state, ctx, connection) : sshFields(state, t, connection)}
@@ -840,11 +864,14 @@ function renderForm(state, ctx) {
   `;
 }
 
-function inputCol(label, name, value, type = 'text', col = 'col-12 col-md-6') {
+// state, when given, paints the field error the backend named (E5).
+function inputCol(label, name, value, type = 'text', col = 'col-12 col-md-6', state = null) {
+  const invalid = state ? invalidClass(state, name) : '';
   return `
     <div class="${col}">
       <label class="form-label fw-bold">${escapeHtml(label)}</label>
-      <input class="form-control" name="${name}" type="${type}" value="${escapeHtml(value)}" autocapitalize="none" autocorrect="off" autocomplete="off" spellcheck="false">
+      <input class="form-control${invalid}" name="${name}" type="${type}" value="${escapeHtml(value)}" aria-invalid="${invalid ? 'true' : 'false'}" autocapitalize="none" autocorrect="off" autocomplete="off" spellcheck="false">
+      ${state ? invalidFeedback(state, name) : ''}
     </div>
   `;
 }
@@ -867,26 +894,27 @@ function sshFields(state, t, connection) {
   const auth = isPassword(connection) ? AUTH_PASSWORD : AUTH_KEY;
   const authOptions = [[AUTH_KEY, t('edit.authKey')], [AUTH_PASSWORD, t('edit.authPassword')]];
   return `
-    ${inputCol(t('edit.host'), 'host', connection.host)}
+    ${inputCol(t('edit.host'), 'host', connection.host, 'text', undefined, state)}
     ${inputCol(t('edit.port'), 'port', connection.port, 'number')}
-    ${inputCol(t('edit.user'), 'user', connection.user)}
+    ${inputCol(t('edit.user'), 'user', connection.user, 'text', undefined, state)}
     <div class="col-12 col-md-6">
       <label class="form-label fw-bold">${escapeHtml(t('edit.authMethod'))}</label>
       <select class="form-select" name="authMethod" data-action="edit-auth">
         ${authOptions.map(([value, label]) => `<option value="${escapeHtml(value)}" ${value === auth ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}
       </select>
     </div>
-    ${isPassword(connection) ? passwordCol(state, t, connection) : keyPathCol(t, connection)}
+    ${isPassword(connection) ? passwordCol(state, t, connection) : keyPathCol(state, t, connection)}
     ${inputCol(t('edit.connectTimeout'), 'connectTimeout', connection.connectTimeout, 'number')}
     ${inputCol(t('edit.commandTimeout'), 'commandTimeout', connection.commandTimeout, 'number')}
   `;
 }
 
-function keyPathCol(t, connection) {
+function keyPathCol(state, t, connection) {
   return `
     <div class="col-12 col-md-6">
       <label class="form-label fw-bold">${escapeHtml(t('edit.keyPath'))}</label>
-      <input class="form-control" name="credential" type="text" value="${escapeHtml(connection.credential)}" autocapitalize="none" autocorrect="off" autocomplete="off" spellcheck="false">
+      <input class="form-control${invalidClass(state, 'credential')}" name="credential" type="text" value="${escapeHtml(connection.credential)}" autocapitalize="none" autocorrect="off" autocomplete="off" spellcheck="false">
+      ${invalidFeedback(state, 'credential')}
       <div class="form-text">${escapeHtml(t('edit.keyPathHelp'))}</div>
     </div>
   `;
@@ -905,9 +933,10 @@ function passwordCol(state, t, connection) {
         <span class="badge ${isSet ? 'text-bg-success' : 'text-bg-secondary'}">${isSet ? '✓ ' : ''}${escapeHtml(isSet ? t('edit.passwordSet') : t('edit.passwordUnset'))}</span>
       </label>
       <div class="input-group">
-        <input class="form-control" name="credential" type="password" value="${escapeHtml(connection.credential || '')}" placeholder="${escapeHtml(isSet ? '••••••' : '')}" autocomplete="new-password" autocapitalize="none" autocorrect="off" spellcheck="false">
+        <input class="form-control${invalidClass(state, 'credential')}" name="credential" type="password" value="${escapeHtml(connection.credential || '')}" placeholder="${escapeHtml(isSet ? '••••••' : '')}" autocomplete="new-password" autocapitalize="none" autocorrect="off" spellcheck="false">
         <button class="btn btn-outline-secondary" type="button" data-action="edit-clear-password" aria-label="${escapeHtml(t('edit.passwordClearAria'))}" ${connection.credential ? '' : 'disabled'}>${escapeHtml(t('edit.passwordClear'))}</button>
       </div>
+      ${invalidFeedback(state, 'credential')}
       <div class="form-text" id="editor-password-help">${escapeHtml(passwordHelp(t, connection, isSet))}</div>
     </div>
   `;
@@ -1044,6 +1073,9 @@ export function refreshEditorChrome(ctx) {
 // non-input parts are updated so focus, caret and IME composition survive.
 function renderAfterAction(ctx) {
   const { state, t } = ctx;
+  // The user may have moved to another page while the action ran; a full
+  // redraw there would replace unsaved input (e.g. the approval textarea).
+  if (state.active && state.active !== 'connections') return;
   const form = document.querySelector('#connection-form');
   const connection = currentConnection(state);
   if (!editorHasFocus() || !form || !connection || form.dataset.connId !== connection.id) {
@@ -1065,13 +1097,15 @@ function renderAfterAction(ctx) {
 
 // Field errors without replacing the selects (the partial redraw above).
 function paintFieldErrors(state) {
-  for (const field of [...SERIAL_FIELDS, 'baudRate']) {
+  for (const field of [...SERIAL_FIELDS, 'baudRate', ...TEXT_ERROR_FIELDS]) {
     const input = document.querySelector(`#connection-form [name="${field}"]`);
     if (!input) continue;
     const message = fieldError(state, field);
     input.classList.toggle('is-invalid', Boolean(message));
     input.setAttribute('aria-invalid', message ? 'true' : 'false');
-    let feedback = input.parentElement.querySelector(`[data-field-error="${field}"]`);
+    // The password input sits in an .input-group; its message goes after it.
+    const anchor = input.closest('.input-group') ?? input;
+    let feedback = anchor.parentElement.querySelector(`[data-field-error="${field}"]`);
     if (!message) {
       feedback?.remove();
       continue;
@@ -1079,7 +1113,7 @@ function paintFieldErrors(state) {
     if (!feedback) {
       feedback = element('div', 'invalid-feedback d-block');
       feedback.dataset.fieldError = field;
-      input.after(feedback);
+      anchor.after(feedback);
     }
     feedback.textContent = message;
   }
@@ -1213,8 +1247,8 @@ async function resetHostKey(ctx) {
   } catch (error) {
     result = { ok: false, message: String(error) };
   }
-  if (result?.message) ctx.toast(result.message);
-  editor.alert = result?.ok ? '' : (result?.message || '');
+  toastResult(ctx, result);
+  editor.alert = result?.ok ? '' : resultText(ctx, result);
   invalidateHostKey(editor);
   renderAfterAction(ctx);
 }
@@ -1408,17 +1442,18 @@ async function saveDraft(ctx) {
   } finally {
     editor.busy = '';
   }
-  if (result?.message) ctx.toast(result.message);
+  toastResult(ctx, result);
   if (!result?.ok && result?.code === 'keyring_unavailable' && draft.id && draft.credential && ctx.recoverCredential) {
     // The keychain refused the new password. The draft stays unsaved; the
     // typed password may still be used for this session (never the DB).
     ctx.recoverCredential(draft, result, { password: draft.credential });
   }
   if (!result?.ok) {
-    editor.alert = result?.message || '';
+    editor.alert = resultText(ctx, result);
     // invalid_serial_mode (phase4-serial-patch §10-3) may name the field.
-    if (result?.field && [...SERIAL_FIELDS, 'baudRate'].includes(result.field)) {
-      editor.fieldErrors = { [result.field]: result.message || '' };
+    // SaveConnection names name/host/user (required, duplicate_name) (E5).
+    if (result?.field && [...SERIAL_FIELDS, 'baudRate', ...TEXT_ERROR_FIELDS].includes(result.field)) {
+      editor.fieldErrors = { [result.field]: resultText(ctx, result) };
     }
     renderAfterAction(ctx);
     return false;
@@ -1552,8 +1587,8 @@ async function runConnectionTest(ctx) {
     editor.busy = '';
   }
   // Only the test panel changes; connState is the backend's business.
-  editor.test = { ok: Boolean(result?.ok), message: result?.message || '', target: testTarget(tested), connId };
-  if (result?.message) ctx.toast(result.message);
+  editor.test = { ok: Boolean(result?.ok), message: resultText(ctx, result), target: testTarget(tested), connId };
+  toastResult(ctx, result);
   // A GUI test is where an unknown host key gets recorded (TOFU).
   invalidateHostKey(editor);
   // The backend records lastTest when the tested values equal the saved ones.
@@ -1576,7 +1611,7 @@ async function disconnect(ctx) {
   const connection = currentConnection(state);
   if (!connection?.id) return;
   const session = ctx.sessionFor?.(connection.id);
-  if (!DISCONNECTABLE.includes(connStateFor(ctx, connection.id))) return;
+  if (!canDisconnectConn(ctx, connection.id)) return;
   const k = (session?.shells ?? 0) + (session?.connecting ?? 0);
   const j = session?.running ?? 0;
   const name = savedById(state, connection.id)?.name ?? connection.name;
@@ -1594,7 +1629,7 @@ async function disconnect(ctx) {
   } catch (error) {
     result = { ok: false, message: String(error) };
   }
-  if (result?.message) ctx.toast(result.message);
+  toastResult(ctx, result);
   // Open tabs also leave on terminal:exit(user); this catches a tab that was
   // reconnecting (StartTerminal just returns canceled) and exited tabs.
   if (result?.ok) ctx.closeTabsForConnection?.(connection.id);
@@ -1620,11 +1655,14 @@ async function deleteConnection(ctx, connId) {
   if (!saved) return;
   const session = ctx.sessionFor?.(connId);
   const tabs = (session?.shells ?? 0) + (session?.connecting ?? 0);
+  // DeleteConnection also cancels running commands (N23): say so up front.
+  const running = session?.running ?? 0;
   const ok = await confirmModal(ctx, {
     title: t('edit.delete.title'),
     bodyHtml: `
       <p class="mb-2"><strong>${escapeHtml(saved.name)}</strong> ${escapeHtml(t('edit.delete.body'))}</p>
       ${tabs > 0 ? `<p class="text-danger mb-2">${escapeHtml(t('edit.deleteWithTabs', { k: tabs }))}</p>` : ''}
+      ${running > 0 ? `<p class="text-danger mb-2" data-delete-running>${escapeHtml(t('edit.deleteWithRunning', { j: running }))}</p>` : ''}
       <p class="text-secondary mb-0">${escapeHtml(t('edit.delete.history'))}</p>
     `,
     okLabel: t('edit.delete'),
@@ -1647,7 +1685,7 @@ async function deleteConnection(ctx, connId) {
     }
     if (editor.returnId === connId) editor.returnId = '';
   }
-  if (result?.message) ctx.toast(result.message);
+  toastResult(ctx, result);
   await ctx.refresh({ silent: true });
   reconcileEditor(state);
   ctx.renderPage();
@@ -1775,17 +1813,15 @@ export async function handleEditorChange(event, ctx) {
   if (!draft) return true;
   if (target.name === 'authMethod') {
     const toPassword = isPassword(draft);
-    const looksLikePath = /^(~|\/|[A-Za-z]:\\|%)/.test(draft.credential);
     const editor = state.editor;
-    // Never send a key path as a password (or a password as a key path).
-    if (toPassword && looksLikePath) {
-      // Remembered so toggling back to key auth does not lose the path.
-      editor.keyPathStash = { id: draft.id, value: draft.credential };
+    // Never guess from the shape of the value: a password may start with '/'
+    // and a key path may be 'id_rsa'. Switching always clears the field; a
+    // key path is set aside and only ever restored into the key field.
+    if (toPassword) {
+      if (draft.credential) editor.keyPathStash = { id: draft.id, value: draft.credential };
       draft.credential = '';
-    } else if (!toPassword && !looksLikePath) {
+    } else {
       draft.credential = '';
-    }
-    if (!toPassword && !draft.credential) {
       const saved = savedById(state, draft.id);
       if (editor.keyPathStash?.id === draft.id) draft.credential = editor.keyPathStash.value;
       else if (saved && !isPassword(saved)) draft.credential = saved.credential ?? '';

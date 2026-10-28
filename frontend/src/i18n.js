@@ -13,6 +13,7 @@ import { AGENTS_I18N } from './agents.js';
 import { SERVERTABS_I18N } from './servertabs.js';
 import { SHORTCUTS_I18N } from './shortcuts.js';
 import { CREDENTIALS_I18N } from './credentials.js';
+import { RESULT_I18N } from './result-message.js';
 
 export const BASE_I18N = {
   ja: {
@@ -133,6 +134,8 @@ export const BASE_I18N = {
     'mcp.noAuth': '認証なし',
     'mcp.connectURL': '接続URL',
     'mcp.usageTitle': 'エージェント用usage',
+    'mcp.usage.sharedNote': '共有 Bearer トークン（このページで発行するトークン）を使う設定例です。エージェントごとのトークンを使う場合は、下の「エージェント」欄の設定例を使ってください。',
+    'mcp.config.placeholder': '<発行したトークン>',
     'mcp.usage.listHosts': '登録済みSSH接続先を確認',
     'mcp.usage.executeCommand': '承認キューへ登録（Bearer認証済みの承認省略エージェントのみ即時実行）',
     'mcp.usage.requestExec': 'execute_command の旧名（非推奨）',
@@ -281,6 +284,8 @@ export const BASE_I18N = {
     'mcp.noAuth': 'No auth',
     'mcp.connectURL': 'Connection URL',
     'mcp.usageTitle': 'Agent Usage',
+    'mcp.usage.sharedNote': 'This example uses the shared Bearer token issued on this page. For a per-agent token, use the example in the Agents section below.',
+    'mcp.config.placeholder': '<issued token>',
     'mcp.usage.listHosts': 'List registered SSH connections',
     'mcp.usage.executeCommand': 'Queue for approval (only Bearer-authenticated bypass agents run immediately)',
     'mcp.usage.requestExec': 'Legacy alias of execute_command (deprecated)',
@@ -318,4 +323,5 @@ export const I18N = mergeI18n(
   SERVERTABS_I18N,
   SHORTCUTS_I18N,
   CREDENTIALS_I18N,
+  RESULT_I18N,
 );

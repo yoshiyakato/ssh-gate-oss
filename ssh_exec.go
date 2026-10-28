@@ -65,9 +65,10 @@ func (e *passphraseMissingError) Error() string {
 }
 
 // testSSHConnection is the GUI "接続テスト": an unknown host key is recorded
-// (TOFU) unless strictHostKey is set.
+// (TOFU) unless strictHostKey is set, and only after authentication (N20).
 func testSSHConnection(ctx context.Context, conn Connection, strictHostKey bool) error {
-	client, err := openSSHClientWithPolicy(ctx, conn, hostKeyPolicy{Origin: hostKeyFromGUI, Strict: strictHostKey})
+	policy, _ := hostKeyPolicy{Origin: hostKeyFromGUI, Strict: strictHostKey}.withDeferredRecording()
+	client, err := openSSHClientWithPolicy(ctx, conn, policy)
 	if err != nil {
 		return err
 	}
@@ -136,9 +137,11 @@ func runSSHCommand(ctx context.Context, conn Connection, command string, outputC
 	return result, runErr
 }
 
-// openSSHClient dials for a GUI terminal tab.
+// openSSHClient dials for a GUI terminal tab. An unknown host key is
+// recorded only once authentication succeeded (N20).
 func openSSHClient(ctx context.Context, conn Connection, strictHostKey bool) (*ssh.Client, error) {
-	return openSSHClientWithPolicy(ctx, conn, hostKeyPolicy{Origin: hostKeyFromGUI, Strict: strictHostKey})
+	policy, _ := hostKeyPolicy{Origin: hostKeyFromGUI, Strict: strictHostKey}.withDeferredRecording()
+	return openSSHClientWithPolicy(ctx, conn, policy)
 }
 
 // connectTimeout is conn.ConnectTimeout with the 10 second default applied.
@@ -259,7 +262,15 @@ func openSSHClientWithPolicy(ctx context.Context, conn Connection, policy hostKe
 		return nil, err
 	}
 	_ = netConn.SetDeadline(time.Time{})
-	return ssh.NewClient(sshConn, chans, reqs), nil
+	client := ssh.NewClient(sshConn, chans, reqs)
+	// Authentication succeeded: only now is a deferred TOFU key trusted
+	// (N20). A failed write (or a concurrent dial that recorded another key)
+	// fails the dial rather than leaving an unrecorded trust.
+	if err := policy.Candidate.Commit(); err != nil {
+		_ = client.Close()
+		return nil, err
+	}
+	return client, nil
 }
 
 // sshAuthMethods builds the auth chain. The returned func closes the

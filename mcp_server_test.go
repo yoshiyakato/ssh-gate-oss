@@ -36,7 +36,9 @@ func isolateEnv(t *testing.T) string {
 	t.Setenv("USERPROFILE", t.TempDir())
 	t.Setenv("SSH_AUTH_SOCK", "")
 	t.Setenv("SSH_GETE_TOKEN", "")
-	t.Setenv("SSH_GETE_MCP_ADDR", "")
+	// Never the default 8787: another ssh-gete may be serving it, and a test
+	// that restarts the listener (GenerateMCPToken) must not shadow it.
+	t.Setenv("SSH_GETE_MCP_ADDR", freeLoopbackAddr(t))
 	t.Setenv("SSH_GETE_STRICT_HOSTKEY", "")
 	t.Setenv("SSH_GETE_NO_SEED", "")
 	// Never touch the real keychain from tests.
@@ -935,10 +937,10 @@ func TestSharedTokenCannotClaimBypass(t *testing.T) {
 
 	token := issueAgentToken(t, app, "trusted")
 	// Now "trusted" holds a token with bypass on and an active grant: the
-	// shared token naming it must still be queued.
-	out, _ = callToolAuth(t, app, shared, "execute_command", `{"host":"lab","command":"echo shared","agent_name":"trusted"}`)
-	if out["state"] != statePending || out["auto_executed"] == true {
-		t.Fatalf("shared token claimed bypass of an agent that has a token: %v", out)
+	// shared token naming it is refused outright (N14), not even queued.
+	out, isErr := callToolAuth(t, app, shared, "execute_command", `{"host":"lab","command":"echo shared","agent_name":"trusted"}`)
+	if !isErr || out["error_kind"] != "unauthorized_bypass" || out["auto_executed"] == true {
+		t.Fatalf("shared token used the name of an agent that has a token: %v", out)
 	}
 	if execs := srv.Execs(); len(execs) != 0 {
 		t.Fatalf("command ran on the shared token after the agent token was issued: %v", execs)
@@ -1787,7 +1789,8 @@ func TestListenerRestartDetachesBypassedRun(t *testing.T) {
 	}
 	select {
 	case out := <-answer:
-		if out["request_id"] != id || out["state"] != stateAutoRunning {
+		// §5.3: a detached run answers state=running (N27).
+		if out["request_id"] != id || out["state"] != stateRunning {
 			t.Fatalf("answer on restart: %v", out)
 		}
 	case <-time.After(5 * time.Second):

@@ -225,7 +225,7 @@ export function scopeLabels(scopeConnIds, connections, t) {
   return ids.map((id) => (names.has(id) ? names.get(id) : t('agents.bypass.scopeUnknown', { id })));
 }
 
-function mcpEndpoint(mcp) {
+export function mcpEndpoint(mcp) {
   const settings = mcp ?? {};
   return settings.localURL || `http://127.0.0.1:${settings.port || 8787}${settings.mcpPath || '/mcp'}`;
 }
@@ -234,11 +234,15 @@ function mcpEndpoint(mcp) {
 // goes in only when the caller has it (while it is on screen); otherwise a
 // placeholder keeps the shape.
 export function claudeConfigExample(mcp, token, t) {
-  const server = {
-    type: 'http',
-    url: mcpEndpoint(mcp),
-    headers: { Authorization: `Bearer ${token || t('agents.config.placeholder')}` },
-  };
+  return mcpConfigJSON(mcp, `Bearer ${token || t('agents.config.placeholder')}`);
+}
+
+// mcpConfigJSON is the one shape of the ~/.claude.json snippet; the settings
+// page's shared-Bearer example and the per-agent example both use it, so the
+// two cannot drift. An empty authorization leaves headers out.
+export function mcpConfigJSON(mcp, authorization) {
+  const server = { type: 'http', url: mcpEndpoint(mcp) };
+  if (authorization) server.headers = { Authorization: authorization };
   return JSON.stringify({ mcpServers: { [MCP_SERVER_KEY]: server } }, null, 2);
 }
 
@@ -604,7 +608,8 @@ async function runAction(ctx, action, call) {
   } finally {
     agents.busy = '';
   }
-  if (result?.message) ctx.toast(result.message);
+  const message = ctx.resultMessage ? ctx.resultMessage(result) : String(result?.message ?? '');
+  if (message) ctx.toast(message);
   await loadAgents();
   await ctx.refresh({ silent: true });
   return result ?? { ok: false, message: '' };

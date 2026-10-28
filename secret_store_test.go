@@ -442,3 +442,17 @@ func TestDefaultSecretStoreFromEnv(t *testing.T) {
 		t.Fatalf("default service = %q", keyringServiceName())
 	}
 }
+
+// E3: outside a test binary SSH_GETE_KEYRING=memory must not switch saves to
+// a store that loses every password on restart.
+func TestMemoryKeyringOnlyInTestBinaries(t *testing.T) {
+	t.Setenv(keyringServiceEnv, "")
+	if _, ok := selectSecretStore("memory", true).(*memorySecretStore); !ok {
+		t.Fatalf("test binary: memory store expected")
+	}
+	for _, backend := range []string{"memory", " MEMORY ", ""} {
+		if _, ok := selectSecretStore(backend, false).(*osSecretStore); !ok {
+			t.Fatalf("release build with %q: OS keychain expected", backend)
+		}
+	}
+}

@@ -265,6 +265,11 @@ type mcpCaller struct {
 	Agent string
 	// Shared reports that the shared Bearer token authenticated the request.
 	Shared bool
+	// TokenHash is the hash of the per-agent token that authenticated the
+	// request (empty otherwise). A bypass decision made later requires the
+	// agent's current token to still be this one, so a request authenticated
+	// just before a rotation is not auto-executed after it (N28).
+	TokenHash string
 }
 
 // mayBypassAs reports whether the caller proved it is agentName. The shared
@@ -608,7 +613,7 @@ func (a *App) restartMCPServerLocked() error {
 //  1. Stop MCP intake: no new execution (trackExec / reserveExec refuse,
 //     MCP execution and long-poll slots are refused), then stop the
 //     listener. Its stop signal makes in-flight execute_command handlers
-//     answer state=auto_running and detach, so Shutdown does not wait for
+//     answer state=running and detach, so Shutdown does not wait for
 //     them.
 //  2. drainMCPCommands: wait up to shutdownExecGrace for running commands
 //     (GUI-approved and approval-bypassed), so one that finishes within the
@@ -902,7 +907,7 @@ func publicConnections(in []Connection) []Connection {
 func (a *App) TestConnection(id string) ActionResult {
 	conn, ok := a.findConnection(id)
 	if !ok {
-		return ActionResult{OK: false, Message: "接続先が選択されていません"}
+		return ActionResult{OK: false, Code: "not_found", Message: "接続先が選択されていません"}
 	}
 	return a.testConnectionConfig(conn, "")
 }
@@ -910,7 +915,7 @@ func (a *App) TestConnection(id string) ActionResult {
 func (a *App) TestConnectionWithPassphrase(id string, passphrase string) ActionResult {
 	conn, ok := a.findConnection(id)
 	if !ok {
-		return ActionResult{OK: false, Message: "接続先が選択されていません"}
+		return ActionResult{OK: false, Code: "not_found", Message: "接続先が選択されていません"}
 	}
 	return a.testConnectionConfig(conn, passphrase)
 }
@@ -937,7 +942,7 @@ func (a *App) TestConnectionConfig(conn Connection, passphrase string) ActionRes
 		return a.testSerialConnection(conn)
 	}
 	if conn.Host == "" || conn.User == "" {
-		return ActionResult{OK: false, Message: "ホスト名/IPアドレスとユーザー名を入力してください"}
+		return ActionResult{OK: false, Code: "required", Message: "ホスト名/IPアドレスとユーザー名を入力してください"}
 	}
 	return a.testConnectionConfig(conn, passphrase)
 }
@@ -975,10 +980,23 @@ func (a *App) testConnectionConfig(conn Connection, passphrase string) ActionRes
 	a.mu.RLock()
 	strictHostKey := a.mcp.StrictHostKey
 	a.mu.RUnlock()
-	if err := testSSHConnection(ctx, dial, strictHostKey); err != nil {
+	// An unknown host key is trusted only once authentication succeeded
+	// (N20): the dial keeps it as a candidate and openSSHClientWithPolicy
+	// commits it after authentication; the result message shows its
+	// fingerprint. The Commit below is a no-op kept as a safety net.
+	policy, candidate := hostKeyPolicy{Origin: hostKeyFromGUI, Strict: strictHostKey}.withDeferredRecording()
+	err = func() error {
+		client, err := openSSHClientWithPolicy(ctx, dial, policy)
+		if err != nil {
+			return err
+		}
+		_ = client.Close()
+		return candidate.Commit()
+	}()
+	if err != nil {
 		message := fmt.Sprintf("%s へのSSH疎通に失敗しました: %s", displayName, explainSSHError(conn, err))
 		a.recordConnectionTest(conn, "failed", message)
-		result := ActionResult{OK: false, Message: message, ID: conn.ID}
+		result := ActionResult{OK: false, Code: "connect_failed", Message: message, ID: conn.ID}
 		var missing *passphraseMissingError
 		if errors.As(err, &missing) {
 			result.Code = "needs_passphrase"
@@ -1102,10 +1120,10 @@ func (a *App) SaveConnection(connection Connection) ActionResult {
 // saveConnection is SaveConnection's body. It takes and releases a.mu
 // itself; post (nil when there is nothing to do) runs after that. Callers
 // hold a.secretMu.
-func (a *App) saveConnection(connection Connection) (ActionResult, func(ActionResult) ActionResult) {
+func (a *App) saveConnection(connection Connection) (result ActionResult, post func(ActionResult) ActionResult) {
 	connection = normalizeConnection(connection)
 	if connection.Name == "" {
-		return ActionResult{OK: false, Message: "接続先名は必須です"}, nil
+		return ActionResult{OK: false, Code: "required", Field: "name", ID: connection.ID, Message: "接続先名は必須です"}, nil
 	}
 	if connection.Type == "Serial" {
 		if err := validateSerialSettings(serialGOOS, serialSettingsOf(connection)); err != nil {
@@ -1122,13 +1140,17 @@ func (a *App) saveConnection(connection Connection) (ActionResult, func(ActionRe
 		connection.MCPFirstTrust = false
 	} else {
 		if connection.Host == "" || connection.User == "" {
-			return ActionResult{OK: false, Message: "ホスト、ユーザー名は必須です"}, nil
+			field := "host"
+			if connection.Host != "" {
+				field = "user"
+			}
+			return ActionResult{OK: false, Code: "required", Field: field, ID: connection.ID, Message: "ホスト、ユーザー名は必須です"}, nil
 		}
 		connection.SerialPort, connection.BaudRate = "", 0
 		connection.DataBits, connection.Parity, connection.StopBits = 0, "", ""
 	}
 	if a.store == nil {
-		return ActionResult{OK: false, Message: errStoreUnavailable.Error()}, nil
+		return ActionResult{OK: false, Code: "storage", Message: errStoreUnavailable.Error()}, nil
 	}
 
 	// A typed password is written to the keychain before the row, without
@@ -1136,11 +1158,31 @@ func (a *App) saveConnection(connection Connection) (ActionResult, func(ActionRe
 	isNew := connection.ID == ""
 	newPassword := connection.Type != "Serial" && connection.usesPassword() && connection.Credential != ""
 	if newPassword {
-		if message := a.saveConflict(connection); message != "" {
-			return ActionResult{OK: false, Message: message}, nil
+		if conflict := a.saveConflict(connection); !conflict.OK {
+			return conflict, nil
 		}
 		if isNew {
 			connection.ID = newID()
+		} else {
+			// The keychain slot is overwritten before the row is written. If
+			// the row is then not saved, the previous password goes back
+			// (E2), so it is read first; a slot that cannot be read is not
+			// overwritten.
+			restore, err := a.prepareSecretRollback(passwordAccount(connection.ID))
+			if err != nil {
+				log.Printf("read password before overwrite: %v", err)
+				return ActionResult{OK: false, Code: "keyring_unavailable", ID: connection.ID,
+					Message: "キーチェーンの現在のパスワードを読めないため、保存しませんでした。キーチェーンを使える状態にしてから保存し直してください"}, nil
+			}
+			// Registered before a.mu is taken below, so it runs after a.mu
+			// is released (keychain calls never hold a.mu, §5.0); the caller
+			// still holds a.secretMu.
+			defer func() {
+				if !result.OK {
+					restore()
+					a.forgetSecrets(connection.ID)
+				}
+			}()
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), secretWriteTimeout)
 		err := storeSecretVerified(ctx, a.secrets, passwordAccount(connection.ID), connection.Credential)
@@ -1172,12 +1214,11 @@ func (a *App) saveConnection(connection Connection) (ActionResult, func(ActionRe
 			continue
 		}
 		if a.conns[i].Name == connection.Name {
-			return a.abandonNewSecret(isNew, newPassword, connection,
-				ActionResult{OK: false, Message: fmt.Sprintf("「%s」という名前の接続先は既にあります。別の名前にしてください", connection.Name)}), nil
+			return a.abandonNewSecret(isNew, newPassword, connection, duplicateNameResult(connection)), nil
 		}
 	}
 	if !isNew && index < 0 {
-		return ActionResult{OK: false, Message: "編集中の接続先は削除されています。新規として保存し直してください"}, nil
+		return connectionGoneResult(connection), nil
 	}
 
 	if index < 0 {
@@ -1186,7 +1227,7 @@ func (a *App) saveConnection(connection Connection) (ActionResult, func(ActionRe
 		}
 		if err := a.store.insertConnection(connection); err != nil {
 			return a.abandonNewSecret(isNew, newPassword, connection,
-				ActionResult{OK: false, Message: fmt.Sprintf("SQLite保存に失敗しました: %v", err)}), nil
+				ActionResult{OK: false, Code: "storage", Message: fmt.Sprintf("SQLite保存に失敗しました: %v", err)}), nil
 		}
 		a.conns = append(a.conns, connection)
 		a.forgetSecretsLocked(connection.ID)
@@ -1210,10 +1251,10 @@ func (a *App) saveConnection(connection Connection) (ActionResult, func(ActionRe
 	connection.LastTestMessage = previous.LastTestMessage
 	updated, err := a.store.updateConnection(connection)
 	if err != nil {
-		return ActionResult{OK: false, Message: fmt.Sprintf("SQLite保存に失敗しました: %v", err)}, nil
+		return ActionResult{OK: false, Code: "storage", Message: fmt.Sprintf("SQLite保存に失敗しました: %v", err)}, nil
 	}
 	if !updated {
-		return ActionResult{OK: false, Message: "編集中の接続先は削除されています。新規として保存し直してください"}, nil
+		return connectionGoneResult(connection), nil
 	}
 	if previous.Name != connection.Name {
 		if err := a.store.updatePendingRequestsConnection(previous.Name, connection.ID, connection.Name); err != nil {
@@ -1237,15 +1278,16 @@ func (a *App) saveConnection(connection Connection) (ActionResult, func(ActionRe
 		_ = a.sessionSecrets.Delete(context.Background(), passwordAccount(connection.ID))
 	}
 	a.conns[index] = connection
-	result := ActionResult{OK: true, Message: fmt.Sprintf("%s の設定を保存しました", connection.Name), ID: connection.ID}
+	result = ActionResult{OK: true, Message: fmt.Sprintf("%s の設定を保存しました", connection.Name), ID: connection.ID}
 	prev, next := previous, connection
 	return result, func(r ActionResult) ActionResult { return a.afterSerialSave(prev, next, r) }
 }
 
 // saveConflict is the name check of saveConnection, made before a
 // keychain write so a save that is going to fail does not overwrite the
-// stored password first. saveConnection checks again under a.mu.
-func (a *App) saveConflict(connection Connection) string {
+// stored password first. saveConnection checks again under a.mu. OK means no
+// conflict.
+func (a *App) saveConflict(connection Connection) ActionResult {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	found := connection.ID == ""
@@ -1255,13 +1297,59 @@ func (a *App) saveConflict(connection Connection) string {
 			continue
 		}
 		if c.Name == connection.Name {
-			return fmt.Sprintf("「%s」という名前の接続先は既にあります。別の名前にしてください", connection.Name)
+			return duplicateNameResult(connection)
 		}
 	}
 	if !found {
-		return "編集中の接続先は削除されています。新規として保存し直してください"
+		return connectionGoneResult(connection)
 	}
-	return ""
+	return ActionResult{OK: true}
+}
+
+// duplicateNameResult refuses a name another connection already has; Field
+// lets the editor mark the name input (E5).
+func duplicateNameResult(connection Connection) ActionResult {
+	return ActionResult{OK: false, Code: "duplicate_name", Field: "name", ID: connection.ID,
+		Message: fmt.Sprintf("「%s」という名前の接続先は既にあります。別の名前にしてください", connection.Name)}
+}
+
+// connectionGoneResult: the connection being edited was deleted meanwhile.
+func connectionGoneResult(connection Connection) ActionResult {
+	return ActionResult{OK: false, Code: "not_found", ID: connection.ID,
+		Message: "編集中の接続先は削除されています。新規として保存し直してください"}
+}
+
+// prepareSecretRollback reads account's current keychain value and returns a
+// function that puts it back (or, when there was none, deletes the item and
+// queues it for GC if the delete fails). It is used before overwriting a
+// saved password whose row may then fail to save (E2). Callers hold
+// a.secretMu and not a.mu.
+func (a *App) prepareSecretRollback(account string) (func(), error) {
+	ctx, cancel := context.WithTimeout(context.Background(), secretWriteTimeout)
+	previous, err := a.secrets.Get(ctx, account)
+	cancel()
+	had := err == nil
+	if err != nil && !errors.Is(err, ErrSecretNotFound) {
+		return nil, err
+	}
+	return func() {
+		ctx, cancel := context.WithTimeout(context.Background(), secretWriteTimeout)
+		defer cancel()
+		if had {
+			if err := storeSecretVerified(ctx, a.secrets, account, previous); err != nil {
+				log.Printf("restore previous password after a failed save: %v", err)
+			}
+			return
+		}
+		if err := a.secrets.Delete(ctx, account); err != nil {
+			log.Printf("remove unsaved password after a failed save: %v", err)
+			if a.store != nil {
+				if err := a.store.enqueueSecretGC(account); err != nil {
+					log.Printf("queue password for gc: %v", err)
+				}
+			}
+		}
+	}, nil
 }
 
 // abandonNewSecret queues the keychain item written for a new connection
@@ -1279,10 +1367,10 @@ func (a *App) abandonNewSecret(isNew bool, newPassword bool, connection Connecti
 func (a *App) DeleteConnection(id string) ActionResult {
 	conn, ok := a.connectionByID(strings.TrimSpace(id))
 	if !ok {
-		return ActionResult{OK: false, Message: "削除する接続先が見つかりません"}
+		return ActionResult{OK: false, Code: "not_found", Message: "削除する接続先が見つかりません"}
 	}
 	if a.store == nil {
-		return ActionResult{OK: false, Message: errStoreUnavailable.Error()}
+		return ActionResult{OK: false, Code: "storage", Message: errStoreUnavailable.Error()}
 	}
 	a.secretMu.Lock()
 	err := a.store.deleteConnection(conn.ID) // queues its keychain items
@@ -1291,12 +1379,16 @@ func (a *App) DeleteConnection(id string) ActionResult {
 	}
 	a.secretMu.Unlock()
 	if err != nil {
-		return ActionResult{OK: false, Message: fmt.Sprintf("%s の削除に失敗しました: %v", conn.Name, err)}
+		return ActionResult{OK: false, Code: "storage", Message: fmt.Sprintf("%s の削除に失敗しました: %v", conn.Name, err)}
 	}
 	if a.sessionSecrets != nil {
 		a.sessionSecrets.deletePrefix(connSecretPrefix(conn.ID))
 	}
-	a.closeTerminalsForConnection(conn.ID)
+	k := a.closeTerminalsForConnection(conn.ID)
+	// A command still running on it is cancelled as by DisconnectConnection
+	// (N23): once the row is gone it would no longer be counted or
+	// disconnectable.
+	j := a.cancelExecsForConnection(conn.ID, errDisconnected)
 
 	a.mu.Lock()
 	next := make([]Connection, 0, len(a.conns))
@@ -1311,7 +1403,11 @@ func (a *App) DeleteConnection(id string) ActionResult {
 	a.mu.Unlock()
 	a.sessionsChanged()
 
-	return ActionResult{OK: true, Message: fmt.Sprintf("%s を削除しました。コマンド履歴は監査用に残しています", conn.Name)}
+	note := ""
+	if k > 0 || j > 0 {
+		note = fmt.Sprintf("（ターミナル %d 件・実行中コマンド %d 件を終了）", k, j)
+	}
+	return ActionResult{OK: true, ID: conn.ID, Message: fmt.Sprintf("%s を削除しました%s。コマンド履歴は監査用に残しています", conn.Name, note)}
 }
 
 // SaveMCPSettings validates, persists and applies the listener settings.
@@ -1320,7 +1416,7 @@ func (a *App) DeleteConnection(id string) ActionResult {
 // together and a concurrent Delete/Generate cannot interleave (audit #21).
 func (a *App) SaveMCPSettings(settings MCPSettings) ActionResult {
 	if a.store == nil {
-		return ActionResult{OK: false, Message: errStoreUnavailable.Error()}
+		return ActionResult{OK: false, Code: "storage", Message: errStoreUnavailable.Error()}
 	}
 	settings.ConfigPath = a.dbPath
 
@@ -1347,11 +1443,11 @@ func (a *App) SaveMCPSettings(settings MCPSettings) ActionResult {
 	}
 	if err := validateListenSettings(settings, effective); err != nil {
 		a.mu.Unlock()
-		return ActionResult{OK: false, Message: err.Error()}
+		return ActionResult{OK: false, Code: "invalid_listen", Message: err.Error()}
 	}
 	if err := a.store.saveMCPSettings(settings, token); err != nil {
 		a.mu.Unlock()
-		return ActionResult{OK: false, Message: fmt.Sprintf("MCP設定のSQLite保存に失敗しました: %v", err)}
+		return ActionResult{OK: false, Code: "storage", Message: fmt.Sprintf("MCP設定のSQLite保存に失敗しました: %v", err)}
 	}
 	a.mcp = settings
 	a.mcpToken = token
@@ -1359,7 +1455,7 @@ func (a *App) SaveMCPSettings(settings MCPSettings) ActionResult {
 
 	if err := a.restartMCPServerLocked(); err != nil {
 		a.setMCPStatus("エラー", err.Error())
-		return ActionResult{OK: false, Message: fmt.Sprintf("MCPサーバーの再起動に失敗しました: %v", err)}
+		return ActionResult{OK: false, Code: "restart_failed", Message: fmt.Sprintf("MCPサーバーの再起動に失敗しました: %v", err)}
 	}
 	return ActionResult{OK: true, Message: "MCP設定を保存し、待受を再起動しました"}
 }
@@ -1369,7 +1465,7 @@ func (a *App) SaveMCPSettings(settings MCPSettings) ActionResult {
 // into the MCP client configuration.
 func (a *App) GenerateMCPToken() ActionResult {
 	if a.store == nil {
-		return ActionResult{OK: false, Message: errStoreUnavailable.Error()}
+		return ActionResult{OK: false, Code: "storage", Message: errStoreUnavailable.Error()}
 	}
 	token := newID() + newID()
 	a.lifecycleMu.Lock()
@@ -1377,7 +1473,7 @@ func (a *App) GenerateMCPToken() ActionResult {
 	a.mu.Lock()
 	if a.mcpEnvToken != "" {
 		a.mu.Unlock()
-		return ActionResult{OK: false, Message: "環境変数 SSH_GETE_TOKEN でトークンが指定されているため、ここでは発行できません"}
+		return ActionResult{OK: false, Code: "token_from_env", Message: "環境変数 SSH_GETE_TOKEN でトークンが指定されているため、ここでは発行できません"}
 	}
 	settings := a.mcp
 	settings.BearerEnabled = true
@@ -1385,7 +1481,7 @@ func (a *App) GenerateMCPToken() ActionResult {
 	pathErr := validateMCPPaths(settings)
 	if err := a.store.saveMCPSettings(settings, token); err != nil {
 		a.mu.Unlock()
-		return ActionResult{OK: false, Message: fmt.Sprintf("MCP設定のSQLite保存に失敗しました: %v", err)}
+		return ActionResult{OK: false, Code: "storage", Message: fmt.Sprintf("MCP設定のSQLite保存に失敗しました: %v", err)}
 	}
 	a.mcp = settings
 	a.mcpToken = token
@@ -1400,7 +1496,7 @@ func (a *App) GenerateMCPToken() ActionResult {
 	}
 	if err := a.restartMCPServerLocked(); err != nil {
 		a.setMCPStatus("エラー", err.Error())
-		return ActionResult{OK: false, Message: fmt.Sprintf("MCPサーバーの再起動に失敗しました: %v", err), Token: token}
+		return ActionResult{OK: false, Code: "restart_failed", Message: fmt.Sprintf("MCPサーバーの再起動に失敗しました: %v", err), Token: token}
 	}
 	return ActionResult{OK: true, Message: "トークンを発行し、Bearer認証を有効にしました。MCPクライアントの設定に貼り付けてください（この画面を離れると再表示できません）", Token: token}
 }
@@ -1413,7 +1509,7 @@ func (a *App) GenerateMCPToken() ActionResult {
 // old token after the reset (audit #21).
 func (a *App) DeleteMCPSettings() ActionResult {
 	if a.store == nil {
-		return ActionResult{OK: false, Message: errStoreUnavailable.Error()}
+		return ActionResult{OK: false, Code: "storage", Message: errStoreUnavailable.Error()}
 	}
 	a.lifecycleMu.Lock()
 	defer a.lifecycleMu.Unlock()
@@ -1425,7 +1521,7 @@ func (a *App) DeleteMCPSettings() ActionResult {
 	settings = sanitizeMCPSettings(settings, a.mcpEnvToken, "停止中", "")
 	if err := a.store.saveMCPSettings(settings, ""); err != nil {
 		a.mu.Unlock()
-		return ActionResult{OK: false, Message: fmt.Sprintf("MCP設定の削除に失敗しました: %v", err)}
+		return ActionResult{OK: false, Code: "storage", Message: fmt.Sprintf("MCP設定の削除に失敗しました: %v", err)}
 	}
 	a.mcp = settings
 	a.mcpToken = ""
@@ -1474,7 +1570,7 @@ func (a *App) setAgentApprovalBypass(agentName string, enabled bool) ActionResul
 func (a *App) setAgentApprovalBypassLocked(agentName string, enabled bool) ActionResult {
 	agentName = strings.TrimSpace(agentName)
 	if agentName == "" {
-		return ActionResult{OK: false, Message: "エージェント名が不足しています"}
+		return ActionResult{OK: false, Code: "required", Message: "エージェント名が不足しています"}
 	}
 	now := a.clock()
 	a.mu.RLock()
@@ -1493,12 +1589,40 @@ func (a *App) setAgentApprovalBypassLocked(agentName string, enabled bool) Actio
 		return ActionResult{OK: true, Message: fmt.Sprintf("%s には承認省略が設定されていません", agentName)}
 	}
 	if err := a.saveAgentPolicy(policy); err != nil {
-		return ActionResult{OK: false, Message: fmt.Sprintf("%s の承認省略設定を保存できません: %v", agentName, err)}
+		return ActionResult{OK: false, Code: "storage", Message: fmt.Sprintf("%s の承認省略設定を保存できません: %v", agentName, err)}
 	}
+	// The token's own bypass flag follows the human's grant (E4): granting
+	// lets the agent's current token use it, revoking takes that back.
+	a.setAgentTokenBypassLocked(agentName, enabled)
 	if enabled {
 		return ActionResult{OK: true, Message: fmt.Sprintf("%s の承認省略を有効にしました（%s まで）", agentName, policy.ExpiresAt)}
 	}
 	return ActionResult{OK: true, Message: fmt.Sprintf("%s の承認省略を取り消しました", agentName)}
+}
+
+// setAgentTokenBypassLocked sets the bypass flag of agentName's current token,
+// if it has one. Callers hold a.policyMu. A failed write is logged: the grant
+// itself was saved, and an unchanged flag only keeps the bypass inactive (or,
+// on revoke, the policy row already stops it).
+func (a *App) setAgentTokenBypassLocked(agentName string, bypass bool) {
+	a.mu.RLock()
+	token, ok := a.agentTokens[agentName]
+	a.mu.RUnlock()
+	if !ok || token.Bypass == bypass {
+		return
+	}
+	if a.store != nil {
+		if _, err := a.store.setAgentTokenBypass(agentName, bypass); err != nil {
+			log.Printf("set token bypass of %s: %v", agentName, err)
+			return
+		}
+	}
+	a.mu.Lock()
+	if current, ok := a.agentTokens[agentName]; ok && current.TokenHash == token.TokenHash {
+		current.Bypass = bypass
+		a.agentTokens[agentName] = current
+	}
+	a.mu.Unlock()
 }
 
 // saveAgentPolicy persists the policy, then publishes it in memory. Callers
@@ -1539,7 +1663,7 @@ func (a *App) RevokeAllAgentApprovalBypasses() ActionResult {
 		}
 	}
 	if len(failed) > 0 {
-		return ActionResult{OK: false, Message: "承認省略を取り消せなかったエージェントがあります: " + strings.Join(failed, ", ")}
+		return ActionResult{OK: false, Code: "storage", Message: "承認省略を取り消せなかったエージェントがあります: " + strings.Join(failed, ", ")}
 	}
 	return ActionResult{OK: true, Message: fmt.Sprintf("承認省略を %d 件取り消しました", len(names))}
 }
@@ -1576,13 +1700,17 @@ func (a *App) agentApprovalBypassEnabled(agentName string) bool {
 }
 
 // agentBypassCovers reports whether the agent's token and grant together
-// allow auto-executing a command of this risk on conn.
-func (a *App) agentBypassCovers(agentName string, conn Connection, risk string) bool {
+// allow auto-executing a command of this risk on conn. tokenHash is the hash
+// of the token the request authenticated with (mcpCaller.TokenHash): it must
+// still be the agent's current token, so a token rotated or revoked after
+// authentication cannot be used for bypass (N28).
+func (a *App) agentBypassCovers(agentName string, tokenHash string, conn Connection, risk string) bool {
 	now := a.clock()
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	token, ok := a.agentTokens[agentName]
-	if !ok || !token.Bypass {
+	if !ok || !token.Bypass || tokenHash == "" ||
+		subtle.ConstantTimeCompare([]byte(token.TokenHash), []byte(tokenHash)) != 1 {
 		return false
 	}
 	policy, ok := a.agentPolicies[agentName]
@@ -1607,24 +1735,45 @@ func (a *App) agentPoliciesViewLocked() []AgentPolicy {
 
 // IssueAgentToken creates (or rotates) the per-agent Bearer token for
 // agentName. Only its hash is stored; the token is returned once. A request
-// made with it is attributed to agentName and may use that agent's approval
-// bypass, which the shared token never can.
+// made with it is attributed to agentName, which the shared token never is.
+//
+// The token's bypass flag (agent_tokens.bypass) defaults to off (E4). It is
+// on only when the human already granted the agent approval bypass (the
+// "approve and bypass" flow that says the grant starts working once a token
+// is issued); granting bypass later turns it on for the existing token
+// (setAgentApprovalBypassLocked). IssueAgentTokenWithBypass sets it
+// explicitly.
 func (a *App) IssueAgentToken(agentName string) ActionResult {
+	return a.issueAgentToken(agentName, nil)
+}
+
+// IssueAgentTokenWithBypass is IssueAgentToken with the token's bypass flag
+// chosen by the caller: false issues a token that can never use the agent's
+// approval bypass, even while a grant is active.
+func (a *App) IssueAgentTokenWithBypass(agentName string, bypass bool) ActionResult {
+	return a.issueAgentToken(agentName, &bypass)
+}
+
+func (a *App) issueAgentToken(agentName string, bypass *bool) ActionResult {
 	agentName = strings.TrimSpace(agentName)
 	if agentName == "" {
-		return ActionResult{OK: false, Message: "エージェント名を入力してください"}
+		return ActionResult{OK: false, Code: "required", Message: "エージェント名を入力してください"}
 	}
 	if a.store == nil {
-		return ActionResult{OK: false, Message: errStoreUnavailable.Error()}
-	}
-	secret, token, err := newAgentToken(agentName, true)
-	if err != nil {
-		return ActionResult{OK: false, Message: err.Error()}
+		return ActionResult{OK: false, Code: "storage", Message: errStoreUnavailable.Error()}
 	}
 	a.policyMu.Lock()
 	defer a.policyMu.Unlock()
+	allow := a.agentApprovalBypassEnabled(agentName)
+	if bypass != nil {
+		allow = *bypass
+	}
+	secret, token, err := newAgentToken(agentName, allow)
+	if err != nil {
+		return ActionResult{OK: false, Code: "token_failed", Message: err.Error()}
+	}
 	if err := a.store.saveAgentToken(token); err != nil {
-		return ActionResult{OK: false, Message: fmt.Sprintf("%s のトークンを保存できません: %v", agentName, err)}
+		return ActionResult{OK: false, Code: "storage", Message: fmt.Sprintf("%s のトークンを保存できません: %v", agentName, err)}
 	}
 	a.mu.Lock()
 	a.agentTokens[agentName] = token
@@ -1646,11 +1795,11 @@ func (a *App) RevokeAgentToken(agentName string) ActionResult {
 	_, ok := a.agentTokens[agentName]
 	a.mu.RUnlock()
 	if !ok {
-		return ActionResult{OK: false, Message: fmt.Sprintf("%s のトークンは発行されていません", agentName)}
+		return ActionResult{OK: false, Code: "not_found", Message: fmt.Sprintf("%s のトークンは発行されていません", agentName)}
 	}
 	if a.store != nil {
 		if _, err := a.store.deleteAgentToken(agentName); err != nil {
-			return ActionResult{OK: false, Message: fmt.Sprintf("%s のトークンを削除できません: %v", agentName, err)}
+			return ActionResult{OK: false, Code: "storage", Message: fmt.Sprintf("%s のトークンを削除できません: %v", agentName, err)}
 		}
 	}
 	a.mu.Lock()
@@ -1692,11 +1841,11 @@ func (a *App) agentHasToken(agentName string) bool {
 }
 
 // lookupAgentToken resolves a presented Bearer token to its agent and the
-// token's bypass flag. Hashes are compared in constant time against every
+// matched token hash. Hashes are compared in constant time against every
 // issued token; the store is not touched, so a.mu is held only briefly.
-func (a *App) lookupAgentToken(presented string) (string, bool, bool) {
+func (a *App) lookupAgentToken(presented string) (string, string, bool) {
 	if !strings.HasPrefix(presented, agentTokenPrefix) {
-		return "", false, false
+		return "", "", false
 	}
 	want := []byte(hashAgentToken(presented))
 	a.mu.RLock()
@@ -1708,7 +1857,7 @@ func (a *App) lookupAgentToken(presented string) (string, bool, bool) {
 			match, found = token, true
 		}
 	}
-	return match.AgentName, match.Bypass, found
+	return match.AgentName, match.TokenHash, found
 }
 
 // authenticateMCP establishes the caller of an MCP (or audit) request. A
@@ -1717,8 +1866,8 @@ func (a *App) lookupAgentToken(presented string) (string, bool, bool) {
 // the (loopback-only) caller is anonymous. ok=false means 401.
 func (a *App) authenticateMCP(r *http.Request, settings MCPSettings, sharedToken string) (mcpCaller, bool) {
 	if presented, found := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); found {
-		if agent, _, ok := a.lookupAgentToken(strings.TrimSpace(presented)); ok {
-			return mcpCaller{Agent: agent}, true
+		if agent, hash, ok := a.lookupAgentToken(strings.TrimSpace(presented)); ok {
+			return mcpCaller{Agent: agent, TokenHash: hash}, true
 		}
 	}
 	if !settings.BearerEnabled {
@@ -1743,11 +1892,11 @@ func (a *App) ResetHostKey(connID string) ActionResult {
 	connID = strings.TrimSpace(connID)
 	conn, ok := a.connectionByID(connID)
 	if !ok {
-		return ActionResult{OK: false, Message: "接続先が見つかりません"}
+		return ActionResult{OK: false, Code: "not_found", Message: "接続先が見つかりません"}
 	}
 	removed, err := a.resetHostKey(connID)
 	if err != nil {
-		return ActionResult{OK: false, Message: fmt.Sprintf("%s のホスト鍵をリセットできません: %v", conn.Name, err), ID: conn.ID}
+		return ActionResult{OK: false, Code: "storage", Message: fmt.Sprintf("%s のホスト鍵をリセットできません: %v", conn.Name, err), ID: conn.ID}
 	}
 	if removed == 0 {
 		return ActionResult{OK: true, Message: fmt.Sprintf("%s のホスト鍵は記録されていません", conn.Name), ID: conn.ID}
@@ -2019,7 +2168,9 @@ func migrateLegacyData(store *Store, dbPath string, connectionsPath string, sett
 			if err := os.Rename(path, path+".migrated"); err != nil {
 				return err
 			}
-			_ = os.Chmod(path+".migrated", 0o600)
+			if err := restrictToOwner(path + ".migrated"); err != nil {
+				log.Printf("restrict %s.migrated: %v", path, err)
+			}
 		}
 	}
 	return store.setLegacyMigrationState(legacyMigrationDone)

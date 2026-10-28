@@ -939,7 +939,7 @@ func (a *App) ResizeTerminal(id string, cols int, rows int) ActionResult {
 		return ActionResult{OK: true}
 	}
 	if err := resize(cols, rows); err != nil {
-		return ActionResult{OK: false, Message: "サイズ変更に失敗しました: " + err.Error(), SessionID: id}
+		return ActionResult{OK: false, Code: "resize_failed", Message: "サイズ変更に失敗しました: " + err.Error(), SessionID: id}
 	}
 	return ActionResult{OK: true}
 }
@@ -1132,7 +1132,7 @@ func (a *App) ListSerialPorts() []string {
 func (a *App) testSerialConnection(conn Connection) ActionResult {
 	port := serialPortOf(conn)
 	if port == "" {
-		return ActionResult{OK: false, Message: "シリアルポートが設定されていません", ID: conn.ID}
+		return ActionResult{OK: false, Code: "required", Message: "シリアルポートが設定されていません", ID: conn.ID}
 	}
 	goos := serialGOOS
 	if a.serialPortInUse(conn.ID) {
@@ -1143,7 +1143,7 @@ func (a *App) testSerialConnection(conn Connection) ActionResult {
 	}
 	present, err := serialPortPresent(goos, port)
 	if err != nil {
-		return ActionResult{OK: false, Message: fmt.Sprintf("%s を確認できません: %v", port, err), ID: conn.ID}
+		return ActionResult{OK: false, Code: "port_unavailable", Message: fmt.Sprintf("%s を確認できません: %v", port, err), ID: conn.ID}
 	}
 	if present {
 		message := fmt.Sprintf("%s を検出しました（利用可能）", port)

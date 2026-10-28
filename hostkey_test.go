@@ -622,3 +622,52 @@ func dialHostKeyPolicy(t *testing.T, conn Connection, policy hostKeyPolicy) erro
 	}
 	return err
 }
+
+// N20: with a deferred-recording policy, the GUI dial accepts an unknown key
+// for the handshake only. A failed authentication records nothing; a
+// successful one leaves the key pending until Commit.
+func TestHostKeyDeferredRecordingNeedsAuthAndCommit(t *testing.T) {
+	isolateEnv(t)
+	srv := newSSHTestServer(t)
+	conn := srv.Connection("lab")
+
+	bad := conn
+	bad.Credential = "wrong"
+	policy, candidate := hostKeyPolicy{Origin: hostKeyFromGUI}.withDeferredRecording()
+	if err := dialHostKeyPolicy(t, bad, policy); err == nil {
+		t.Fatalf("wrong password authenticated")
+	}
+	if got := readKnownHosts(t); got != "" {
+		t.Fatalf("failed authentication recorded the key: %q", got)
+	}
+	if !candidate.Pending() || candidate.Fingerprint() != ssh.FingerprintSHA256(srv.HostKey()) {
+		t.Fatalf("candidate after the handshake: pending=%v fp=%q", candidate.Pending(), candidate.Fingerprint())
+	}
+	// The dialer drops a candidate whose authentication failed.
+
+	// The MCP origin never trusts the uncommitted (failed-auth) candidate.
+	if _, err := runSSHCommand(hostKeyTestCtx(t), conn, "echo ok", 1024, false); hostKeyErrorKind(err) != "hostkey_unknown" {
+		t.Fatalf("MCP trusted an uncommitted key: %v", err)
+	}
+
+	// A successful GUI dial commits the candidate itself, after
+	// authentication (openSSHClientWithPolicy).
+	policy, candidate = hostKeyPolicy{Origin: hostKeyFromGUI}.withDeferredRecording()
+	if err := dialHostKeyPolicy(t, conn, policy); err != nil {
+		t.Fatalf("GUI dial: %v", err)
+	}
+	want := knownhosts.Line([]string{knownhosts.Normalize(hostKeyAddress(conn))}, srv.HostKey()) + "\n"
+	if got := readKnownHosts(t); got != want {
+		t.Fatalf("known_hosts=%q, want %q", got, want)
+	}
+	if candidate.Pending() || candidate.Commit() != nil || readKnownHosts(t) != want {
+		t.Fatalf("a later Commit changed something")
+	}
+
+	// MCP and strict policies never get a candidate.
+	for _, p := range []hostKeyPolicy{{Origin: hostKeyFromMCP}, {Origin: hostKeyFromGUI, Strict: true}} {
+		if _, c := p.withDeferredRecording(); c != nil {
+			t.Fatalf("policy %+v got a candidate", p)
+		}
+	}
+}

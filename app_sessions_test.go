@@ -610,7 +610,7 @@ func TestDisconnectCancelsBypassedMCPRun(t *testing.T) {
 
 	answer := make(chan any, 1)
 	go func() {
-		out, _ := app.executeCommandTool(context.Background(), mcpCaller{Agent: "trusted"},
+		out, _ := app.executeCommandTool(context.Background(), agentCaller(app, "trusted"),
 			executeCommandArgs{Host: "lab", Command: "sleep 30", AgentName: "trusted"})
 		answer <- out
 	}()
@@ -645,7 +645,7 @@ func TestClientGoneInterruptsBypassedRun(t *testing.T) {
 	httpCtx, hangUp := context.WithCancel(context.Background())
 	answer := make(chan any, 1)
 	go func() {
-		out, _ := app.executeCommandTool(httpCtx, mcpCaller{Agent: "trusted"},
+		out, _ := app.executeCommandTool(httpCtx, agentCaller(app, "trusted"),
 			executeCommandArgs{Host: "lab", Command: "sleep 30", AgentName: "trusted"})
 		answer <- out
 	}()

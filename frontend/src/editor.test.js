@@ -374,3 +374,104 @@ describe('editor phase 3-4', () => {
     expect(ctx.onSelectionChange).not.toHaveBeenCalled();
   });
 });
+
+describe('editor audit fixes', () => {
+  const auth = () => document.querySelector('#connection-form [name=authMethod]');
+  const cred = () => document.querySelector('#connection-form [name=credential]');
+  const change = async (value) => { auth().value = value; await E.handleEditorChange({ target: auth() }, ctx); };
+
+  // #35 / N7: the credential is never carried over by guessing its shape.
+  it('a password that looks like a path never lands in the key path field', async () => {
+    await click('[data-action="edit-select"][data-conn-id="B"]');
+    type('credential', '/Tr0ub4dor&3');
+    await change('SSH鍵認証');
+    expect(cred().type).toBe('text');
+    expect(cred().value).toBe('');
+    expect(state.editor.draft.credential).toBe('');
+  });
+  it('a password typed after key -> password is dropped; the key path comes back', async () => {
+    await change('パスワード保管');
+    type('credential', '~secret%pw');
+    await change('SSH鍵認証');
+    expect(cred().value).toBe('~/.ssh/id');
+  });
+  it('a key path of any shape never stays as the password', async () => {
+    for (const path of ['C:/keys/id_rsa', 'id_rsa', 'keys/id_ed25519']) {
+      type('credential', path);
+      await change('パスワード保管');
+      expect(cred().type).toBe('password');
+      expect(cred().value).toBe('');
+      await change('SSH鍵認証');
+      expect(cred().value).toBe(path);
+    }
+  });
+
+  // N23: the delete confirm says running commands will be stopped.
+  it('the delete confirm counts running commands it will stop', async () => {
+    sessions.push({ connId: 'B', connState: 'disconnected', shells: 1, connecting: 0, running: 3 });
+    render();
+    App.DeleteConnection.mockClear();
+    App.DeleteConnection.mockResolvedValue({ ok: true, message: 'deleted' });
+    const p = click('[data-action=edit-delete][data-conn-id=B]'); await tick();
+    const modal = document.querySelector('#editor-modal-root');
+    expect(modal.querySelector('[data-delete-running]').textContent).toBe('実行中のコマンド 3 件も中止します。');
+    expect(modal.textContent).toContain('ターミナル 1 タブ');
+    modal.querySelector('[data-modal-value=ok]').click(); await p;
+    expect(App.DeleteConnection).toHaveBeenCalledWith('B');
+  });
+
+  // E5: SaveConnection names name/host/user; the error sits next to the input.
+  it('a required or duplicate-name error is shown next to that text field', async () => {
+    App.SaveConnection.mockReset();
+    for (const [field, code] of [['name', 'duplicate_name'], ['host', 'required'], ['user', 'required']]) {
+      type(field, field === 'name' ? 'db' : '');
+      App.SaveConnection.mockResolvedValue({ ok: false, code, field, message: `${field} のエラー` });
+      await E.handleEditorSubmit({ target: document.querySelector('#connection-form'), preventDefault() {} }, ctx);
+      const input = document.querySelector(`#connection-form [name="${field}"]`);
+      expect(input.classList.contains('is-invalid')).toBe(true);
+      expect(input.getAttribute('aria-invalid')).toBe('true');
+      expect(document.querySelector(`[data-field-error="${field}"]`).textContent).toBe(`${field} のエラー`);
+      expect(document.querySelectorAll('[data-field-error]').length).toBe(1);
+    }
+    state.lang = 'en'; render();
+    expect(document.querySelector('[data-field-error="user"]')).toBeTruthy();
+  });
+
+  // N4: running commands alone (connState disconnected) can be cut.
+  it('a connection with only running commands can be disconnected', async () => {
+    sessions.push({ connId: 'A', connState: 'disconnected', shells: 0, connecting: 0, running: 2 });
+    render();
+    expect(document.querySelector('[data-action=edit-disconnect]').disabled).toBe(false);
+    App.DisconnectConnection.mockClear();
+    App.DisconnectConnection.mockResolvedValue({ ok: true, message: 'bye' });
+    const p = click('[data-action=edit-disconnect]'); await tick();
+    expect(document.querySelector('#editor-modal-root').textContent).toContain('実行中コマンド 2 件');
+    document.querySelector('#editor-modal-root [data-modal-value=ok]').click(); await p;
+    expect(App.DisconnectConnection).toHaveBeenCalledWith('A');
+  });
+
+  // N5: an action that finishes after the user left the page does not
+  // redraw the page they are on now.
+  it('a connection test that finishes on another page leaves that page alone', async () => {
+    state.active = 'connections';
+    const d = (() => { let r; const p = new Promise((res) => { r = res; }); return { p, r }; })();
+    App.TestConnectionConfig.mockReturnValueOnce(d.p);
+    const p = click('[data-action=edit-test]'); await tick();
+    state.active = 'commands';
+    ctx.renderPage = vi.fn();
+    d.r({ ok: true, message: 'fine' }); await p;
+    expect(ctx.renderPage).not.toHaveBeenCalled();
+    expect(state.editor.test.message).toBe('fine');
+  });
+
+  // E6: the editor shows ctx.resultMessage, not the raw backend message.
+  it('save failure text goes through ctx.resultMessage', async () => {
+    ctx.resultMessage = (result) => `EN:${result.code ?? '-'}`;
+    type('name', '');
+    App.SaveConnection.mockResolvedValue({ ok: false, code: 'name_required', message: '接続先名は必須です' });
+    await E.handleEditorSubmit({ target: document.querySelector('#connection-form'), preventDefault() {} }, ctx);
+    expect(ctx.toast).toHaveBeenCalledWith('EN:name_required');
+    expect(document.querySelector('.editor-alert').textContent).toContain('EN:name_required');
+    expect(document.querySelector('.editor-alert').textContent).not.toContain('接続先名');
+  });
+});

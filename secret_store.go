@@ -6,9 +6,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"sync"
+	"testing"
 
 	"github.com/zalando/go-keyring"
 )
@@ -44,8 +46,11 @@ const (
 	// keyringServiceEnv overrides the service name (test/dev builds).
 	keyringServiceEnv = "SSH_GETE_KEYRING_SERVICE"
 	// keyringBackendEnv = "memory" keeps every secret in process memory only.
-	// Tests set it so they never touch the real keychain; it never writes
-	// plaintext anywhere, so it is safe to honour in release builds too.
+	// It is honoured only inside a test binary (testing.Testing): tests set it
+	// so they never touch the real keychain. A release build ignores it with
+	// a warning, because every saved password would silently be lost on the
+	// next start (REQ-014: no silent fallback; phase5-keychain.md limits the
+	// memory store to tests and session-only secrets).
 	keyringBackendEnv = "SSH_GETE_KEYRING"
 )
 
@@ -57,11 +62,20 @@ func keyringServiceName() string {
 	return defaultKeyringService
 }
 
-// defaultSecretStore is what NewApp should install: the OS keychain, or the
-// memory store when SSH_GETE_KEYRING=memory.
+// defaultSecretStore is what NewApp should install: the OS keychain, or,
+// in a test binary only, the memory store when SSH_GETE_KEYRING=memory.
 func defaultSecretStore() SecretStore {
-	if strings.EqualFold(strings.TrimSpace(os.Getenv(keyringBackendEnv)), "memory") {
-		return newMemorySecretStore()
+	return selectSecretStore(os.Getenv(keyringBackendEnv), testing.Testing())
+}
+
+// selectSecretStore is defaultSecretStore with the environment value and
+// "is this a test binary" passed in, so both branches can be tested.
+func selectSecretStore(backend string, testBinary bool) SecretStore {
+	if strings.EqualFold(strings.TrimSpace(backend), "memory") {
+		if testBinary {
+			return newMemorySecretStore()
+		}
+		log.Printf("warning: %s=memory is ignored outside tests; passwords are stored in the OS keychain", keyringBackendEnv)
 	}
 	return newOSSecretStore(keyringServiceName())
 }

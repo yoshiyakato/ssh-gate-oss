@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -22,7 +24,7 @@ func newCommandRequest(conn Connection, command string, reason string, requested
 	now := time.Now()
 	seq := requestIDSeq.Add(1)
 	req := CommandRequest{
-		ID:           fmt.Sprintf("REQ-%d-%d", now.UnixMilli(), seq),
+		ID:           fmt.Sprintf("REQ-%d-%d-%s", now.UnixMilli(), seq, requestIDNonce()),
 		ConnectionID: conn.ID,
 		Host:         conn.Name,
 		User:         conn.User,
@@ -39,6 +41,16 @@ func newCommandRequest(conn Connection, command string, reason string, requested
 		req.ExpiresAt = now.Add(pendingRequestTTL).Format(time.RFC3339)
 	}
 	return req
+}
+
+// requestIDNonce is the random tail of a request ID. Time and sequence alone
+// are guessable, and an ID is all get_request_status needs (N12).
+func requestIDNonce() string {
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // targetFingerprint identifies where a command would run (user@host:port).
@@ -218,16 +230,19 @@ func (a *App) resolveRequestTarget(req CommandRequest) (Connection, string, bool
 // connection the request resolves to now, and whether user@host:port moved
 // since the agent asked.
 type ApprovalTarget struct {
-	RequestID     string      `json:"requestId"`
-	Found         bool        `json:"found"`
-	ResolvedBy    string      `json:"resolvedBy"`
-	ConnID        string      `json:"connId"`
-	Name          string      `json:"name"`
-	Type          string      `json:"type"`
-	RequestedHost string      `json:"requestedHost"`
-	RequestedFP   string      `json:"requestedFp"`
-	CurrentFP     string      `json:"currentFp"`
-	FPChanged     bool        `json:"fpChanged"`
+	RequestID     string `json:"requestId"`
+	Found         bool   `json:"found"`
+	ResolvedBy    string `json:"resolvedBy"`
+	ConnID        string `json:"connId"`
+	Name          string `json:"name"`
+	Type          string `json:"type"`
+	RequestedHost string `json:"requestedHost"`
+	RequestedFP   string `json:"requestedFp"`
+	CurrentFP     string `json:"currentFp"`
+	FPChanged     bool   `json:"fpChanged"`
+	// TargetUnknown: the request has no recorded target (older data), so it
+	// cannot be approved; FPChanged is set too.
+	TargetUnknown bool        `json:"targetUnknown"`
 	Executable    bool        `json:"executable"`
 	HostKey       HostKeyInfo `json:"hostKey"`
 	Message       string      `json:"message"`
@@ -253,11 +268,16 @@ func (a *App) GetApprovalTarget(id string) ApprovalTarget {
 	target.Name = conn.Name
 	target.Type = conn.connectionType()
 	target.CurrentFP = targetFingerprint(conn)
-	target.FPChanged = req.TargetFP != "" && req.TargetFP != target.CurrentFP
 	target.Executable = target.Type != "Serial"
+	// A request without a recorded target (stored before target_fp existed)
+	// cannot be checked, so it counts as changed: approve() refuses it (N21).
+	target.TargetUnknown = target.Executable && req.TargetFP == ""
+	target.FPChanged = target.TargetUnknown || (req.TargetFP != "" && req.TargetFP != target.CurrentFP)
 	switch {
 	case !target.Executable:
 		target.Message = "シリアルの接続先ではコマンドを実行できません"
+	case target.TargetUnknown:
+		target.Message = targetUnknownMessage
 	case target.FPChanged:
 		target.Message = fmt.Sprintf("要求後に実行先が変わりました（%s → %s）", req.TargetFP, target.CurrentFP)
 	}
@@ -268,6 +288,8 @@ func (a *App) GetApprovalTarget(id string) ApprovalTarget {
 	}
 	return target
 }
+
+const targetUnknownMessage = "要求時の実行先（ユーザー@ホスト:ポート）が記録されていない古い要求のため承認できません。拒否して、エージェントに再度依頼させてください"
 
 func (a *App) ApproveCommand(id string, command string) ActionResult {
 	return a.approve(id, command, false, false)
@@ -288,7 +310,7 @@ func (a *App) approve(id string, command string, allowRiskIncrease bool, grantBy
 	command = strings.TrimSpace(command)
 	req, ok := a.findRequest(id)
 	if !ok {
-		return ActionResult{OK: false, Message: "承認対象のリクエストが見つかりません"}
+		return ActionResult{OK: false, Code: "not_found", Message: "承認対象のリクエストが見つかりません"}
 	}
 	if command == "" {
 		command = req.Command
@@ -323,10 +345,13 @@ func (a *App) approve(id string, command string, allowRiskIncrease bool, grantBy
 			Message: fmt.Sprintf("要求後に実行先が変わったため承認できません（%s → %s）。拒否して、エージェントに再度依頼させてください", req.TargetFP, targetFingerprint(conn)),
 		}
 	}
+	if connOK && req.TargetFP == "" {
+		return ActionResult{OK: false, Code: "target_unknown", Message: targetUnknownMessage}
+	}
 	agentName := strings.TrimSpace(req.RequestedBy)
 	if grantBypass {
 		if agentName == "" {
-			return ActionResult{OK: false, Message: "承認省略にはエージェント名が必要です"}
+			return ActionResult{OK: false, Code: "required", Message: "承認省略にはエージェント名が必要です"}
 		}
 		// The grant is only usable through the agent's own token; without
 		// either kind of token there is no way to authenticate the agent.
@@ -372,7 +397,7 @@ func (a *App) approve(id string, command string, allowRiskIncrease bool, grantBy
 		return ActionResult{OK: false, Message: fmt.Sprintf("%s は既に処理済みです（%s）", id, running.Status), Code: "not_pending"}
 	}
 	if err != nil {
-		return ActionResult{OK: false, Message: fmt.Sprintf("%s の状態を更新できません: %v", id, err)}
+		return ActionResult{OK: false, Code: "state_storage", Message: fmt.Sprintf("%s の状態を更新できません: %v", id, err)}
 	}
 	res.activate()
 	execCtx := res.ctx
@@ -398,14 +423,14 @@ func (a *App) approve(id string, command string, allowRiskIncrease bool, grantBy
 
 	if !connOK {
 		_, _ = a.finishRequest(running, stateFailed, commandResult{}, errors.New("対象ホストが接続先一覧にありません"))
-		return done(ActionResult{OK: false, Message: "対象ホストが接続先一覧にありません" + bypassNote})
+		return done(ActionResult{OK: false, Code: "not_found", Message: "対象ホストが接続先一覧にありません" + bypassNote})
 	}
 	// A disconnect or shutdown that came after the transition: record it
 	// and never start the command.
 	if cause := stopCauseOf(execCtx); cause != nil {
 		_, _ = a.finishRequest(running, stateFailed, commandResult{}, cause)
 		if errors.Is(cause, errShuttingDown) {
-			return done(ActionResult{OK: false, Message: fmt.Sprintf("%s は終了処理のため中断されました%s", id, bypassNote)})
+			return done(ActionResult{OK: false, Code: "shutting_down", Message: fmt.Sprintf("%s は終了処理のため中断されました%s", id, bypassNote)})
 		}
 		return done(ActionResult{OK: false, Code: "canceled", Message: fmt.Sprintf("%s は切断されたため実行しませんでした%s", id, bypassNote)})
 	}
@@ -413,11 +438,11 @@ func (a *App) approve(id string, command string, allowRiskIncrease bool, grantBy
 	if errors.Is(execErr, errShuttingDown) {
 		// finishRequest records it as interrupted.
 		_, _ = a.finishRequest(running, stateFailed, result, execErr)
-		return done(ActionResult{OK: false, Message: fmt.Sprintf("%s は終了処理のため中断されました%s", id, bypassNote)})
+		return done(ActionResult{OK: false, Code: "shutting_down", Message: fmt.Sprintf("%s は終了処理のため中断されました%s", id, bypassNote)})
 	}
 	if execErr != nil && !isExitError(execErr) {
 		_, _ = a.finishRequest(running, stateFailed, result, execErr)
-		return done(ActionResult{OK: false, Message: fmt.Sprintf("%s の実行に失敗しました: %s%s", id, explainSSHError(conn, execErr), bypassNote)})
+		return done(ActionResult{OK: false, Code: "exec_failed", Message: fmt.Sprintf("%s の実行に失敗しました: %s%s", id, explainSSHError(conn, execErr), bypassNote)})
 	}
 	state := stateSucceeded
 	if execErr != nil {
@@ -525,7 +550,7 @@ func finalStateNotSaved(id string, err error) (ActionResult, bool) {
 func (a *App) RejectCommand(id string) ActionResult {
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return ActionResult{OK: false, Message: "拒否対象のリクエストが選択されていません"}
+		return ActionResult{OK: false, Code: "not_found", Message: "拒否対象のリクエストが選択されていません"}
 	}
 	updated, err := a.transitionRequest(id, []string{statePending}, func(r *CommandRequest) {
 		r.Status = stateRejected
@@ -536,7 +561,7 @@ func (a *App) RejectCommand(id string) ActionResult {
 		return ActionResult{OK: false, Message: fmt.Sprintf("%s は既に処理済みです（%s）", id, updated.Status), Code: "not_pending"}
 	}
 	if err != nil {
-		return ActionResult{OK: false, Message: "拒否対象のリクエストが見つかりません"}
+		return ActionResult{OK: false, Code: "not_found", Message: "拒否対象のリクエストが見つかりません"}
 	}
 	return ActionResult{OK: true, Message: fmt.Sprintf("%s を拒否しました", id)}
 }
@@ -557,10 +582,10 @@ func (a *App) DeleteCommandRequest(id string) ActionResult {
 		}
 	}
 	if index < 0 {
-		return ActionResult{OK: false, Message: "削除対象のコマンド履歴が見つかりません"}
+		return ActionResult{OK: false, Code: "not_found", Message: "削除対象のコマンド履歴が見つかりません"}
 	}
 	if status := a.requests[index].Status; status == stateRunning || status == stateAutoRunning {
-		return ActionResult{OK: false, Message: "実行中のリクエストは削除できません"}
+		return ActionResult{OK: false, Code: "in_use", Message: "実行中のリクエストは削除できません"}
 	}
 	if a.store != nil {
 		err := a.store.deleteCommandRequestUnlessRunning(id)
@@ -568,12 +593,12 @@ func (a *App) DeleteCommandRequest(id string) ActionResult {
 			// Running in SQLite, or already gone there; only the latter may
 			// still be dropped from memory.
 			if _, found, loadErr := a.store.loadCommandRequest(id); loadErr != nil || found {
-				return ActionResult{OK: false, Message: "実行中のリクエストは削除できません"}
+				return ActionResult{OK: false, Code: "in_use", Message: "実行中のリクエストは削除できません"}
 			}
 			err = nil
 		}
 		if err != nil {
-			return ActionResult{OK: false, Message: fmt.Sprintf("%s の削除に失敗しました: %v", id, err)}
+			return ActionResult{OK: false, Code: "storage", Message: fmt.Sprintf("%s の削除に失敗しました: %v", id, err)}
 		}
 	}
 	a.requests = slices.Delete(slices.Clone(a.requests), index, index+1)
@@ -590,7 +615,7 @@ func (a *App) needsHumanApproval(conn Connection, risk string, command string, c
 	if forceQueue || risk == "High" || !caller.mayBypassAs(agentName) {
 		return true
 	}
-	if !a.agentBypassCovers(caller.Agent, conn, risk) {
+	if !a.agentBypassCovers(caller.Agent, caller.TokenHash, conn, risk) {
 		return true
 	}
 	settings := a.GetMCPSettings()
