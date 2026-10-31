@@ -6,8 +6,8 @@
 # イメージの中ではビルドしない。release の headless バイナリを入れる:
 #
 #   mkdir -p dist/linux-amd64 dist/linux-arm64
-#   tar -xzf ssh-gate-linux-x64-headless-v1.01.tar.gz   -C dist/linux-amd64 ssh-gete
-#   tar -xzf ssh-gate-linux-arm64-headless-v1.01.tar.gz -C dist/linux-arm64 ssh-gete
+#   tar -xzf ssh-gate-linux-x64-headless-v1.02.tar.gz   -C dist/linux-amd64 ssh-gete
+#   tar -xzf ssh-gate-linux-arm64-headless-v1.02.tar.gz -C dist/linux-arm64 ssh-gete
 #   docker buildx build --platform linux/amd64,linux/arm64 -f deploy/docker/Dockerfile -t ssh-gete:headless .
 #
 # ベースイメージは digest で固定する（release.yml の action を SHA で固定しているのと同じ方針）。
