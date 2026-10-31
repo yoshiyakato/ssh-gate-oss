@@ -20,12 +20,15 @@ func main() {
 	}
 	app := NewApp()
 
+	workW, workH := windowWorkArea()
+	width, height := fitWindowSize(workW, workH, windowWidth, windowHeight, windowMinWidth, windowMinHeight)
+
 	err := wails.Run(&options.App{
 		Title:     "ssh-gete",
-		Width:     1440,
-		Height:    960,
-		MinWidth:  1180,
-		MinHeight: 760,
+		Width:     width,
+		Height:    height,
+		MinWidth:  windowMinWidth,
+		MinHeight: windowMinHeight,
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},
