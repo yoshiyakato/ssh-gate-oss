@@ -2567,6 +2567,7 @@ func (a *App) dialAISessionClient(ctx context.Context, conn Connection) (*ssh.Cl
 	if err != nil {
 		return nil, err
 	}
+	a.noteSSHReachable(conn.ID)
 	return client, nil
 }
 

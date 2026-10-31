@@ -822,8 +822,10 @@ func (a *App) executeSSH(parent context.Context, conn Connection, command string
 	}
 	res, err := runSSHCommand(ctx, conn, command, outputCap, strictHostKey)
 	if err != nil && !isExitError(err) {
-		err = a.withStopCause(parent, err)
+		return res, a.withStopCause(parent, err)
 	}
+	// A non-zero exit is the command's result: the connection itself worked.
+	a.noteSSHReachable(conn.ID)
 	return res, err
 }
 
