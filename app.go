@@ -353,6 +353,7 @@ type DashboardData struct {
 	RunningTotal    int              `json:"runningTotal"`
 	SessionsSeq     uint64           `json:"sessionsSeq"`
 	AISessions      AISessionCounts  `json:"aiSessions"`
+	Version         string           `json:"version"` // appVersion, shown in the sidebar
 }
 
 // SessionSummary is the live runtime state of one saved connection (§5.4
@@ -751,6 +752,7 @@ func (a *App) GetInitialData() DashboardData {
 		MCP:             a.mcpSnapshotLocked(),
 		StorageError:    a.storageError,
 		KeychainPending: a.keychainPending,
+		Version:         appVersion,
 	}
 	a.mu.RUnlock()
 	snapshot := a.sessionsSnapshot()

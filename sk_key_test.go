@@ -189,3 +189,10 @@ func TestSuccessfulSSHUseClearsTerminalError(t *testing.T) {
 		t.Fatal("a failed dial must keep the terminal error")
 	}
 }
+
+// The sidebar shows the build version from the dashboard data.
+func TestDashboardDataCarriesVersion(t *testing.T) {
+	if got := newTestApp(t).GetInitialData().Version; got != appVersion {
+		t.Fatalf("version %q, want %q", got, appVersion)
+	}
+}

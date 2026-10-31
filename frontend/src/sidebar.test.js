@@ -44,6 +44,18 @@ describe('renderSidebarStatus', () => {
     expect(document.querySelector('[data-action="side-more"]').textContent).toContain('他 1 件');
   });
 
+  it('shows the version just above the company name', () => {
+    const render = (version) => {
+      document.body.innerHTML = renderSidebarStatus(baseData([], { version }), { t: tFor('ja'), lang: 'ja', now: NOW });
+      return document.querySelector('.app-version');
+    };
+    const row = render('20261031-02');
+    expect(row.textContent).toBe('Ver.20261031-02');
+    expect(row.nextElementSibling.className).toBe('company-name');
+    expect(render('v1.02').textContent).toBe('Ver.1.02');
+    expect(render('')).toBeNull();
+  });
+
   it('always pairs the symbol with a state label', () => {
     const data = baseData([session('router-01', { connState: 'error', lastError: 'boom' }), session('web-01', { connState: 'connected', shells: 1, connectedSince: ago(3) })]);
     document.body.innerHTML = renderSidebarStatus(data, { t: tFor('ja'), lang: 'ja', now: NOW });
