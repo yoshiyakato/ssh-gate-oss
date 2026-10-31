@@ -353,6 +353,7 @@ type DashboardData struct {
 	RunningTotal    int              `json:"runningTotal"`
 	SessionsSeq     uint64           `json:"sessionsSeq"`
 	AISessions      AISessionCounts  `json:"aiSessions"`
+	Version         string           `json:"version"` // appVersion, shown in the sidebar
 }
 
 // SessionSummary is the live runtime state of one saved connection (§5.4
@@ -751,6 +752,7 @@ func (a *App) GetInitialData() DashboardData {
 		MCP:             a.mcpSnapshotLocked(),
 		StorageError:    a.storageError,
 		KeychainPending: a.keychainPending,
+		Version:         appVersion,
 	}
 	a.mu.RUnlock()
 	snapshot := a.sessionsSnapshot()
@@ -1105,10 +1107,17 @@ func (a *App) recordConnectionTest(tested Connection, result string, message str
 		}
 	}
 	a.mu.Unlock()
-	// A passing SSH test shows the connection works again, so a terminal
-	// error left from an earlier tab no longer describes it ("接続エラー").
 	// Serial errors stay: they follow the device (serial_mode.go).
-	if result == "ok" && tested.connectionType() != "Serial" && a.clearTerminalError(tested.ID) {
+	if result == "ok" && tested.connectionType() != "Serial" {
+		a.noteSSHReachable(tested.ID)
+	}
+}
+
+// noteSSHReachable is called once an SSH connection to connID has succeeded
+// (a passing test, a command run, an AI session): a terminal error left from
+// an earlier tab no longer describes the connection ("接続エラー").
+func (a *App) noteSSHReachable(connID string) {
+	if a.clearTerminalError(connID) {
 		a.sessionsChanged()
 	}
 }

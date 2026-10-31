@@ -147,3 +147,52 @@ func TestPassingConnectionTestClearsTerminalError(t *testing.T) {
 		t.Fatalf("nothing to clear, but sessions:changed sent again (%d)", notified)
 	}
 }
+
+// Reaching the host by running a command or dialing an AI session also clears
+// the terminal error; a run that never reached the host keeps it.
+func TestSuccessfulSSHUseClearsTerminalError(t *testing.T) {
+	app := newTestApp(t)
+	srv := newSSHTestServer(t)
+	conn := addTrustedConnection(t, app, srv.Connection("lab"))
+	setError := func() {
+		app.termMu.Lock()
+		app.ensureMaps()
+		app.lastErr[conn.ID] = "connection lost"
+		app.termMu.Unlock()
+	}
+	lastError := func() string { return app.terminalRuntime()[conn.ID].LastError }
+
+	setError()
+	if _, err := app.executeSSH(context.Background(), conn, "exit 3", 0, mcpCredentialTimeout); !isExitError(err) {
+		t.Fatalf("expected an exit error, got %v", err)
+	}
+	if got := lastError(); got != "" {
+		t.Fatalf("a non-zero exit still reached the host, error kept: %q", got)
+	}
+
+	setError()
+	client, err := app.dialAISessionClient(context.Background(), conn)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	_ = client.Close()
+	if got := lastError(); got != "" {
+		t.Fatalf("AI session dial kept the error: %q", got)
+	}
+
+	setError()
+	srv.Close()
+	if _, err := app.executeSSH(context.Background(), conn, "echo hi", 0, mcpCredentialTimeout); err == nil {
+		t.Fatal("expected a dial failure")
+	}
+	if lastError() == "" {
+		t.Fatal("a failed dial must keep the terminal error")
+	}
+}
+
+// The sidebar shows the build version from the dashboard data.
+func TestDashboardDataCarriesVersion(t *testing.T) {
+	if got := newTestApp(t).GetInitialData().Version; got != appVersion {
+		t.Fatalf("version %q, want %q", got, appVersion)
+	}
+}

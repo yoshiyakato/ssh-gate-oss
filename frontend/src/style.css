@@ -81,6 +81,20 @@ body {
   font-weight: 800;
 }
 
+.app-version {
+  margin-top: .6rem;
+  padding-top: .55rem;
+  color: rgba(255, 255, 255, .6);
+  border-top: 1px solid rgba(255, 255, 255, .12);
+  font-size: .72rem;
+}
+
+.app-version + .company-name {
+  margin-top: .1rem;
+  padding-top: 0;
+  border-top: 0;
+}
+
 .company-name {
   margin-top: .6rem;
   padding-top: .55rem;

@@ -192,6 +192,12 @@ function renderLangToggle(t, lang) {
 </div>`;
 }
 
+// renderVersion shows the build version; a release tag loses its leading "v".
+function renderVersion(version) {
+  if (!version) return '';
+  return `<div class="app-version">Ver.${escapeHtml(String(version).replace(/^v(?=\d)/, ''))}</div>`;
+}
+
 // renderSidebarStatus returns the innerHTML of #sidebar-status. data is
 // state.data; lang may be the code or ctx.lang.
 export function renderSidebarStatus(data, { t, lang, now = Date.now() } = {}) {
@@ -201,6 +207,7 @@ export function renderSidebarStatus(data, { t, lang, now = Date.now() } = {}) {
     renderSessionsSection(data, t, code, now),
     renderMCPSection(data, t),
     renderStorageError(data, t),
+    renderVersion(data?.version),
     '<div class="company-name">QuickIterate Co., Ltd.</div>',
   ].filter(Boolean).join('\n');
 }
