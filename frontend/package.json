@@ -17,7 +17,7 @@
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
-    "admin-lte": "^4.0.0",
-    "bootstrap-icons": "^1.13.1"
+    "admin-lte": "^4.10.0",
+    "bootstrap-icons": "^1.13.2"
   }
 }
