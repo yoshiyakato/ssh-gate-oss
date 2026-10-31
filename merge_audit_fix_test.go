@@ -37,7 +37,12 @@ func runHeadlessForExit(t *testing.T, dir string) (int, string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan int, 1)
-	opts := CLIOptions{Headless: true, DataDir: dir, Listen: "127.0.0.1:" + strconv.Itoa(wireFreePort(t))}
+	// isolateEnv's MCP port was released too, so the kernel may hand it out again.
+	listen := "127.0.0.1:" + strconv.Itoa(wireFreePort(t))
+	for listen == os.Getenv("SSH_GETE_MCP_ADDR") {
+		listen = "127.0.0.1:" + strconv.Itoa(wireFreePort(t))
+	}
+	opts := CLIOptions{Headless: true, DataDir: dir, Listen: listen}
 	go func() { done <- runHeadlessWith(ctx, opts, embeddedDistForTest(t), deps) }()
 	select {
 	case code := <-done:
