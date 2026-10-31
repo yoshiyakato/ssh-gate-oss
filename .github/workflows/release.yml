@@ -103,12 +103,15 @@ jobs:
           retention-days: 1
 
       # -s: フロントエンドの install / build を飛ばす（上で済ませている）。
-      # -ldflags: --version と headless の起動ログに出す版（build-headless と同じ）。
+      # -ldflags: 画面と --version に出す版。CHANGELOG.md の先頭の Ver.日付-通し番号（build-headless と同じ）。
       - name: Build
         shell: bash
         env:
           VERSION: ${{ github.ref_name }}
-        run: wails build -s -platform ${{ matrix.platform }} -clean -trimpath -ldflags "-X main.appVersion=${VERSION}"
+        run: |
+          APP_VERSION="$(sed -n 's/^## Ver\.\([0-9-]*\).*/\1/p' CHANGELOG.md | head -1)"
+          test -n "${APP_VERSION}"
+          wails build -s -platform ${{ matrix.platform }} -clean -trimpath -ldflags "-X main.appVersion=${APP_VERSION}"
 
       - name: Package (macOS)
         if: runner.os == 'macOS'
@@ -202,7 +205,9 @@ jobs:
           bin=ssh-gete
           if [ "${GOOS}" = windows ]; then bin=ssh-gete.exe; fi
           echo "BIN=${bin}" >> "${GITHUB_ENV}"
-          go build -tags headless -trimpath -ldflags "-s -w -X main.appVersion=${VERSION}" -o "${bin}" .
+          APP_VERSION="$(sed -n 's/^## Ver\.\([0-9-]*\).*/\1/p' CHANGELOG.md | head -1)"
+          test -n "${APP_VERSION}"
+          go build -tags headless -trimpath -ldflags "-s -w -X main.appVersion=${APP_VERSION}" -o "${bin}" .
           file "${bin}" || true
 
       # linux/amd64 はランナーで直接動かせるので、静的リンクであることと起動できることを確かめる。
