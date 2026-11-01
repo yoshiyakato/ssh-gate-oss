@@ -104,6 +104,7 @@ function dashboard(seq, sessions) {
     terminals: [],
     runningTotal: 0,
     sessionsSeq: seq,
+    version: '20261101-02',
   };
 }
 
@@ -141,6 +142,10 @@ describe('main.js integration', () => {
     expect(document.querySelectorAll('#page-root')).toHaveLength(1);
     expect(document.querySelectorAll('#terminal-dock #terminal-stack')).toHaveLength(1);
     expect(document.querySelector('#sidebar-status .side-empty')).not.toBeNull();
+  });
+
+  it('shows the version from the dashboard data in the sidebar', () => {
+    expect(document.querySelector('#sidebar-status .app-version').textContent).toBe('Ver.20261101-02');
   });
 
   it('keeps tabs and xterm nodes across navigation and polling, while the sidebar updates', async () => {

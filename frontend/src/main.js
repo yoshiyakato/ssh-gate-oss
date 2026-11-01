@@ -171,6 +171,8 @@ const state = {
     storageError: '',
     // Passwords the startup migration could not move to the keychain.
     keychainPending: 0,
+    // Build version shown in the sidebar.
+    version: '',
     sessions: [],
     terminals: [],
     runningTotal: 0,
@@ -767,6 +769,7 @@ async function fetchData({ silent = false } = {}) {
   if (!protectSettings) state.settingsMcp = state.data.mcp;
   state.data.storageError = next.storageError ?? '';
   state.data.keychainPending = Number(next.keychainPending ?? 0);
+  state.data.version = next.version ?? '';
   applySessions(next);
   reconcileEditor(state);
   reconcileServerFilter({ reason: state.serverFilterReady ? 'refresh' : 'init' });
