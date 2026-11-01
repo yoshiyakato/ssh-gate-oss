@@ -8,11 +8,11 @@ ssh-gete はウィンドウを出さずに動かせます（`--headless`）。�
 
 | 成果物 | 中身 | GUI | `--headless` | 必要なもの |
 |---|---|---|---|---|
-| `ssh-gate-mac-universal-v1.02.zip` / `ssh-gate-win-*-v1.02.zip` | GUI 版（Wails） | あり | 使える | macOS / Windows のデスクトップ |
-| `ssh-gate-linux-x64-headless-v1.02.tar.gz` | headless 専用（Linux amd64） | なし | 常に headless | なし（静的リンク。GTK / WebKit 不要） |
-| `ssh-gate-linux-arm64-headless-v1.02.tar.gz` | headless 専用（Linux arm64） | なし | 常に headless | なし |
-| `ssh-gate-mac-arm64-headless-v1.02.zip` / `ssh-gate-mac-x64-headless-v1.02.zip` | headless 専用（macOS Apple シリコン / Intel） | なし | 常に headless | なし（署名なし） |
-| `ssh-gate-win-x64-headless-v1.02.zip` / `ssh-gate-win-arm64-headless-v1.02.zip` | headless 専用（Windows。コンソールアプリ） | なし | 常に headless | なし |
+| `ssh-gate-mac-universal-v1.03.zip` / `ssh-gate-win-*-v1.03.zip` | GUI 版（Wails） | あり | 使える | macOS / Windows のデスクトップ |
+| `ssh-gate-linux-x64-headless-v1.03.tar.gz` | headless 専用（Linux amd64） | なし | 常に headless | なし（静的リンク。GTK / WebKit 不要） |
+| `ssh-gate-linux-arm64-headless-v1.03.tar.gz` | headless 専用（Linux arm64） | なし | 常に headless | なし |
+| `ssh-gate-mac-arm64-headless-v1.03.zip` / `ssh-gate-mac-x64-headless-v1.03.zip` | headless 専用（macOS Apple シリコン / Intel） | なし | 常に headless | なし（署名なし） |
+| `ssh-gate-win-x64-headless-v1.03.zip` / `ssh-gate-win-arm64-headless-v1.03.zip` | headless 専用（Windows。コンソールアプリ） | なし | 常に headless | なし |
 
 - Linux の GUI 版は GTK と WebKit を動的リンクするので、サーバーでは headless 専用ビルドを使ってください。
 - headless 専用の tar.gz には `ssh-gete`、systemd の unit（`ssh-gete.service`）、設定ファイルの例（`headless.example.yaml`）、この文書が入っています。zip（macOS / Windows）には unit を除いた同じものが入っています。
@@ -204,8 +204,8 @@ Dockerfile: [deploy/docker/Dockerfile](../deploy/docker/Dockerfile)（distroless
 
 ```sh
 mkdir -p dist/linux-amd64 dist/linux-arm64
-tar -xzf ssh-gate-linux-x64-headless-v1.02.tar.gz   -C dist/linux-amd64 ssh-gete
-tar -xzf ssh-gate-linux-arm64-headless-v1.02.tar.gz -C dist/linux-arm64 ssh-gete
+tar -xzf ssh-gate-linux-x64-headless-v1.03.tar.gz   -C dist/linux-amd64 ssh-gete
+tar -xzf ssh-gate-linux-arm64-headless-v1.03.tar.gz -C dist/linux-arm64 ssh-gete
 docker buildx build --platform linux/amd64,linux/arm64 -f deploy/docker/Dockerfile -t ssh-gete:headless --load .
 
 docker volume create ssh-gete-data
